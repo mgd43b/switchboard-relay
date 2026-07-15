@@ -41,11 +41,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install package with test extras
-        run: uv pip install --system -e '.[test]'
+      - name: Create venv and install package with test extras
+        run: |
+          uv venv
+          uv pip install -e '.[test]'
 
       - name: Run tests (coverage threshold enforced via pyproject)
-        run: python -m pytest
+        run: .venv/bin/python -m pytest
 
       - name: Verify console entry point
-        run: switchboard --version
+        run: .venv/bin/switchboard --version
