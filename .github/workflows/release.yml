@@ -20,7 +20,7 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@v5
         id: release
         with:
           token: ${{ github.token }}
@@ -37,10 +37,10 @@ jobs:
       id-token: write # MANDATORY for OIDC trusted publishing; no API tokens.
       contents: write # to attach built dists to the GitHub Release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13" # pin the build interpreter for reproducible releases
 
