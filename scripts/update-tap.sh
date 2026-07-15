@@ -37,6 +37,22 @@ success() { echo -e "${GREEN}✓${NC} $*"; }
 warn()    { echo -e "${YELLOW}⚠${NC} $*"; }
 error()   { echo -e "${RED}✗${NC} $*" >&2; }
 
+# Single EXIT handler: always remove the temp download dir, and if we still hold
+# a formula backup (i.e. we exited before finishing the edit) restore it, so a
+# failure part-way through never leaves the tap formula half-modified.
+TEMP_DIR=""
+BACKUP=""
+cleanup() {
+    local ec=$?
+    [[ -n "$TEMP_DIR" ]] && rm -rf "$TEMP_DIR"
+    if [[ -n "$BACKUP" && -f "$BACKUP" ]]; then
+        mv -f "$BACKUP" "$FORMULA_PATH"
+        warn "Restored the original formula after an incomplete run."
+    fi
+    return $ec
+}
+trap cleanup EXIT
+
 usage() {
     cat <<EOF
 Usage: $0 <version> [options]
@@ -100,8 +116,7 @@ fi
 success "sdist is published"
 
 # -- step 2: download + sha256 ----------------------------------------------
-TEMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TEMP_DIR"' EXIT
+TEMP_DIR="$(mktemp -d)"  # cleaned up (and backup restored) by the EXIT trap
 TARBALL="${TEMP_DIR}/${SDIST_FILE}"
 curl -sLf "$SDIST_URL" -o "$TARBALL" || { error "Download failed"; exit 1; }
 SHA256="$(shasum -a 256 "$TARBALL" | awk '{print $1}')"
@@ -153,11 +168,11 @@ if [[ "$SKIP_TEST" == false && "$DRY_RUN" == false ]]; then
             success "Install test passed (${FORMULA_NAME} ${INSTALLED})"
         else
             error "Version mismatch: expected ${VERSION}, got '${INSTALLED}'"
-            mv "$BACKUP" "$FORMULA_PATH"; exit 1
+            exit 1  # EXIT trap restores the formula
         fi
     else
-        error "Formula install failed — reverting"
-        mv "$BACKUP" "$FORMULA_PATH"; exit 1
+        error "Formula install failed"
+        exit 1  # EXIT trap restores the formula
     fi
 else
     warn "Skipping install test"
@@ -165,12 +180,11 @@ fi
 
 # -- step 7: commit + push (or restore on dry-run) --------------------------
 if [[ "$DRY_RUN" == true ]]; then
-    warn "DRY RUN — restoring formula, not committing"
-    mv "$BACKUP" "$FORMULA_PATH"
+    warn "DRY RUN — not committing (the EXIT trap restores the original formula)"
     exit 0
 fi
 
-rm -f "$BACKUP"
+rm -f "$BACKUP"  # committing for real: drop the backup so the trap won't restore
 git -C "$TAP_PATH" add "$FORMULA_PATH"
 git -C "$TAP_PATH" commit -m "${FORMULA_NAME} ${VERSION}"
 git -C "$TAP_PATH" push

@@ -41,6 +41,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13" # pin the build interpreter for reproducible releases
 
       - name: Build sdist and wheel
         run: uv build
