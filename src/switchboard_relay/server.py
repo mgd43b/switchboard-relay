@@ -18,12 +18,19 @@ calling session with an address, and subsequent ``inbox()``/``wait()``/``send()`
 calls resolve "who am I" from that connection. In stdio there is exactly one
 connection per process; in the daemon there are many, keyed by the live
 ``ServerSession`` object.
+
+Each server is bound to one *board* -- an isolated switchboard with its own
+participant registry and mailboxes, backed by its own SQLite file. By default the
+board is derived from the project (git repo), so sessions in different repos are
+isolated and every worktree of one repo shares a board; ``$SWITCHBOARD_BOARD``
+overrides it to any named (e.g. shared) board. See :mod:`switchboard_relay.board`.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import secrets
 import sys
 import time
 from dataclasses import dataclass
@@ -33,7 +40,8 @@ from typing import Any, Optional
 import anyio
 from mcp.server.fastmcp import Context, FastMCP
 
-from switchboard_relay.store import DEFAULT_TTL_SECONDS, Store, default_db_path
+from switchboard_relay.board import boards_dir, legacy_db_path, resolve_target
+from switchboard_relay.store import DEFAULT_TTL_SECONDS, Store
 
 # How often wait() checks the mailbox, and how often it heartbeats the caller's
 # liveness while parked. Poll is a balance between latency and DB churn.
@@ -45,6 +53,17 @@ _CHANNEL_METHOD = "notifications/claude/channel"
 
 def _now() -> float:
     return time.time()
+
+
+def _auto_name() -> str:
+    """A short, unique-ish fallback address for a session that registers unnamed.
+
+    The server can't observe a session's title, so rather than dead-end a bare
+    "register me", we mint a usable handle (e.g. ``session-a3f9``). It's unique
+    enough to address and thread replies to; a caller that wants a memorable
+    name just passes one.
+    """
+    return f"session-{secrets.token_hex(2)}"
 
 
 def _resolve_ttl() -> float:
@@ -85,9 +104,13 @@ class Switchboard:
     is rebuilt as sessions register.
     """
 
-    def __init__(self, store: Store, *, ttl: float = DEFAULT_TTL_SECONDS):
+    def __init__(self, store: Store, *, ttl: float = DEFAULT_TTL_SECONDS, board: str = ""):
         self.store = store
         self.ttl = ttl
+        # The board this server is bound to. Purely informational here (isolation
+        # is provided by pointing at a per-board database); surfaced in tool
+        # responses so a session can see which switchboard it joined.
+        self.board = (board or "").strip()
         # id(ctx.session) -> _Conn. Keyed by object identity because one
         # ServerSession maps to exactly one client connection for its lifetime.
         self._conns: dict[int, _Conn] = {}
@@ -168,20 +191,39 @@ class Switchboard:
 
     # -- tool implementations ----------------------------------------------
 
-    def register(self, ctx: Context, name: str, role: str = "") -> dict:
+    def register(self, ctx: Context, name: str = "", role: str = "") -> dict:
         name = (name or "").strip()
+        assigned = False
         if not name:
-            raise ValueError('name must be a non-empty string, e.g. "lead" or "worker:feature-x".')
-        role = (role or "").strip()
+            # No explicit name: fall back to a pre-seeded identity from the
+            # environment. The tool description steers the caller to pass its
+            # session title, but the server cannot observe that title -- so rather
+            # than dead-end a bare "register me", mint a usable handle and say so.
+            name = self._default_name
+        if not name:
+            name = _auto_name()
+            assigned = True
+        role = (role or "").strip() or self._default_role
         p = self.store.register(name, role, now=_now())
         self._bind(ctx, p.name, p.role)
-        return {
+        payload = self._participants_payload()
+        out = {
             "ok": True,
             "you": p.name,
             "role": p.role,
             "ttl_seconds": self.ttl,
-            "participants": self._participants_payload(),
+            **({"board": self.board} if self.board else {}),
+            "participants": payload,
         }
+        if assigned:
+            out["note"] = (
+                f"No name was given, so I registered you as '{p.name}'. Pass "
+                "name=... to choose your own address (e.g. your session title)."
+            )
+        hint = self._solo_hint(payload)
+        if hint:
+            out["hint"] = hint
+        return out
 
     def participants(self, ctx: Context) -> dict:
         # A read is also a heartbeat for the caller, if registered.
@@ -189,7 +231,15 @@ class Switchboard:
         if conn is not None:
             self.store.touch(conn.name, now=_now())
         payload = self._participants_payload()
-        return {"participants": payload, "count": len(payload)}
+        out = {
+            "participants": payload,
+            "count": len(payload),
+            **({"board": self.board} if self.board else {}),
+        }
+        hint = self._solo_hint(payload)
+        if hint:
+            out["hint"] = hint
+        return out
 
     def send(self, ctx: Context, to: str, body: str, reply_to: Optional[int] = None) -> dict:
         conn = self._resolve(ctx)
@@ -199,7 +249,17 @@ class Switchboard:
         now = _now()
         mid = self.store.send(to, body, sender=conn.name, reply_to=reply_to, now=now)
         self.store.touch(conn.name, now=now)
-        return {"id": mid, "to": to, "from": conn.name, "reply_to": reply_to}
+        out = {"id": mid, "to": to, "from": conn.name, "reply_to": reply_to}
+        if not self._has_live_recipient(to):
+            # Delivery is still durable -- this is a soft nudge that nobody is
+            # currently reading `to`, which most often means a typo'd name/role.
+            out["no_live_recipient"] = True
+            out["warning"] = (
+                f"No session is currently registered as '{to}'. The message is queued "
+                "and will be delivered whenever one reads it, but if you expected an "
+                "immediate reader, double-check the name/role with participants()."
+            )
+        return out
 
     async def _notify(
         self, ctx: Context, *, sender: str, to: str, mid: int, reply_to: Optional[int]
@@ -259,6 +319,9 @@ class Switchboard:
         if not to:
             raise ValueError("`to` must be a non-empty address (a participant name or role).")
         now = _now()
+        # Note whether anyone is live to answer *before* we send -- used to explain
+        # a timeout below (offline recipient vs. a live one that just didn't reply).
+        live_at_send = self._has_live_recipient(to)
         qid = self.store.send(to, body, sender=conn.name, now=now)
         self.store.touch(conn.name, now=now)
         await self._notify(ctx, sender=conn.name, to=to, mid=qid, reply_to=None)
@@ -283,13 +346,21 @@ class Switchboard:
                 }
             if now >= deadline:
                 self.store.touch(conn.name, now=now)
-                return {
+                result = {
                     "you": conn.name,
                     "asked": to,
                     "question_id": qid,
                     "reply": None,
                     "timed_out": True,
                 }
+                if not live_at_send:
+                    result["no_live_recipient"] = True
+                    result["note"] = (
+                        f"No session was registered as '{to}' when you asked, so no "
+                        "reply is likely -- the name/role may be misspelled or that "
+                        "session may be offline. Your question remains queued."
+                    )
+                return result
             await anyio.sleep(min(_WAIT_POLL_SECONDS, max(0.0, deadline - now)))
 
     async def broadcast(self, ctx: Context, body: str) -> dict:
@@ -354,6 +425,25 @@ class Switchboard:
 
     # -- helpers ------------------------------------------------------------
 
+    def _has_live_recipient(self, to: str) -> bool:
+        """True if some live participant reads ``to`` (by its name or its role)."""
+        now = _now()
+        for p in self.store.participants(now=now, ttl=self.ttl):
+            if p.name == to or (p.role and p.role == to):
+                return True
+        return False
+
+    def _solo_hint(self, payload: list[dict]) -> Optional[str]:
+        """A nudge shown when a session is alone on its board (nobody to talk to)."""
+        if len(payload) != 1:
+            return None
+        where = f" (board '{self.board}')" if self.board else ""
+        return (
+            f"You're the only session here{where}. Open another Claude Code session on "
+            "the same board -- the same repo, or one started with the same "
+            "SWITCHBOARD_BOARD -- and register it to start talking."
+        )
+
     def _participants_payload(self) -> list[dict]:
         now = _now()
         # Opportunistic housekeeping so the table does not grow unbounded.
@@ -372,33 +462,43 @@ class Switchboard:
 # they double as the user-facing tool descriptions. Keep them action-oriented.
 
 
-def build_server(store: Optional[Store] = None, *, ttl: Optional[float] = None) -> FastMCP:
+def build_server(
+    store: Optional[Store] = None, *, ttl: Optional[float] = None, board: str = ""
+) -> FastMCP:
     store = store if store is not None else Store()
-    sb = Switchboard(store, ttl=ttl if ttl is not None else _resolve_ttl())
+    sb = Switchboard(store, ttl=ttl if ttl is not None else _resolve_ttl(), board=board)
 
     mcp = FastMCP(
         "switchboard-relay",
         instructions=(
             "Shared message bus for independent Claude Code sessions. Call "
-            'register(name) once to claim an address (e.g. "lead" or '
-            '"worker:feature-x"), then send(to, body) to message another '
+            "register() once to claim an address -- pass a name (e.g. "
+            '"lead" or "worker:feature-x") or, if none is given, register under '
+            "your session's title -- then send(to, body) to message another "
             "session and inbox()/wait() to receive. For a question that needs an "
             "answer, ask(to, body) sends and blocks for the reply in one call. "
-            "Messages are durable: they wait in the recipient's mailbox until read."
+            "Messages are durable: they wait in the recipient's mailbox until read. "
+            "The switchboard is scoped to this project by default, so you only see "
+            "sessions on the same board."
         ),
     )
     # Expose the wiring for tests and daemon introspection.
     mcp._switchboard_relay = sb  # type: ignore[attr-defined]
 
     @mcp.tool()
-    def register(name: str, role: str = "", ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+    def register(name: str = "", role: str = "", ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Claim an address on the switchboard for this session.
 
         `name` is your address that others send to (e.g. "lead",
-        "worker:feature-x"). `role` is an optional shared address for a group
-        (e.g. "worker") -- a message sent to a role is delivered to any
-        participant that reads with that role. Re-call to refresh your presence
-        (a heartbeat) or change your role. Returns the current live participants.
+        "worker:feature-x"). It is optional: if the user did not give you a
+        specific name, register under your current session's title (a short slug
+        of it) so you are addressable by it -- and if you truly have no name to
+        offer, one is assigned for you (a "session-..." handle, returned in
+        `you`). `role` is an optional shared address for a group (e.g. "worker")
+        -- a message sent to a role is delivered to any participant that reads
+        with that role. Re-call to refresh your presence (a heartbeat) or change
+        your role. Returns the `board` you joined and the current live
+        participants (with a `hint` if you're the only one).
         """
         return sb.register(ctx, name, role)
 
@@ -416,7 +516,9 @@ def build_server(store: Optional[Store] = None, *, ttl: Optional[float] = None) 
         `to` is an address: a participant name or a role. `body` is the message
         text. Pass `reply_to` with a message id you received to thread a reply.
         Delivery is durable -- the message waits even if `to` is offline or has
-        not registered yet. Returns the new message `id`.
+        not registered yet. Returns the new message `id`; if no live participant
+        currently reads `to`, the result also carries `no_live_recipient` and a
+        `warning` (most often a typo'd name/role).
         """
         return await sb.send_async(ctx, to, body, reply_to)
 
@@ -457,7 +559,9 @@ def build_server(store: Optional[Store] = None, *, ttl: Optional[float] = None) 
         to the question's `from` (your unique name) -- that is where ask() looks;
         replying to a shared role could let a role peer drain it first. On timeout
         returns `timed_out=true` and `reply=null` (the question still sits durably
-        in the recipient's inbox). Other messages in your inbox are left untouched.
+        in the recipient's inbox); if nobody was even registered as `to` when you
+        asked, the result also carries `no_live_recipient` so you can tell "wrong
+        address" from "still thinking". Other messages in your inbox are untouched.
         """
         return await sb.ask(ctx, to, body, timeout_s)
 
@@ -495,7 +599,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--db",
         default=None,
-        help="Path to the SQLite database (default: $SWITCHBOARD_DB or ~/.claude/switchboard.db).",
+        help="Path to the SQLite database (raw override; wins over --board and "
+        "$SWITCHBOARD_DB). Default: the current board's file.",
+    )
+    parser.add_argument(
+        "--board",
+        default=None,
+        help="Switchboard/board to target (default: $SWITCHBOARD_BOARD or the "
+        "current project). Each board is an isolated bus at "
+        "~/.claude/switchboard/<board>.db.",
     )
     parser.add_argument(
         "--ttl",
@@ -514,6 +626,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, default=int(os.environ.get("SWITCHBOARD_PORT", "8765")))
 
     # Human-facing inspection commands (read the DB directly; no MCP server).
+    sub.add_parser("boards", help="List local switchboards (boards) and their live participants.")
     sub.add_parser("participants", help="Print live participants and exit.")
     tail = sub.add_parser("tail", help="Print queued (undelivered) messages and exit.")
     tail.add_argument("-f", "--follow", action="store_true", help="Keep polling for new messages.")
@@ -542,6 +655,35 @@ def _open_store_ro(db_path) -> Optional[Store]:
     if str(p) != ":memory:" and not p.exists():
         return None
     return Store(db_path)
+
+
+def _discover_boards() -> list[tuple[str, Path]]:
+    """(board_name, db_path) for every local board file, plus a legacy DB if any.
+
+    Sorted by name. Purely a read of the filesystem -- creates nothing.
+    """
+    found: dict[str, Path] = {}
+    d = boards_dir()
+    if d.is_dir():
+        for f in sorted(d.glob("*.db")):
+            found[f.stem] = f
+    legacy = legacy_db_path()
+    if legacy.exists():
+        found.setdefault(legacy.stem, legacy)  # shown as "switchboard"
+    return sorted(found.items())
+
+
+def _cli_boards(ttl: float) -> int:
+    boards = _discover_boards()
+    if not boards:
+        print("No switchboards yet.")
+        return 0
+    now = _now()
+    for name, path in boards:
+        # Every discovered path exists (we just globbed them), so opening is safe.
+        live = len(Store(path).participants(now=now, ttl=ttl))
+        print(f"{name}  ({live} live)  {path}")
+    return 0
 
 
 def _cli_participants(db_path, ttl: float) -> int:
@@ -606,8 +748,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"switchboard-relay {__version__}")
         return 0
 
-    db_path = args.db or os.environ.get("SWITCHBOARD_DB") or default_db_path()
     ttl = args.ttl if args.ttl is not None else _resolve_ttl()
+
+    # `boards` lists every local board and needs no single target.
+    if args.cmd == "boards":
+        return _cli_boards(ttl)
+
+    # Everything else operates on one resolved board: --db > --board >
+    # $SWITCHBOARD_DB > $SWITCHBOARD_BOARD > the current project.
+    db_path, board = resolve_target(db_arg=args.db, board_arg=args.board)
 
     # Human-facing inspection commands read the DB directly -- no server, and no
     # side effect of creating the DB if it does not exist yet.
@@ -619,14 +768,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _cli_prune(db_path, ttl, args.older_than_days)
 
     store = Store(db_path)
-    mcp = build_server(store, ttl=ttl)
+    mcp = build_server(store, ttl=ttl, board=board)
 
     if args.cmd == "serve":
         mcp.settings.host = args.host
         mcp.settings.port = args.port
         print(
             f"switchboard-relay daemon (streamable-http) on http://{args.host}:{args.port}"
-            f"{mcp.settings.streamable_http_path}  db={store.db_path}",
+            f"{mcp.settings.streamable_http_path}  board={board}  db={store.db_path}",
             file=sys.stderr,
         )
         mcp.run(transport="streamable-http")
