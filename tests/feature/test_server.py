@@ -8,6 +8,8 @@ by test_integration.py).
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from switchboard_relay.server import _CHANNEL_METHOD, Switchboard
@@ -48,9 +50,120 @@ def test_resolve_requires_registration(board):
         board.inbox(_ctx())
 
 
-def test_register_rejects_empty_name(board):
-    with pytest.raises(ValueError, match="non-empty"):
-        board.register(_ctx(), "   ")
+def test_register_auto_assigns_name_when_none_given(board):
+    # A bare register() no longer dead-ends: the server can't see the session
+    # title, so it mints a usable handle, says so, and binds the session to it.
+    ctx = _ctx()
+    out = board.register(ctx, "   ")
+    assert re.fullmatch(r"session-[0-9a-f]{6}", out["you"])
+    assert "session-" in out["note"]
+    assert board.inbox(ctx)["you"] == out["you"]  # bound and usable
+
+
+def test_register_explicit_name_has_no_auto_note(board):
+    assert "note" not in board.register(_ctx(), "lead")
+
+
+def test_register_explicit_heartbeat_not_overridden_by_env_role(tmp_path, monkeypatch):
+    # $SWITCHBOARD_ROLE must not clobber an explicitly-named session's role on a
+    # bare re-register: a nameless re-call would inherit it, but an explicit one
+    # passes an empty role through so Store preserves the existing role.
+    monkeypatch.setenv("SWITCHBOARD_ROLE", "worker")
+    sb = Switchboard(Store(tmp_path / "sb.db"), ttl=300)
+    ctx = _ctx()
+    sb.register(ctx, "lead", "coordinator")  # explicit role
+    out = sb.register(ctx, "lead")  # bare heartbeat; env role is set to "worker"
+    assert out["role"] == "coordinator"  # preserved, NOT reset to the env role
+
+
+def test_register_falls_back_to_env_name(tmp_path, monkeypatch):
+    # A nameless register() adopts the environment-seeded identity when present --
+    # that is not an "assigned" name, so there is no note.
+    monkeypatch.setenv("SWITCHBOARD_NAME", "lead")
+    monkeypatch.setenv("SWITCHBOARD_ROLE", "coordinator")
+    sb = Switchboard(Store(tmp_path / "sb.db"), ttl=300)
+    out = sb.register(_ctx())  # no name, no role
+    assert out["you"] == "lead"
+    assert out["role"] == "coordinator"
+    assert "note" not in out
+
+
+# -- solo hint --------------------------------------------------------------
+
+
+def test_register_hints_when_alone(board):
+    out = board.register(_ctx(), "lead")
+    assert "only session" in out["hint"].lower()
+
+
+def test_no_solo_hint_with_multiple_participants(board):
+    board.register(_ctx(), "lead")
+    out = board.register(_ctx(), "worker:1", "worker")
+    assert "hint" not in out  # two live now, so no "you're alone" nudge
+
+
+def test_participants_hints_when_alone(board):
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    assert "hint" in board.participants(ctx)
+
+
+# -- unknown-recipient warning ---------------------------------------------
+
+
+def test_send_warns_when_no_live_recipient(board):
+    # Sender registers with an empty role, exercising the empty-role skip in the
+    # liveness check; the target address has nobody reading it.
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    out = board.send(ctx, "nobody", "hello?")
+    assert out["no_live_recipient"] is True
+    assert "warning" in out
+
+
+def test_send_no_warning_for_live_name(board):
+    a, b = _ctx(), _ctx()
+    board.register(a, "lead")
+    board.register(b, "worker:x", "worker")
+    assert "no_live_recipient" not in board.send(a, "worker:x", "hi")
+
+
+def test_send_no_warning_for_live_role(board):
+    a, b = _ctx(), _ctx()
+    board.register(a, "lead")
+    board.register(b, "worker:x", "worker")
+    assert "no_live_recipient" not in board.send(a, "worker", "hi")  # matched by role
+
+
+def test_ask_timeout_flags_unknown_recipient(board):
+    ctx = _ctx()
+    board.register(ctx, "worker:x", "worker")
+    out = _run(board.ask, ctx, "leed", "help?", 0.05)  # nobody is "leed"
+    assert out["timed_out"] is True
+    assert out["no_live_recipient"] is True
+    assert "note" in out
+
+
+def test_ask_timeout_no_flag_when_recipient_live(board):
+    w, lead = _ctx(), _ctx()
+    board.register(w, "worker:x", "worker")
+    board.register(lead, "lead")  # live, but does not reply within the timeout
+    out = _run(board.ask, w, "lead", "hi", 0.05)
+    assert out["timed_out"] is True
+    assert "no_live_recipient" not in out
+
+
+def test_register_and_participants_report_board(tmp_path):
+    sb = Switchboard(Store(tmp_path / "sb.db"), ttl=300, board="proj-abc123")
+    reg = sb.register(_ctx(), "lead")
+    assert reg["board"] == "proj-abc123"
+    assert sb.participants(_ctx())["board"] == "proj-abc123"
+
+
+def test_board_omitted_from_payload_when_unset(board):
+    # The default (unlabeled) board adds no "board" key, so payloads stay lean.
+    assert "board" not in board.register(_ctx(), "lead")
+    assert "board" not in board.participants(_ctx())
 
 
 def test_send_rejects_empty_recipient(board):

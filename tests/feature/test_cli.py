@@ -33,9 +33,10 @@ def fake_build(monkeypatch, tmp_path):
     captured = {}
     fake = FakeMCP()
 
-    def _build(store, ttl=None):
+    def _build(store, ttl=None, board=""):
         captured["db_path"] = str(store.db_path)
         captured["ttl"] = ttl
+        captured["board"] = board
         return fake
 
     monkeypatch.setenv("SWITCHBOARD_DB", str(tmp_path / "cli.db"))
@@ -72,6 +73,55 @@ def test_main_passes_db_and_ttl(fake_build, tmp_path):
     assert main(["--db", str(custom), "--ttl", "42"]) == 0
     assert captured["db_path"] == str(custom)
     assert captured["ttl"] == 42.0
+
+
+def test_main_board_label_from_env_db(fake_build):
+    # With $SWITCHBOARD_DB set (by the fixture) the board label follows the file
+    # stem, and the server is built for that board.
+    _, captured = fake_build
+    assert main([]) == 0
+    assert captured["board"] == "cli"  # $SWITCHBOARD_DB is <tmp>/cli.db
+
+
+def test_main_board_arg_targets_board_file(fake_build, monkeypatch, tmp_path):
+    # --board selects ~/.claude/switchboard/<board>.db and wins over $SWITCHBOARD_DB.
+    _, captured = fake_build
+    monkeypatch.setattr("switchboard_relay.board.boards_dir", lambda home=None: tmp_path / "sb")
+    assert main(["--board", "Team X"]) == 0
+    assert captured["board"] == "team-x"
+    assert captured["db_path"] == str(tmp_path / "sb" / "team-x.db")
+
+
+# -- boards subcommand ------------------------------------------------------
+
+
+def test_main_boards_empty(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(server, "boards_dir", lambda home=None: tmp_path / "none")
+    monkeypatch.setattr(server, "legacy_db_path", lambda home=None: tmp_path / "switchboard.db")
+    assert main(["boards"]) == 0
+    assert "No switchboards yet." in capsys.readouterr().out
+
+
+def test_main_boards_lists_with_live_counts(monkeypatch, tmp_path, capsys):
+    bdir = tmp_path / "switchboard"
+    bdir.mkdir()
+    Store(bdir / "team.db").register("lead", now=time.time())
+    Store(bdir / "quiet.db").close()  # a board file that exists but has nobody live
+    monkeypatch.setattr(server, "boards_dir", lambda home=None: bdir)
+    monkeypatch.setattr(server, "legacy_db_path", lambda home=None: tmp_path / "switchboard.db")
+    assert main(["boards"]) == 0
+    out = capsys.readouterr().out
+    assert "team" in out and "1 live" in out
+    assert "quiet" in out and "0 live" in out
+
+
+def test_main_boards_includes_legacy_db(monkeypatch, tmp_path, capsys):
+    legacy = tmp_path / "switchboard.db"
+    Store(legacy).close()
+    monkeypatch.setattr(server, "boards_dir", lambda home=None: tmp_path / "missing")
+    monkeypatch.setattr(server, "legacy_db_path", lambda home=None: legacy)
+    assert main(["boards"]) == 0
+    assert "switchboard" in capsys.readouterr().out  # legacy DB shown under its stem
 
 
 # -- _resolve_ttl -----------------------------------------------------------
