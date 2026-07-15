@@ -1,8 +1,8 @@
-"""switchboard: a local MCP server for inter-session messaging in Claude Code."""
+"""switchboard-relay: a local MCP server for inter-session messaging in Claude Code."""
 
 from importlib.metadata import PackageNotFoundError, version
 
-from switchboard.store import Message, Participant, Store, default_db_path
+from switchboard_relay.store import Message, Participant, Store, default_db_path
 
 try:
     __version__ = version("switchboard-relay")

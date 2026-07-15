@@ -12,10 +12,10 @@ A clear description of the bug.
 Steps or a minimal snippet (which tools/commands, what you sent, what you expected).
 
 **Environment**
-- switchboard version (`switchboard --version`):
+- switchboard-relay version (`switchboard-relay --version`):
 - How it's run: stdio (default) / `serve` daemon:
 - OS + Python version:
 - Number of participating sessions:
 
 **Logs**
-Any relevant stderr output (switchboard logs to stderr).
+Any relevant stderr output (switchboard-relay logs to stderr).

@@ -1,4 +1,4 @@
-"""FastMCP server exposing the switchboard tools.
+"""FastMCP server exposing the switchboard-relay tools.
 
 Two ways to run the same server:
 
@@ -33,7 +33,7 @@ from typing import Any, Optional
 import anyio
 from mcp.server.fastmcp import Context, FastMCP
 
-from switchboard.store import DEFAULT_TTL_SECONDS, Store, default_db_path
+from switchboard_relay.store import DEFAULT_TTL_SECONDS, Store, default_db_path
 
 # How often wait() checks the mailbox, and how often it heartbeats the caller's
 # liveness while parked. Poll is a balance between latency and DB churn.
@@ -225,7 +225,7 @@ class Switchboard:
             f"Call inbox() (or wait()) to read it."
         )
         meta = {
-            "source": "switchboard",
+            "source": "switchboard-relay",
             "msg_from": str(sender),
             "msg_to": str(to),
             "msg_id": str(mid),
@@ -377,7 +377,7 @@ def build_server(store: Optional[Store] = None, *, ttl: Optional[float] = None) 
     sb = Switchboard(store, ttl=ttl if ttl is not None else _resolve_ttl())
 
     mcp = FastMCP(
-        "switchboard",
+        "switchboard-relay",
         instructions=(
             "Shared message bus for independent Claude Code sessions. Call "
             'register(name) once to claim an address (e.g. "lead" or '
@@ -388,7 +388,7 @@ def build_server(store: Optional[Store] = None, *, ttl: Optional[float] = None) 
         ),
     )
     # Expose the wiring for tests and daemon introspection.
-    mcp._switchboard = sb  # type: ignore[attr-defined]
+    mcp._switchboard_relay = sb  # type: ignore[attr-defined]
 
     @mcp.tool()
     def register(name: str, role: str = "", ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
@@ -489,7 +489,7 @@ def build_server(store: Optional[Store] = None, *, ttl: Optional[float] = None) 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="switchboard",
+        prog="switchboard-relay",
         description="A local MCP server for inter-session messaging between Claude Code sessions.",
     )
     parser.add_argument(
@@ -601,9 +601,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.version:
-        from switchboard import __version__
+        from switchboard_relay import __version__
 
-        print(f"switchboard {__version__}")
+        print(f"switchboard-relay {__version__}")
         return 0
 
     db_path = args.db or os.environ.get("SWITCHBOARD_DB") or default_db_path()
@@ -625,7 +625,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         mcp.settings.host = args.host
         mcp.settings.port = args.port
         print(
-            f"switchboard daemon (streamable-http) on http://{args.host}:{args.port}"
+            f"switchboard-relay daemon (streamable-http) on http://{args.host}:{args.port}"
             f"{mcp.settings.streamable_http_path}  db={store.db_path}",
             file=sys.stderr,
         )

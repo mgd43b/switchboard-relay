@@ -1,6 +1,6 @@
 """Server-layer unit tests.
 
-These exercise the :class:`~switchboard.server.Switchboard` glue directly with a
+These exercise the :class:`~switchboard_relay.server.Switchboard` glue directly with a
 lightweight fake Context, so they cover identity binding, the opt-in push path,
 and role targeting without standing up the full MCP transport (that is covered
 by test_integration.py).
@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from switchboard.server import _CHANNEL_METHOD, Switchboard
-from switchboard.store import Store
+from switchboard_relay.server import _CHANNEL_METHOD, Switchboard
+from switchboard_relay.store import Store
 
 
 class FakeSession:

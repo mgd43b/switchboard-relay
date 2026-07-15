@@ -1,4 +1,4 @@
-"""Unit tests for the switchboard SQLite store.
+"""Unit tests for the switchboard-relay SQLite store.
 
 These exercise the pure store in isolation: register/heartbeat, send/inbox
 drain semantics, role addressing, `since`, and TTL expiry. Time is injected via
@@ -12,8 +12,8 @@ import types
 
 import pytest
 
-import switchboard.store as store_mod
-from switchboard.store import (
+import switchboard_relay.store as store_mod
+from switchboard_relay.store import (
     DEFAULT_TTL_SECONDS,
     Store,
     _enable_wal,

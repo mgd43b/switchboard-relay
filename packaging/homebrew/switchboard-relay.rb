@@ -1,14 +1,14 @@
-# Homebrew formula for switchboard.
+# Homebrew formula for switchboard-relay.
 #
 # This is the SOURCE TEMPLATE. The live formula lives in the tap repo at
-# github.com/mgd43b/homebrew-taps → Formula/switchboard.rb. Copy this there,
+# github.com/mgd43b/homebrew-taps → Formula/switchboard-relay.rb. Copy this there,
 # then fill the `url`/`sha256` and (auto-)generate the `resource` stanzas with:
 #
-#     brew update-python-resources switchboard      # macOS + Homebrew required
+#     brew update-python-resources switchboard-relay      # macOS + Homebrew required
 #
 # See RELEASING.md for the full first-time and per-release procedure. Users then
-# install with:  brew install mgd43b/taps/switchboard
-class Switchboard < Formula
+# install with:  brew install mgd43b/taps/switchboard-relay
+class SwitchboardRelay < Formula
   include Language::Python::Virtualenv
 
   desc "Shared, durable messaging channel for independent Claude Code sessions"
@@ -28,7 +28,7 @@ class Switchboard < Formula
   depends_on "rust" => :build
 
   # ---- BEGIN auto-generated resources ------------------------------------
-  # Do NOT hand-edit. Regenerate with `brew update-python-resources switchboard`.
+  # Do NOT hand-edit. Regenerate with `brew update-python-resources switchboard-relay`.
   # The real file lists mcp, pydantic, pydantic-core, anyio, starlette, httpx,
   # sse-starlette, uvicorn, and all their transitive deps (~20-25 stanzas).
   #
@@ -43,6 +43,6 @@ class Switchboard < Formula
   end
 
   test do
-    assert_match "switchboard", shell_output("#{bin}/switchboard --version")
+    assert_match "switchboard-relay", shell_output("#{bin}/switchboard-relay --version")
   end
 end

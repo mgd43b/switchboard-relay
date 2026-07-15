@@ -1,4 +1,4 @@
-# switchboard
+# switchboard-relay
 
 [![CI](https://github.com/mgd43b/switchboard-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/mgd43b/switchboard-relay/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/switchboard-relay)](https://pypi.org/project/switchboard-relay/)
@@ -9,31 +9,31 @@
 
 Claude Code's built‑in session channel is injected only by the desktop/GUI app, so
 terminal CLI sessions can't use it. A *config‑level* MCP server, by contrast, loads on
-**every** surface — terminal CLI, desktop, and IDE — and its tools are allowlistable. `switchboard`
+**every** surface — terminal CLI, desktop, and IDE — and its tools are allowlistable. `switchboard-relay`
 is a tiny such server: it routes named messages between any set of Claude Code sessions on
 one machine, backed by SQLite so mailboxes survive restarts.
 
 ```
-  worker:feature-x ──send("lead", "what's the API for X?")──▶  ┌───────────┐
-                                                               │switchboard│  (SQLite mailbox)
-  lead ◀──inbox() / wait()── "what's the API for X?" ──────────└───────────┘
+  worker:feature-x ──send("lead", "what's the API for X?")──▶  ┌─────────────────┐
+                                                               │switchboard-relay│  (SQLite mailbox)
+  lead ◀──inbox() / wait()── "what's the API for X?" ──────────└─────────────────┘
   lead ──send("worker:feature-x", "use client.foo()")─────────▶  …delivered to worker's inbox
 ```
 
 The canonical pattern: a long‑running **lead** session that short‑lived **worker** sessions ask
-questions of — no copy‑pasting between windows. But `switchboard` just routes named messages, so
+questions of — no copy‑pasting between windows. But `switchboard-relay` just routes named messages, so
 any addressing scheme works.
 
 ---
 
 ## Install
 
-`switchboard` is a standard Python package (Python ≥ 3.10). Install it so the `switchboard`
+`switchboard-relay` is a standard Python package (Python ≥ 3.10). Install it so the `switchboard-relay`
 command is on your `PATH`:
 
 ```bash
 # Homebrew (macOS/Linux)
-brew install mgd43b/taps/switchboard
+brew install mgd43b/taps/switchboard-relay
 
 # with uv (recommended)
 uv tool install switchboard-relay
@@ -48,40 +48,40 @@ uv tool install .
 Then register it with Claude Code at **user scope** (loads in every project, on every surface):
 
 ```bash
-claude mcp add --scope user -- switchboard
+claude mcp add --scope user -- switchboard-relay
 ```
 
-That's it. Open any Claude Code session (terminal or desktop) and the eight `switchboard`
+That's it. Open any Claude Code session (terminal or desktop) and the eight `switchboard-relay`
 tools are available. Verify with `claude mcp list`.
 
 > **No install step?** If you'd rather not install anything, point Claude Code at `uvx`:
 > ```bash
-> claude mcp add --scope user -- uvx --from switchboard-relay switchboard
+> claude mcp add --scope user -- uvx switchboard-relay
 > ```
 
 ### Make the tools run without a confirmation prompt (allowlist)
 
-MCP tools are named `mcp__switchboard__<tool>`. To let them fire without a per‑call prompt,
+MCP tools are named `mcp__switchboard-relay__<tool>`. To let them fire without a per‑call prompt,
 add them to `permissions.allow` in your user settings (`~/.claude/settings.json`):
 
 ```json
 {
   "permissions": {
     "allow": [
-      "mcp__switchboard__register",
-      "mcp__switchboard__participants",
-      "mcp__switchboard__send",
-      "mcp__switchboard__inbox",
-      "mcp__switchboard__wait",
-      "mcp__switchboard__ask",
-      "mcp__switchboard__broadcast",
-      "mcp__switchboard__unregister"
+      "mcp__switchboard-relay__register",
+      "mcp__switchboard-relay__participants",
+      "mcp__switchboard-relay__send",
+      "mcp__switchboard-relay__inbox",
+      "mcp__switchboard-relay__wait",
+      "mcp__switchboard-relay__ask",
+      "mcp__switchboard-relay__broadcast",
+      "mcp__switchboard-relay__unregister"
     ]
   }
 }
 ```
 
-Or allowlist the whole server with a single entry: `"mcp__switchboard"`.
+Or allowlist the whole server with a single entry: `"mcp__switchboard-relay"`.
 
 ---
 
@@ -96,7 +96,7 @@ Or allowlist the whole server with a single entry: `"mcp__switchboard"`.
 | `wait` | `wait(timeout_s?)` | Block up to `timeout_s` seconds (default 30, max 3600) until a message arrives, then drain and return it. Returns `timed_out: true` on timeout. |
 | `ask` | `ask(to, body, timeout_s?)` | **Request/response in one call:** send `body` to `to`, then block until a reply threaded to it comes back (`reply_to` = the returned `question_id`). Leaves other inbox messages untouched; returns `timed_out: true` if no reply in time. |
 | `broadcast` | `broadcast(body)` | Send `body` to every currently‑live participant except yourself. Returns the per‑recipient message ids. |
-| `unregister` | `unregister()` | Leave the switchboard (drop out of `participants()`). Your mailbox is preserved for if you return. |
+| `unregister` | `unregister()` | Leave the switchboard-relay (drop out of `participants()`). Your mailbox is preserved for if you return. |
 
 Messages are **durable**: a message sent to a name that hasn't registered yet simply waits in
 that mailbox until it's read. Addressing by `role` fans a message out to whichever participant
@@ -109,7 +109,7 @@ reads with that role — for reliable one‑to‑one delivery, use unique names.
 **In your long‑running lead session** (e.g. a coordinator you keep open in a terminal):
 
 ```
-Register me on switchboard as "lead", then keep calling wait() in a loop:
+Register me on switchboard-relay as "lead", then keep calling wait() in a loop:
 whenever a message arrives, answer the question by sending a reply back to
 its sender (use reply_to), then wait() again.
 ```
@@ -118,13 +118,13 @@ Claude will `register(name="lead")` and then park in `wait()`. Pair it with the
 [`/loop`](https://code.claude.com/docs/en/slash-commands) skill to keep it going hands‑free:
 
 ```
-/loop wait for a switchboard message, answer it, and reply to the sender
+/loop wait for a switchboard-relay message, answer it, and reply to the sender
 ```
 
 **In each worker session:**
 
 ```
-Register me on switchboard as "worker:auth" with role "worker", then use ask()
+Register me on switchboard-relay as "worker:auth" with role "worker", then use ask()
 to ask the lead how our auth middleware refreshes tokens.
 ```
 
@@ -138,14 +138,14 @@ returns the reply. No window‑switching, no manual `wait()`.
 
 ### Peek at the traffic from your terminal
 
-`switchboard` doubles as a small inspection CLI over the same database — handy for debugging
+`switchboard-relay` doubles as a small inspection CLI over the same database — handy for debugging
 who's connected and what's queued, without an MCP client:
 
 ```bash
-switchboard participants     # live participants (name, role, idle time)
-switchboard tail             # queued (undelivered) messages
-switchboard tail --follow    # …and keep watching
-switchboard prune            # delete old dead-letter messages + expired participants
+switchboard-relay participants     # live participants (name, role, idle time)
+switchboard-relay tail             # queued (undelivered) messages
+switchboard-relay tail --follow    # …and keep watching
+switchboard-relay prune            # delete old dead-letter messages + expired participants
 ```
 
 Example recipes for the lead loop and workers live in [`examples/`](examples/).
@@ -167,32 +167,32 @@ All optional. Set as environment variables (e.g. via `claude mcp add --env KEY=v
 Example with a custom TTL:
 
 ```bash
-claude mcp add --scope user --env SWITCHBOARD_TTL=600 -- switchboard
+claude mcp add --scope user --env SWITCHBOARD_TTL=600 -- switchboard-relay
 ```
 
 ---
 
 ## How it works (and its one limitation)
 
-Each Claude Code session spawns its **own** `switchboard` process (stdio transport). Those
+Each Claude Code session spawns its **own** `switchboard-relay` process (stdio transport). Those
 processes don't talk to each other directly — they share state through the SQLite database, which
 gives you durability and cross‑session delivery for free. `wait()` long‑polls that database.
 
-This design has one consequence worth knowing: **switchboard cannot wake a session that isn't
+This design has one consequence worth knowing: **switchboard-relay cannot wake a session that isn't
 already doing something.** A recipient learns about a message by calling `inbox()` or `wait()`
 (on its next turn, or while parked in a `/loop`). Nothing can push into a fully idle or closed
-session — that's a property of how Claude Code sessions work, not a switchboard limitation.
+session — that's a property of how Claude Code sessions work, not a switchboard-relay limitation.
 
 ### Experimental: push via Channels (daemon mode)
 
 There's an opt‑in path for lower‑latency delivery into a session that's *currently open*. Run
-switchboard as a single shared HTTP daemon instead of per‑session stdio:
+switchboard-relay as a single shared HTTP daemon instead of per‑session stdio:
 
 ```bash
 # start the daemon (push is a daemon-side opt-in)
-SWITCHBOARD_PUSH=1 switchboard serve --host 127.0.0.1 --port 8765
+SWITCHBOARD_PUSH=1 switchboard-relay serve --host 127.0.0.1 --port 8765
 # point every session at it instead of the stdio server
-claude mcp add --scope user --transport http switchboard http://127.0.0.1:8765/mcp
+claude mcp add --scope user --transport http switchboard-relay http://127.0.0.1:8765/mcp
 ```
 
 In daemon mode all sessions connect to one process, so `send()` can emit a Claude Code
@@ -201,7 +201,7 @@ to a connected recipient. The notification is a **nudge to check your inbox**, n
 the durable SQLite row stays the single source of truth, so a recipient still `inbox()`‑drains the
 message exactly once (and a role‑addressed nudge reaches every connected member, but only one drains
 the row). This is **experimental**: it requires the recipient session to be running and subscribed to
-switchboard as a channel (Claude Code's channels feature is itself a research preview and may require
+switchboard-relay as a channel (Claude Code's channels feature is itself a research preview and may require
 extra flags), and it never replaces durable delivery. Leave it off (the default) and everything works
 via polling.
 
@@ -217,8 +217,8 @@ uv run ruff check .           # lint
 uv run ruff format .          # format
 ```
 
-- `src/switchboard/store.py` — the durable SQLite store (registry + mailboxes). Pure and clock‑free.
-- `src/switchboard/server.py` — the FastMCP server: identity binding, the eight tools, the `wait()` poll loop, and best‑effort push.
+- `src/switchboard_relay/store.py` — the durable SQLite store (registry + mailboxes). Pure and clock‑free.
+- `src/switchboard_relay/server.py` — the FastMCP server: identity binding, the eight tools, the `wait()` poll loop, and best‑effort push.
 - `tests/` is split into three tiers:
   - `tests/unit/` — the SQLite store in isolation.
   - `tests/feature/` — tool/feature behavior through the server layer (identity, push, roles, the CLI) with a fake Context.

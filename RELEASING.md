@@ -1,4 +1,4 @@
-# Releasing switchboard
+# Releasing switchboard-relay
 
 Versioning and releases are automated with
 [release-please](https://github.com/googleapis/release-please). It reads the
@@ -31,13 +31,13 @@ Homebrew**.
 
 1. Create the tap once: `brew tap-new mgd43b/homebrew-taps` and push it to GitHub.
 2. After the first PyPI release, run the update script (see below) — it seeds
-   `Formula/switchboard.rb` from [`packaging/homebrew/switchboard.rb`](packaging/homebrew/switchboard.rb),
+   `Formula/switchboard-relay.rb` from [`packaging/homebrew/switchboard-relay.rb`](packaging/homebrew/switchboard-relay.rb),
    generates the pinned dependency `resource` stanzas, and pushes.
 
 Users then install with:
 
 ```bash
-brew install mgd43b/taps/switchboard   # or: brew tap mgd43b/taps && brew install switchboard
+brew install mgd43b/taps/switchboard-relay   # or: brew tap mgd43b/taps && brew install switchboard-relay
 ```
 
 ## Cutting a release

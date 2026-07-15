@@ -49,7 +49,7 @@ dev = [
 ]
 
 [project.scripts]
-switchboard = "switchboard.server:main"
+switchboard-relay = "switchboard_relay.server:main"
 
 [project.urls]
 Homepage = "https://github.com/mgd43b/switchboard-relay"
@@ -57,12 +57,12 @@ Repository = "https://github.com/mgd43b/switchboard-relay"
 Issues = "https://github.com/mgd43b/switchboard-relay/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/switchboard"]
+packages = ["src/switchboard_relay"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "-ra --cov=switchboard --cov-report=term-missing --cov-fail-under=95"
+addopts = "-ra --cov=switchboard_relay --cov-report=term-missing --cov-fail-under=95"
 markers = [
     "unit: pure component tests (the store in isolation)",
     "feature: tool/feature behavior through the server layer (no transport)",
@@ -70,7 +70,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["switchboard"]
+source = ["switchboard_relay"]
 branch = true
 
 [tool.coverage.report]

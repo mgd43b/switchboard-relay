@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Update the Homebrew tap formula for a new switchboard release.
+# Update the Homebrew tap formula for a new switchboard-relay release.
 #
-# switchboard is a Python package, so unlike a source-tarball (Rust/Go) formula
+# switchboard-relay is a Python package, so unlike a source-tarball (Rust/Go) formula
 # this does more than bump url+sha256: it regenerates the pinned dependency
 # `resource` stanzas with `brew update-python-resources` (Homebrew builds in a
 # no-network sandbox, so every dep must be a checksummed resource). Requires
@@ -19,7 +19,7 @@ NC='\033[0m'
 # Configuration
 REPO_OWNER="mgd43b"
 PYPI_NAME="switchboard-relay"   # PyPI distribution name
-FORMULA_NAME="switchboard"    # formula file / installed name
+FORMULA_NAME="switchboard-relay"    # formula file / installed name
 TAP_REPO="homebrew-taps"
 TAP_PATH="$(brew --repository 2>/dev/null)/Library/Taps/${REPO_OWNER}/${TAP_REPO}"
 FORMULA_PATH="${TAP_PATH}/Formula/${FORMULA_NAME}.rb"
@@ -57,7 +57,7 @@ usage() {
     cat <<EOF
 Usage: $0 <version> [options]
 
-Update the Homebrew tap formula for a new switchboard release.
+Update the Homebrew tap formula for a new switchboard-relay release.
 
 Arguments:
   version       Version number (e.g., 0.1.0) without the 'v' prefix
