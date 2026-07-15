@@ -1,6 +1,6 @@
-# Contributing to switchboard
+# Contributing to switchboard-relay
 
-Thanks for your interest! switchboard aims to stay small, dependency‑light, and well‑tested.
+Thanks for your interest! switchboard-relay aims to stay small, dependency‑light, and well‑tested.
 
 ## Setup
 

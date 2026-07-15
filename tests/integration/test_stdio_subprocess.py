@@ -2,11 +2,11 @@
 
 This is the truest reproduction of the deployment shape: two separate OS
 processes (as two Claude Code sessions would be), each running the installed
-``switchboard`` console script, talking only through the shared DB file. It
+``switchboard-relay`` console script, talking only through the shared DB file. It
 exercises the console entry point, the stdio transport, and cross-process
 durability all at once.
 
-Skipped automatically if the ``switchboard`` console script is not on PATH
+Skipped automatically if the ``switchboard-relay`` console script is not on PATH
 (e.g. the package was not installed, only imported).
 """
 
@@ -26,10 +26,10 @@ from mcp.client.stdio import stdio_client
 def _find_switchboard() -> str | None:
     # Prefer PATH, but also look next to the running interpreter so the test
     # runs inside a virtualenv that hasn't been PATH-activated (and in CI).
-    found = shutil.which("switchboard")
+    found = shutil.which("switchboard-relay")
     if found:
         return found
-    candidate = Path(sys.executable).parent / "switchboard"
+    candidate = Path(sys.executable).parent / "switchboard-relay"
     return str(candidate) if candidate.exists() else None
 
 
@@ -37,7 +37,7 @@ SWITCHBOARD_BIN = _find_switchboard()
 
 pytestmark = pytest.mark.skipif(
     SWITCHBOARD_BIN is None,
-    reason="`switchboard` console script not on PATH (install the package to run this test)",
+    reason="`switchboard-relay` console script not on PATH (install the package to run this test)",
 )
 
 

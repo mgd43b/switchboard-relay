@@ -1,9 +1,9 @@
-"""Integration tests: drive the switchboard tools over a real MCP transport.
+"""Integration tests: drive the switchboard-relay tools over a real MCP transport.
 
 Two independent client sessions connect to one FastMCP server through the SDK's
 in-memory client/server pipe, so each has its own MCP session (distinct
 identity) while sharing the same durable store -- exactly the shape of two
-Claude Code sessions talking through switchboard. This is the wire-level proof
+Claude Code sessions talking through switchboard-relay. This is the wire-level proof
 of the acceptance criteria (register -> send -> inbox -> reply, TTL expiry,
 wait()).
 """
@@ -15,8 +15,8 @@ from contextlib import asynccontextmanager
 
 from mcp.shared.memory import create_connected_server_and_client_session as connect
 
-from switchboard.server import build_server
-from switchboard.store import Store
+from switchboard_relay.server import build_server
+from switchboard_relay.store import Store
 
 
 def make_board(tmp_path, *, ttl: float = 300.0):

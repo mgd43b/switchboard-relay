@@ -23,7 +23,7 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
-# SQLite databases (switchboard's runtime state)
+# SQLite databases (switchboard-relay's runtime state)
 *.db
 *.db-wal
 *.db-shm

@@ -11,9 +11,9 @@ import types
 
 import pytest
 
-import switchboard.server as server
-from switchboard.server import DEFAULT_TTL_SECONDS, _resolve_ttl, main
-from switchboard.store import Store
+import switchboard_relay.server as server
+from switchboard_relay.server import DEFAULT_TTL_SECONDS, _resolve_ttl, main
+from switchboard_relay.store import Store
 
 
 class FakeMCP:
@@ -47,7 +47,7 @@ def test_main_version(capsys):
     rc = main(["--version"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "switchboard" in out
+    assert "switchboard-relay" in out
     assert any(ch.isdigit() for ch in out)  # includes a version number
 
 
