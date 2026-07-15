@@ -1,26 +1,33 @@
 version: 2
 updates:
-  # GitHub Actions used by the CI and release workflows. Grouped so all bumps
-  # land in a single PR instead of one per action.
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-    commit-message:
-      prefix: "ci"
-    groups:
-      github-actions:
-        patterns: ["*"]
-
   # Python dependencies declared in pyproject.toml (runtime + test/dev extras).
+  # `fix` prefix + scope => PR titles like "fix(deps): bump the python group ...",
+  # which release-please treats as a patch bump, so dependency updates flow into
+  # the next release. Grouped so all bumps land in a single PR.
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
     commit-message:
-      prefix: "deps"
+      prefix: "fix"
+      include: "scope"
     groups:
       python:
+        patterns: ["*"]
+
+  # GitHub Actions used by the CI and release workflows. These are CI-only and do
+  # not change the published package, so they use `chore` (release-please ignores
+  # them — no point cutting a PyPI release for a byte-identical artifact). Switch
+  # the prefix to `fix` if you want action bumps to trigger releases too.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      github-actions:
         patterns: ["*"]
