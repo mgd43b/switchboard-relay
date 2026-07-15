@@ -222,6 +222,34 @@ def test_resolve_target_project_default(monkeypatch, tmp_path):
     assert p == tmp_path / "sb" / f"{label}.db"
 
 
+# -- describe_target reports the resolution source --------------------------
+
+
+def test_describe_target_source_db_arg(tmp_path):
+    assert board.describe_target(db_arg=str(tmp_path / "x.db")).source == "--db"
+
+
+def test_describe_target_source_board_arg():
+    assert board.describe_target(board_arg="team").source == "--board"
+
+
+def test_describe_target_source_db_env(tmp_path):
+    assert board.describe_target(env={"SWITCHBOARD_DB": str(tmp_path / "e.db")}).source == (
+        "$SWITCHBOARD_DB"
+    )
+
+
+def test_describe_target_source_board_env():
+    assert board.describe_target(env={"SWITCHBOARD_BOARD": "team"}).source == "$SWITCHBOARD_BOARD"
+
+
+def test_describe_target_source_project(monkeypatch, tmp_path):
+    monkeypatch.setattr(board, "_git_common_dir", lambda base: None)
+    t = board.describe_target(env={"CLAUDE_PROJECT_DIR": str(tmp_path)})
+    assert t.source == "project"
+    assert _NAME_RE.fullmatch(t.board)
+
+
 # -- real git: worktrees share a board, distinct repos do not ---------------
 
 

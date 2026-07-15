@@ -33,10 +33,12 @@ def fake_build(monkeypatch, tmp_path):
     captured = {}
     fake = FakeMCP()
 
-    def _build(store, ttl=None, board=""):
+    def _build(store, ttl=None, board="", msg_ttl=None, max_body=None):
         captured["db_path"] = str(store.db_path)
         captured["ttl"] = ttl
         captured["board"] = board
+        captured["msg_ttl"] = msg_ttl
+        captured["max_body"] = max_body
         return fake
 
     monkeypatch.setenv("SWITCHBOARD_DB", str(tmp_path / "cli.db"))
@@ -122,6 +124,94 @@ def test_main_boards_includes_legacy_db(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(server, "legacy_db_path", lambda home=None: legacy)
     assert main(["boards"]) == 0
     assert "switchboard" in capsys.readouterr().out  # legacy DB shown under its stem
+
+
+# -- doctor subcommand ------------------------------------------------------
+
+
+def test_main_doctor_reports_resolution_env_and_hints(monkeypatch, tmp_path, capsys):
+    db = tmp_path / "d.db"
+    s = Store(db)
+    now = time.time()
+    s.register("lead", "coordinator", now=now)  # a lone participant
+    s.send("leed", "typo target", sender="lead", now=now)  # queued to a dead address
+    monkeypatch.setenv("SWITCHBOARD_DB", str(db))
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "resolved by: $SWITCHBOARD_DB" in out
+    assert "SWITCHBOARD_DB=" in out
+    assert "SWITCHBOARD_BOARD (unset)" in out
+    assert "lead" in out and "coordinator" in out
+    assert "pending (undelivered) messages: 1" in out
+    assert "only 1 live participant" in out  # lone-participant hint
+    assert "no live reader" in out  # queued-to-dead-address hint
+
+
+def test_main_doctor_healthy_when_peers_and_no_dead_mail(monkeypatch, tmp_path, capsys):
+    db = tmp_path / "h.db"
+    s = Store(db)
+    now = time.time()
+    s.register("lead", now=now)
+    s.register("worker:1", "worker", now=now)
+    s.send("lead", "queued but to a live reader", sender="worker:1", now=now)
+    monkeypatch.setenv("SWITCHBOARD_DB", str(db))
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "pending (undelivered) messages: 1" in out
+    assert "looks healthy" in out
+
+
+def test_main_doctor_no_db_does_not_create_it(monkeypatch, tmp_path, capsys):
+    missing = tmp_path / "nope.db"
+    monkeypatch.setenv("SWITCHBOARD_DB", str(missing))
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "does not exist yet" in out
+    assert "different board" in out  # steers toward a board mismatch
+    assert not missing.exists()  # read-only: must not materialize the db
+
+
+# -- _resolve_msg_ttl / _resolve_max_body -----------------------------------
+
+
+def test_resolve_msg_ttl_default_when_unset(monkeypatch):
+    monkeypatch.delenv("SWITCHBOARD_MSG_TTL", raising=False)
+    assert server._resolve_msg_ttl() == server.DEFAULT_MSG_TTL_SECONDS
+
+
+def test_resolve_msg_ttl_zero_disables(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_MSG_TTL", "0")
+    assert server._resolve_msg_ttl() == 0.0
+
+
+def test_resolve_msg_ttl_reads_positive(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_MSG_TTL", "3600")
+    assert server._resolve_msg_ttl() == 3600.0
+
+
+def test_resolve_msg_ttl_falls_back_on_bad_value(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_MSG_TTL", "not-a-number")
+    assert server._resolve_msg_ttl() == server.DEFAULT_MSG_TTL_SECONDS
+
+
+def test_resolve_max_body_default_when_unset(monkeypatch):
+    monkeypatch.delenv("SWITCHBOARD_MAX_BODY", raising=False)
+    assert server._resolve_max_body() == server.DEFAULT_MAX_BODY_BYTES
+
+
+def test_resolve_max_body_zero_disables(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_MAX_BODY", "0")
+    assert server._resolve_max_body() == 0
+
+
+def test_resolve_max_body_reads_positive(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_MAX_BODY", "1024")
+    assert server._resolve_max_body() == 1024
+
+
+def test_resolve_max_body_falls_back_on_bad_value(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_MAX_BODY", "huge")
+    assert server._resolve_max_body() == server.DEFAULT_MAX_BODY_BYTES
 
 
 # -- _resolve_ttl -----------------------------------------------------------

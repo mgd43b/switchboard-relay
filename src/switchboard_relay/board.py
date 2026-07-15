@@ -30,6 +30,7 @@ import hashlib
 import os
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -150,13 +151,27 @@ def resolve_board(env: Optional[dict] = None) -> str:
     return project_board(env)
 
 
-def resolve_target(
+@dataclass(frozen=True)
+class Target:
+    """A resolved switchboard target: its db file, board name, and *how* we got there.
+
+    ``source`` is one of ``--db``, ``$SWITCHBOARD_DB``, ``--board``,
+    ``$SWITCHBOARD_BOARD``, or ``project`` -- surfaced by ``doctor`` so a user can
+    see why they landed on a given board.
+    """
+
+    db_path: Path
+    board: str
+    source: str
+
+
+def describe_target(
     *,
     db_arg: Optional[str] = None,
     board_arg: Optional[str] = None,
     env: Optional[dict] = None,
-) -> tuple[Path, str]:
-    """Resolve ``(db_path, board_label)`` from CLI args and the environment.
+) -> Target:
+    """Resolve the target *and* report which rule decided it (for diagnostics).
 
     Precedence: an explicit db path (``--db`` / ``$SWITCHBOARD_DB``) → an explicit
     board (``--board`` / ``$SWITCHBOARD_BOARD``) → the project-derived board. When
@@ -166,15 +181,31 @@ def resolve_target(
 
     if db_arg:
         p = Path(db_arg).expanduser()
-        return p, p.stem
+        return Target(p, p.stem, "--db")
     if board_arg:
         board = sanitize_board(board_arg)
-        return board_db_path(board), board
+        return Target(board_db_path(board), board, "--board")
 
     db_env = (env.get("SWITCHBOARD_DB") or "").strip()
     if db_env:
         p = Path(db_env).expanduser()
-        return p, p.stem
+        return Target(p, p.stem, "$SWITCHBOARD_DB")
 
-    board = resolve_board(env)
-    return board_db_path(board), board
+    raw = (env.get("SWITCHBOARD_BOARD") or "").strip()
+    if raw and raw.lower() != _PROJECT_SENTINEL:
+        board = sanitize_board(raw)
+        return Target(board_db_path(board), board, "$SWITCHBOARD_BOARD")
+
+    board = project_board(env)
+    return Target(board_db_path(board), board, "project")
+
+
+def resolve_target(
+    *,
+    db_arg: Optional[str] = None,
+    board_arg: Optional[str] = None,
+    env: Optional[dict] = None,
+) -> tuple[Path, str]:
+    """``(db_path, board_label)`` from CLI args and the environment. See :func:`describe_target`."""
+    t = describe_target(db_arg=db_arg, board_arg=board_arg, env=env)
+    return t.db_path, t.board

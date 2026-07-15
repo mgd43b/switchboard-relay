@@ -9,6 +9,7 @@ by test_integration.py).
 from __future__ import annotations
 
 import re
+import time
 
 import pytest
 
@@ -151,6 +152,83 @@ def test_ask_timeout_no_flag_when_recipient_live(board):
     out = _run(board.ask, w, "lead", "hi", 0.05)
     assert out["timed_out"] is True
     assert "no_live_recipient" not in out
+
+
+# -- hygiene bounds: body-size cap (#17) ------------------------------------
+
+
+def _sb(tmp_path, **kw):
+    return Switchboard(Store(tmp_path / "sb.db"), ttl=300, **kw)
+
+
+def test_send_rejects_oversized_body(tmp_path):
+    sb = _sb(tmp_path, max_body=10)
+    ctx = _ctx()
+    sb.register(ctx, "lead")
+    with pytest.raises(ValueError, match="over the 10-byte limit"):
+        sb.send(ctx, "worker", "x" * 11)
+
+
+def test_send_allows_body_at_the_limit(tmp_path):
+    sb = _sb(tmp_path, max_body=10)
+    ctx = _ctx()
+    sb.register(ctx, "lead")
+    assert isinstance(sb.send(ctx, "worker", "x" * 10)["id"], int)
+
+
+def test_body_cap_disabled_when_zero(tmp_path):
+    sb = _sb(tmp_path, max_body=0)
+    ctx = _ctx()
+    sb.register(ctx, "lead")
+    assert isinstance(sb.send(ctx, "worker", "x" * 5000)["id"], int)
+
+
+def test_ask_and_broadcast_also_enforce_body_cap(tmp_path):
+    sb = _sb(tmp_path, max_body=5)
+    ctx = _ctx()
+    sb.register(ctx, "lead", "worker")
+    with pytest.raises(ValueError, match="byte limit"):
+        _run(sb.ask, ctx, "peer", "toolong", 0.05)
+    with pytest.raises(ValueError, match="byte limit"):
+        _run(sb.broadcast, ctx, "toolong")
+
+
+def test_check_body_ignores_non_string(tmp_path):
+    # A non-string body bypasses the size check; Store.send enforces the type.
+    sb = _sb(tmp_path, max_body=1)
+    sb._check_body(12345)  # must not raise
+
+
+# -- hygiene bounds: undelivered-message TTL (#17) --------------------------
+
+
+def test_msg_ttl_ages_out_stale_queued_messages(tmp_path):
+    sb = _sb(tmp_path, msg_ttl=1.0)
+    now = time.time()
+    sb.store.send("lead", "ancient", sender="w", now=now - 1000)  # older than msg_ttl
+    sb.store.send("lead", "fresh", sender="w", now=now)  # recent
+    sb.register(_ctx(), "someone")  # normal op triggers opportunistic prune
+    assert [m.body for m in sb.store.inbox("lead", peek=True)] == ["fresh"]
+
+
+def test_msg_ttl_zero_disables_ageout(tmp_path):
+    sb = _sb(tmp_path, msg_ttl=0)
+    sb.store.send("lead", "ancient", sender="w", now=time.time() - 10**9)
+    sb.register(_ctx(), "someone")
+    assert [m.body for m in sb.store.inbox("lead", peek=True)] == ["ancient"]
+
+
+# -- daemon registry eviction (#18) -----------------------------------------
+
+
+def test_conns_evicted_when_participant_expires(tmp_path):
+    sb = Switchboard(Store(tmp_path / "sb.db"), ttl=0.02)
+    ctx = _ctx()
+    sb.register(ctx, "ghost")
+    assert id(ctx.session) in sb._conns
+    time.sleep(0.05)  # let ghost's participant expire past the tiny TTL
+    sb.participants(_ctx())  # any participants()/register triggers the sweep
+    assert id(ctx.session) not in sb._conns
 
 
 def test_register_and_participants_report_board(tmp_path):
