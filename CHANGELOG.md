@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1](https://github.com/mgd43b/switchboard-relay/compare/v0.2.0...v0.2.1) (2026-07-15)
+
+
+### Features
+
+* per-project boards, optional register name, and friendlier UX ([#14](https://github.com/mgd43b/switchboard-relay/issues/14)) ([5aa7622](https://github.com/mgd43b/switchboard-relay/commit/5aa76226096748d7ce5b0f0d3e0f4bd4b6ceed1f))
+
 ## [0.2.0](https://github.com/mgd43b/switchboard-relay/compare/v0.1.1...v0.2.0) (2026-07-15)
 
 
