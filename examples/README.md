@@ -1,7 +1,11 @@
 # switchboard-relay examples
 
 Copy‑paste prompt recipes for the lead / worker pattern. These assume switchboard-relay is
-installed and added at user scope (`claude mcp add --scope user -- switchboard-relay`).
+installed — either the [Claude Code plugin](../README.md#claude-code-plugin-recommended)
+(`/plugin marketplace add mgd43b/switchboard-relay` then `/plugin install switchboard-relay@mgd43b`)
+or added manually at user scope (`claude mcp add --scope user -- switchboard-relay`).
+
+> **Stuck?** Run `switchboard-relay doctor` — it says which board you're on and why nothing's flowing.
 
 > **Boards:** sessions share a **per‑project board** by default, so the lead and workers below just
 > work when they're in the same repo. To coordinate across *different* repos, put every session on
@@ -55,6 +59,7 @@ claude mcp add --scope user --env SWITCHBOARD_NAME=worker:build --env SWITCHBOAR
 From any terminal, peek at the shared state without an MCP client:
 
 ```bash
+switchboard-relay doctor            # one-shot diagnostics: board, peers, queued mail, hints
 switchboard-relay boards            # every local board + its live participant count
 switchboard-relay participants      # who's live on this project's board
 switchboard-relay tail --follow     # queued messages as they arrive

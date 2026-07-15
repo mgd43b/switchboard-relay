@@ -40,7 +40,7 @@ from typing import Any, Optional
 import anyio
 from mcp.server.fastmcp import Context, FastMCP
 
-from switchboard_relay.board import boards_dir, legacy_db_path, resolve_target
+from switchboard_relay.board import boards_dir, describe_target, legacy_db_path
 from switchboard_relay.store import DEFAULT_TTL_SECONDS, Store
 
 # How often wait() checks the mailbox, and how often it heartbeats the caller's
@@ -79,6 +79,40 @@ def _resolve_ttl() -> float:
         return DEFAULT_TTL_SECONDS
 
 
+# Undelivered messages age out after this many seconds, pruned opportunistically
+# (the same pattern as participant expiry). Overridable via $SWITCHBOARD_MSG_TTL;
+# a value <= 0 disables age-out entirely.
+DEFAULT_MSG_TTL_SECONDS = 7 * 86400.0
+
+# Reject a send() whose body exceeds this many UTF-8 bytes -- a hygiene bound so a
+# runaway sender can't bloat the store. Overridable via $SWITCHBOARD_MAX_BODY; a
+# value <= 0 disables the cap.
+DEFAULT_MAX_BODY_BYTES = 256 * 1024
+
+
+def _resolve_msg_ttl() -> float:
+    raw = os.environ.get("SWITCHBOARD_MSG_TTL")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_MSG_TTL_SECONDS
+    try:
+        val = float(raw)
+    except ValueError:
+        return DEFAULT_MSG_TTL_SECONDS
+    return val if val > 0 else 0.0  # 0 / negative -> age-out disabled
+
+
+def _resolve_max_body() -> int:
+    raw = os.environ.get("SWITCHBOARD_MAX_BODY")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_MAX_BODY_BYTES
+    try:
+        # OverflowError guards against e.g. "1e309" -> float('inf') -> int(inf).
+        val = int(float(raw))
+    except (ValueError, OverflowError):
+        return DEFAULT_MAX_BODY_BYTES
+    return val if val > 0 else 0  # 0 / negative -> cap disabled
+
+
 def _clamp_timeout(value: Any, *, default: float = 30.0, cap: float = 3600.0) -> float:
     """Coerce a caller-supplied timeout to a sane [0, cap] range."""
     try:
@@ -106,13 +140,25 @@ class Switchboard:
     is rebuilt as sessions register.
     """
 
-    def __init__(self, store: Store, *, ttl: float = DEFAULT_TTL_SECONDS, board: str = ""):
+    def __init__(
+        self,
+        store: Store,
+        *,
+        ttl: float = DEFAULT_TTL_SECONDS,
+        board: str = "",
+        msg_ttl: float = DEFAULT_MSG_TTL_SECONDS,
+        max_body: int = DEFAULT_MAX_BODY_BYTES,
+    ):
         self.store = store
         self.ttl = ttl
         # The board this server is bound to. Purely informational here (isolation
         # is provided by pointing at a per-board database); surfaced in tool
         # responses so a session can see which switchboard it joined.
         self.board = (board or "").strip()
+        # Hygiene bounds (see issue #17). msg_ttl ages out undelivered messages
+        # opportunistically; max_body caps a single send. <= 0 disables either.
+        self.msg_ttl = msg_ttl
+        self.max_body = max_body
         # id(ctx.session) -> _Conn. Keyed by object identity because one
         # ServerSession maps to exactly one client connection for its lifetime.
         self._conns: dict[int, _Conn] = {}
@@ -256,6 +302,7 @@ class Switchboard:
         to = (to or "").strip()
         if not to:
             raise ValueError("`to` must be a non-empty address (a participant name or role).")
+        self._check_body(body)
         now = _now()
         mid = self.store.send(to, body, sender=conn.name, reply_to=reply_to, now=now)
         self.store.touch(conn.name, now=now)
@@ -328,6 +375,7 @@ class Switchboard:
         to = (to or "").strip()
         if not to:
             raise ValueError("`to` must be a non-empty address (a participant name or role).")
+        self._check_body(body)
         now = _now()
         # Note whether anyone is live to answer *before* we send -- used to explain
         # a timeout below (offline recipient vs. a live one that just didn't reply).
@@ -376,6 +424,7 @@ class Switchboard:
     async def broadcast(self, ctx: Context, body: str) -> dict:
         """Send ``body`` to every currently-live participant except the sender."""
         conn = self._resolve(ctx)
+        self._check_body(body)
         now = _now()
         recipients = [
             p for p in self.store.participants(now=now, ttl=self.ttl) if p.name != conn.name
@@ -435,6 +484,17 @@ class Switchboard:
 
     # -- helpers ------------------------------------------------------------
 
+    def _check_body(self, body: Any) -> None:
+        """Reject an over-large message body (a hygiene bound; see issue #17)."""
+        if self.max_body > 0 and isinstance(body, str):
+            n = len(body.encode("utf-8"))
+            if n > self.max_body:
+                raise ValueError(
+                    f"Message body is {n} bytes, over the {self.max_body}-byte limit "
+                    "(set $SWITCHBOARD_MAX_BODY to change it, or 0 to disable). Send a "
+                    "shorter message, or a reference/path instead of inlining large content."
+                )
+
     def _has_live_recipient(self, to: str) -> bool:
         """True if some live participant reads ``to`` (by its name or its role)."""
         now = _now()
@@ -454,12 +514,32 @@ class Switchboard:
             "SWITCHBOARD_BOARD -- and register it to start talking."
         )
 
+    def _prune_conns(self, live_names: set[str]) -> None:
+        """Evict daemon registry entries whose participant is no longer live.
+
+        The daemon keys ``_conns`` on the live ``ServerSession`` object, so a
+        client that disconnects without calling ``unregister()`` would otherwise
+        linger forever (issue #18). A connected session heartbeats on every tool
+        call, keeping its participant live; a departed one expires from the store
+        within the TTL and is swept here. Bounds the registry to (live sessions +
+        at most one TTL window of stragglers) -- no unbounded leak.
+        """
+        stale = [sid for sid, c in self._conns.items() if c.name not in live_names]
+        for sid in stale:
+            del self._conns[sid]
+
     def _participants_payload(self) -> list[dict]:
         now = _now()
-        # Opportunistic housekeeping so the table does not grow unbounded.
+        # Opportunistic housekeeping so neither the participant table nor the
+        # undelivered-message backlog grows unbounded. Message age-out mirrors
+        # participant expiry: pruned during normal operation, never on a timer.
         self.store.prune_participants(now=now, ttl=self.ttl)
+        if self.msg_ttl > 0:
+            self.store.prune_messages(older_than=now - self.msg_ttl)
+        live = self.store.participants(now=now, ttl=self.ttl)
+        self._prune_conns({p.name for p in live})
         out = []
-        for p in self.store.participants(now=now, ttl=self.ttl):
+        for p in live:
             d = p.to_dict()
             d["idle_seconds"] = round(now - p.last_seen, 1)
             out.append(d)
@@ -473,10 +553,23 @@ class Switchboard:
 
 
 def build_server(
-    store: Optional[Store] = None, *, ttl: Optional[float] = None, board: str = ""
+    store: Optional[Store] = None,
+    *,
+    ttl: Optional[float] = None,
+    board: str = "",
+    msg_ttl: Optional[float] = None,
+    max_body: Optional[int] = None,
 ) -> FastMCP:
     store = store if store is not None else Store()
-    sb = Switchboard(store, ttl=ttl if ttl is not None else _resolve_ttl(), board=board)
+    sb = Switchboard(
+        store,
+        ttl=ttl if ttl is not None else _resolve_ttl(),
+        board=board,
+        # Match the ttl pattern: resolve from the environment when not supplied,
+        # so programmatic callers behave like the CLI.
+        msg_ttl=msg_ttl if msg_ttl is not None else _resolve_msg_ttl(),
+        max_body=max_body if max_body is not None else _resolve_max_body(),
+    )
 
     mcp = FastMCP(
         "switchboard-relay",
@@ -630,12 +723,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd")
     serve = sub.add_parser(
         "serve",
-        help="Run as a shared HTTP daemon (streamable-http) enabling push. Experimental.",
+        help="Run as a shared HTTP daemon (streamable-http) so send() can push a live nudge "
+        "into a connected session (the 'responsive lead' setup; needs Claude Code Channels). "
+        "See the README.",
     )
     serve.add_argument("--host", default=os.environ.get("SWITCHBOARD_HOST", "127.0.0.1"))
     serve.add_argument("--port", type=int, default=int(os.environ.get("SWITCHBOARD_PORT", "8765")))
 
     # Human-facing inspection commands (read the DB directly; no MCP server).
+    sub.add_parser(
+        "doctor",
+        help="One-shot 'why isn't this working?' diagnostics for the current board.",
+    )
     sub.add_parser("boards", help="List local switchboards (boards) and their live participants.")
     sub.add_parser("participants", help="Print live participants and exit.")
     tail = sub.add_parser("tail", help="Print queued (undelivered) messages and exit.")
@@ -656,15 +755,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _open_store_ro(db_path) -> Optional[Store]:
-    """Open the store for a read-only peek, or None if it does not exist yet.
+    """Open an existing store for inspection, or None if it does not exist yet.
 
-    Avoids materializing the database file (and its WAL sidecars) just to run an
-    inspection command against a system that has never started the server.
+    Returns None (creating nothing) when the database file is absent, so an
+    inspection command never materializes a db on a system that has not started
+    the server. When it does exist, it is opened with ``init_schema=False`` -- no
+    WAL-mode switch, no CREATE TABLE -- so a read-only command (doctor,
+    participants, tail) writes no schema state. (`prune` also uses this and then
+    issues its DELETEs; the tables already exist.)
     """
     p = Path(str(db_path)).expanduser()
     if str(p) != ":memory:" and not p.exists():
         return None
-    return Store(db_path)
+    return Store(db_path, init_schema=False)
 
 
 def _discover_boards() -> list[tuple[str, Path]]:
@@ -693,6 +796,95 @@ def _cli_boards(ttl: float) -> int:
         # Every discovered path exists (we just globbed them), so opening is safe.
         live = len(Store(path).participants(now=now, ttl=ttl))
         print(f"{name}  ({live} live)  {path}")
+    return 0
+
+
+# Env vars worth surfacing in `doctor` -- everything that steers behavior.
+_DOCTOR_ENV_VARS = (
+    "SWITCHBOARD_DB",
+    "SWITCHBOARD_BOARD",
+    "SWITCHBOARD_TTL",
+    "SWITCHBOARD_MSG_TTL",
+    "SWITCHBOARD_MAX_BODY",
+    "SWITCHBOARD_NAME",
+    "SWITCHBOARD_ROLE",
+    "SWITCHBOARD_PUSH",
+)
+
+
+def _count_queued(store: Store, live_addresses: set[str]) -> tuple[int, int]:
+    """(total queued messages, queued to an address with no live reader).
+
+    Pages through the whole pending backlog so the counts are exact even beyond
+    one query window.
+    """
+    total = 0
+    dead = 0
+    last = 0
+    while True:
+        batch = store.pending_messages(since=last)
+        if not batch:
+            return total, dead
+        for m in batch:
+            total += 1
+            if m.to not in live_addresses:
+                dead += 1
+        last = batch[-1].id
+
+
+def _cli_doctor(target, ttl: float) -> int:
+    """Print resolution, env, live peers, and queued counts, plus heuristic hints."""
+    print("switchboard-relay doctor")
+    print(f"  board:       {target.board}")
+    print(f"  db:          {target.db_path}")
+    print(f"  resolved by: {target.source}")
+
+    print("  env:")
+    for var in _DOCTOR_ENV_VARS:
+        val = os.environ.get(var)
+        print(f"    {var}={val}" if val not in (None, "") else f"    {var} (unset)")
+
+    store = _open_store_ro(target.db_path)
+    if store is None:
+        print("  db file:     does not exist yet (nobody has registered on this board)")
+        print(
+            "\nhint: this board has no state yet. Register a session here, or you may be on a "
+            "different board than you expect -- run `switchboard-relay boards` to compare."
+        )
+        return 0
+
+    now = _now()
+    parts = store.participants(now=now, ttl=ttl)
+    print("  db file:     exists")
+    print(f"  live participants: {len(parts)}")
+    for p in parts:
+        role = f" [{p.role}]" if p.role else ""
+        print(f"    {p.name}{role}  idle={round(now - p.last_seen, 1)}s")
+
+    live_addresses = {p.name for p in parts} | {p.role for p in parts if p.role}
+    total_queued, dead_queued = _count_queued(store, live_addresses)
+    print(f"  pending (undelivered) messages: {total_queued}")
+
+    hints = []
+    if len(parts) <= 1:
+        who = "no live participants" if not parts else "only 1 live participant"
+        hints.append(
+            f"{who} on this board -- if a peer should be here, it is likely on a DIFFERENT board. "
+            "Compare with `switchboard-relay boards`, or put both sessions on the same "
+            "$SWITCHBOARD_BOARD."
+        )
+    if dead_queued:
+        hints.append(
+            f"{dead_queued} message(s) are queued to an address with no live reader -- likely a "
+            "misspelled name/role in `to`, or the recipient isn't running. Check the `to` "
+            "addresses (`switchboard-relay tail`) against the live list above."
+        )
+    if hints:
+        print("\nhints:")
+        for h in hints:
+            print(f"  - {h}")
+    else:
+        print("\nlooks healthy: live peers are present and nothing is stuck to a dead address.")
     return 0
 
 
@@ -766,10 +958,13 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Everything else operates on one resolved board: --db > --board >
     # $SWITCHBOARD_DB > $SWITCHBOARD_BOARD > the current project.
-    db_path, board = resolve_target(db_arg=args.db, board_arg=args.board)
+    target = describe_target(db_arg=args.db, board_arg=args.board)
+    db_path = target.db_path
 
     # Human-facing inspection commands read the DB directly -- no server, and no
     # side effect of creating the DB if it does not exist yet.
+    if args.cmd == "doctor":
+        return _cli_doctor(target, ttl)
     if args.cmd == "participants":
         return _cli_participants(db_path, ttl)
     if args.cmd == "tail":
@@ -778,14 +973,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _cli_prune(db_path, ttl, args.older_than_days)
 
     store = Store(db_path)
-    mcp = build_server(store, ttl=ttl, board=board)
+    mcp = build_server(
+        store, ttl=ttl, board=target.board, msg_ttl=_resolve_msg_ttl(), max_body=_resolve_max_body()
+    )
 
     if args.cmd == "serve":
         mcp.settings.host = args.host
         mcp.settings.port = args.port
         print(
             f"switchboard-relay daemon (streamable-http) on http://{args.host}:{args.port}"
-            f"{mcp.settings.streamable_http_path}  board={board}  db={store.db_path}",
+            f"{mcp.settings.streamable_http_path}  board={target.board}  db={store.db_path}",
             file=sys.stderr,
         )
         mcp.run(transport="streamable-http")

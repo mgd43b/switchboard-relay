@@ -118,7 +118,13 @@ class Store:
     coexist without external coordination.
     """
 
-    def __init__(self, db_path: Optional[os.PathLike | str] = None, *, busy_timeout_ms: int = 5000):
+    def __init__(
+        self,
+        db_path: Optional[os.PathLike | str] = None,
+        *,
+        busy_timeout_ms: int = 5000,
+        init_schema: bool = True,
+    ):
         # expanduser() so a "~/..." path (e.g. from $SWITCHBOARD_DB, which MCP
         # passes literally without shell expansion) resolves to the real home
         # directory instead of a literal "~" folder under the process CWD --
@@ -126,7 +132,12 @@ class Store:
         # ":memory:" has no "~" so this leaves it untouched.
         self.db_path = default_db_path() if db_path is None else Path(db_path).expanduser()
         self._busy_timeout_ms = busy_timeout_ms
-        if str(self.db_path) != ":memory:":
+        # init_schema=False opens an already-created database without the
+        # schema-establishing writes (WAL-mode switch + CREATE TABLE), so an
+        # inspection command touches no db state. Connections are still opened
+        # read-write -- a genuine mode=ro open of a WAL database is unreliable
+        # (SQLite can't always initialize the -shm), which is why we don't use it.
+        if init_schema and str(self.db_path) != ":memory:":
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
         # A single shared in-memory database only survives as long as one
         # connection is held open, so keep one alive for the ":memory:" case
@@ -134,7 +145,8 @@ class Store:
         self._memory_conn: Optional[sqlite3.Connection] = None
         if str(self.db_path) == ":memory:":
             self._memory_conn = self._new_connection()
-        self._init_schema()
+        if init_schema:
+            self._init_schema()
 
     # -- connection plumbing ------------------------------------------------
 

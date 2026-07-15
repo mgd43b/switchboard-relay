@@ -342,6 +342,15 @@ def test_messages_survive_new_store_instance(tmp_path):
     s2.close()
 
 
+def test_init_schema_false_reads_existing_without_reinit(tmp_path):
+    path = tmp_path / "sb.db"
+    Store(path).register("lead", "coordinator", now=1.0)  # creates schema + data
+    # An inspection-style open: no schema-establishing writes, still reads fine.
+    ro = Store(path, init_schema=False)
+    assert [p.name for p in ro.participants(now=1.0, ttl=300)] == ["lead"]
+    ro.close()
+
+
 def test_wal_mode_enabled(tmp_path):
     path = tmp_path / "sb.db"
     s = Store(path)

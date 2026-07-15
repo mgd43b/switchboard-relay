@@ -111,6 +111,25 @@ Five words cover the whole model:
 
 ## Install
 
+The fastest path is the **Claude Code plugin** — two commands, no Python setup (the server runs via
+`uvx`). Prefer explicit config? Jump to [installing the package manually](#install-the-package-manually).
+
+### Claude Code plugin (recommended)
+
+Run these in any Claude Code session:
+
+```
+/plugin marketplace add mgd43b/switchboard-relay
+/plugin install switchboard-relay@mgd43b
+```
+
+The `mcp__switchboard-relay__*` tools are wired up automatically — the plugin declares an MCP server
+that runs via `uvx switchboard-relay`, so there's nothing to `pip install`. Verify with `/plugin` or
+`claude mcp list`. (Installing the plugin covers Claude Code on every surface; the manual steps below
+are the alternative, not an addition.)
+
+### Install the package manually
+
 `switchboard-relay` is a standard Python package (Python ≥ 3.10). Install it so the
 `switchboard-relay` command is on your `PATH`:
 
@@ -128,7 +147,7 @@ pipx install switchboard-relay
 uv tool install .
 ```
 
-### Add it to Claude Code
+#### Add it to Claude Code
 
 Register it at **user scope** so it loads in every project, on every surface (terminal CLI,
 desktop, and IDE):
@@ -145,7 +164,7 @@ Verify with `claude mcp list`.
 > claude mcp add --scope user -- uvx switchboard-relay
 > ```
 
-### Add it to Claude Desktop
+#### Add it to Claude Desktop
 
 Open **Settings → Developer → Edit Config** (or edit `claude_desktop_config.json` directly —
 `~/Library/Application Support/Claude/` on macOS, `%APPDATA%\Claude\` on Windows) and add a
@@ -332,13 +351,19 @@ connected and what's queued, without an MCP client. It targets the current proje
 default; add `--board <name>` (or `--db <path>`) to inspect another:
 
 ```bash
-switchboard-relay boards                        # every local board + its live participant count
-switchboard-relay participants                  # live participants on this board (name, role, idle)
+switchboard-relay doctor                         # ⭐ "why isn't this working?" — resolution, peers, hints
+switchboard-relay boards                         # every local board + its live participant count
+switchboard-relay participants                   # live participants on this board (name, role, idle)
 switchboard-relay tail                           # queued (undelivered) messages on this board
 switchboard-relay tail --follow                  # …and keep watching
 switchboard-relay prune                          # delete old dead-letter messages + expired participants
 switchboard-relay participants --board team      # …a specific board instead
 ```
+
+**`doctor`** is the one-shot diagnostic: it prints which board you resolved to (and *how* — `--board`,
+`$SWITCHBOARD_BOARD`, project-derived, …), the relevant env vars, live participants, the queued-message
+count, and a plain-English hint when something looks off (you're alone on a board, or messages are
+piling up against a name nobody reads).
 
 ---
 
@@ -351,9 +376,11 @@ All optional. Set as environment variables (e.g. via `claude mcp add --env KEY=v
 | `SWITCHBOARD_BOARD` | *(project)* | Board to join. An explicit name (any string) puts these sessions on a shared bus; `project` forces per‑project derivation. See [Boards](#boards-one-switchboard-per-project). |
 | `SWITCHBOARD_DB` | *(the board's file)* | Raw SQLite path override — wins over `SWITCHBOARD_BOARD`. Point several sessions at one exact file to share it. |
 | `SWITCHBOARD_TTL` | `300` | Seconds of inactivity before a participant drops out of `participants()`. |
+| `SWITCHBOARD_MSG_TTL` | `604800` (7 days) | Undelivered messages older than this are pruned automatically during normal operation. Set `0` to disable age‑out. |
+| `SWITCHBOARD_MAX_BODY` | `262144` (256 KiB) | Reject a `send()` whose body exceeds this many UTF‑8 bytes. Set `0` to disable the cap. |
 | `SWITCHBOARD_NAME` | — | Auto‑register this session under this address (skips an explicit `register`; also the fallback when `register()` is called without a name). |
 | `SWITCHBOARD_ROLE` | — | Role to pair with `SWITCHBOARD_NAME`. |
-| `SWITCHBOARD_PUSH` | `0` | Opt into experimental push (see [below](#experimental-push-via-channels-daemon-mode)). Only meaningful in daemon mode. |
+| `SWITCHBOARD_PUSH` | `0` | Opt into live push for the [responsive‑lead setup](#responsive-lead-push-via-channels-daemon-mode). Only meaningful in daemon mode. |
 
 Example — a longer liveness window:
 
@@ -375,30 +402,43 @@ something.** A recipient learns about a message by calling `inbox()` or `wait()`
 or while parked in a `/loop`. Nothing can push into a fully idle or closed session. That's a property
 of how Claude Code sessions work, not a switchboard limitation.
 
-### Experimental: push via Channels (daemon mode)
+### Responsive lead: push via Channels (daemon mode)
 
-There's an opt‑in path for lower‑latency delivery into a session that's *currently open*. Run
-switchboard as a single shared HTTP daemon instead of per‑session stdio:
+For lower‑latency delivery into a session that's *currently open*, run switchboard as a single shared
+HTTP daemon instead of per‑session stdio. This is the **responsive‑lead** setup — a lead that reacts
+the instant a worker asks, rather than on its next poll.
 
 ```bash
-# start the daemon (push is a daemon-side opt-in)
+# 1. Start the shared daemon with push enabled (leave it running):
 SWITCHBOARD_PUSH=1 switchboard-relay serve --host 127.0.0.1 --port 8765
-# point every session at it instead of the stdio server
+
+# 2. Point every session at it instead of the stdio server:
 claude mcp add --scope user --transport http switchboard-relay http://127.0.0.1:8765/mcp
 ```
 
-In daemon mode all sessions connect to one process, so `send()` can emit a Claude Code
-[Channels](https://code.claude.com/docs/en/channels) notification (`notifications/claude/channel`) to
-a connected recipient. The notification is a **nudge to check your inbox**, not the message body — the
+Then run the lead parked in a `wait()` loop (the [`/loop`](https://code.claude.com/docs/en/slash-commands)
+recipe above) and workers `ask()` as usual — the daemon nudges the lead the moment a question lands.
+
+In daemon mode all sessions share one process, so `send()` can emit a Claude Code
+[Channels](https://code.claude.com/docs/en/channels) notification (`notifications/claude/channel`) to a
+connected recipient. The notification is a **nudge to check your inbox**, not the message body — the
 durable SQLite row stays the single source of truth, so a recipient still `inbox()`‑drains the message
 exactly once (and a role‑addressed nudge reaches every connected member, but only one drains the row).
-This is **experimental**: it requires the recipient session to be running and subscribed to switchboard
-as a channel (Claude Code's channels feature is itself a research preview and may require extra flags),
-and it never replaces durable delivery. Leave it off (the default) and everything works via polling.
+The daemon evicts a session's connection registry entry once it goes idle past the TTL, so a client that
+drops without `unregister()` doesn't linger.
+
+Two things stay true no matter what: push **never replaces durable delivery** (turn it off and
+everything still works by polling), and it **can't wake a closed session** — the recipient must be open
+and subscribed to switchboard as a channel. Claude Code's Channels is itself a research preview, so
+treat push as the *fast path on top of* the durable poll, not a dependency.
 
 ---
 
 ## Troubleshooting
+
+**Start here:** run **`switchboard-relay doctor`**. It resolves your board, lists live peers and queued
+messages, and prints a hint for the two most common failures below — usually enough to spot the problem
+in one shot.
 
 **"I sent a message but nothing happened."**
 switchboard can't wake an idle session — a recipient only sees a message when *it* calls `inbox()` or
@@ -441,8 +481,11 @@ Source layout — each module is small and single‑purpose:
 Tests are split into three tiers:
 
 - `tests/unit/` — the SQLite store and board resolution in isolation.
-- `tests/feature/` — tool behavior through the server layer (identity, push, roles, the CLI) with a fake Context.
-- `tests/integration/` — the tools driven over a real MCP transport, including **two real stdio subprocesses** sharing one database.
+- `tests/feature/` — tool behavior through the server layer (identity, push, roles, hygiene bounds, the CLI) with a fake Context.
+- `tests/integration/` — the tools over a real MCP transport, including **two real stdio subprocesses**, plus an **N‑process exactly‑once stress test** that reconciles sent‑vs‑received ids under contention (including shared‑role drains).
+
+The Claude Code plugin/marketplace manifests live in [`.claude-plugin/`](.claude-plugin/); validate them
+with `claude plugin validate .`.
 
 CI (Python 3.10–3.14) runs ruff + the full suite with the coverage gate on every push and PR. Releases
 and Homebrew packaging are documented in [RELEASING.md](RELEASING.md).
