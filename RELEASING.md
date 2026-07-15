@@ -1,20 +1,23 @@
 # Releasing switchboard
 
-Releases are automated by [`.github/workflows/release.yml`](.github/workflows/release.yml),
-which fires on a `v*.*.*` tag and: builds the sdist + wheel, verifies the tag matches
-`[project].version`, publishes to PyPI via **Trusted Publishing** (OIDC — no API tokens),
-creates a GitHub Release, and bumps the Homebrew tap.
+Versioning and releases are automated with
+[release-please](https://github.com/googleapis/release-please). It reads the
+[Conventional Commits](https://www.conventionalcommits.org/) on `main` and keeps a
+**release PR** open that bumps the version in `pyproject.toml` and updates
+`CHANGELOG.md`. Merging that PR creates the `vX.Y.Z` tag + GitHub Release, and the
+publish job in [`.github/workflows/release.yml`](.github/workflows/release.yml) builds and
+pushes to PyPI via **Trusted Publishing** (OIDC — no API tokens).
 
 ## One-time setup
 
 ### PyPI Trusted Publishing
 
 1. In the GitHub repo: **Settings → Environments → New environment**, named exactly `pypi`.
-   (Optional: add required reviewers so each release pauses for approval.)
+   (Optional: add required reviewers so each publish pauses for approval.)
 2. On PyPI, **before the first release**, register a *pending* publisher at
    <https://pypi.org/manage/account/publishing/> → GitHub, matching the workflow exactly:
-   - PyPI Project Name: `switchboard-mcp`
-   - Owner: `mgd43b` · Repository: `switchboard`
+   - PyPI Project Name: `switchboard-relay`
+   - Owner: `mgd43b` · Repository: `switchboard-relay`
    - Workflow name: `release.yml` · Environment name: `pypi`
 
    The first successful run consumes the pending publisher, creates the project, and
@@ -23,57 +26,42 @@ creates a GitHub Release, and bumps the Homebrew tap.
 ### Homebrew tap (optional)
 
 The tap lives in a **separate** repo, `github.com/mgd43b/homebrew-taps` (the `homebrew-`
-prefix is required — `brew tap mgd43b/taps` re-adds it). All `brew` commands below need
-**macOS with Homebrew** installed.
+prefix is required — `brew tap mgd43b/taps` re-adds it). Everything below needs **macOS with
+Homebrew**.
 
-1. Create the tap: `brew tap-new mgd43b/homebrew-taps` and push it to GitHub.
-2. Scaffold the formula from the published sdist (do this after the first PyPI release):
-   ```bash
-   brew create --python --set-name switchboard --tap mgd43b/taps \
-     https://files.pythonhosted.org/packages/source/s/switchboard-mcp/switchboard_mcp-<ver>.tar.gz
-   ```
-   Or start from [`packaging/homebrew/switchboard.rb`](packaging/homebrew/switchboard.rb)
-   in this repo and copy it to `Formula/switchboard.rb` in the tap.
-3. Generate the pinned dependency `resource` stanzas (this is the part no CI action can do
-   for you — Homebrew builds in a no-network sandbox, so every dep must be checksummed):
-   ```bash
-   brew update-python-resources switchboard
-   ```
-4. Validate and commit:
-   ```bash
-   brew install --build-from-source switchboard
-   brew test switchboard
-   brew audit --strict --online --new switchboard
-   ```
-5. For the automated per-release bump, create a PAT with write access to
-   `mgd43b/homebrew-taps` and add it to **this** repo's secrets as `HOMEBREW_TAP_TOKEN`.
-   (The default `GITHUB_TOKEN` cannot push to another repo.) Without the secret, the
-   `homebrew-bump` job simply skips.
+1. Create the tap once: `brew tap-new mgd43b/homebrew-taps` and push it to GitHub.
+2. After the first PyPI release, run the update script (see below) — it seeds
+   `Formula/switchboard.rb` from [`packaging/homebrew/switchboard.rb`](packaging/homebrew/switchboard.rb),
+   generates the pinned dependency `resource` stanzas, and pushes.
 
 Users then install with:
 
 ```bash
-brew install mgd43b/taps/switchboard      # or: brew tap mgd43b/taps && brew install switchboard
+brew install mgd43b/taps/switchboard   # or: brew tap mgd43b/taps && brew install switchboard
 ```
 
 ## Cutting a release
 
-1. Bump `[project].version` in `pyproject.toml` (and update any changelog). Commit + merge.
-2. Tag and push:
-   ```bash
-   git tag v0.2.0
-   git push origin v0.2.0
-   ```
-3. The workflow builds, publishes to PyPI, creates the GitHub Release, and (if the token is
-   configured) opens a Homebrew bump.
+1. Land your changes on `main` as Conventional Commits (`feat:`, `fix:`, `chore:`, …).
+2. release-please opens/updates a PR titled **"chore(main): release X.Y.Z"**. Review it —
+   the version bump and CHANGELOG are computed from the commit types
+   (`feat` → minor, `fix` → patch; pre-1.0 stays in `0.x`).
+3. **Merge the release PR.** That creates the tag + GitHub Release and triggers the PyPI
+   publish automatically.
 
-### When dependencies change
+> **First release:** the manifest baselines at `0.1.0`, so the first release PR proposes the
+> next bump from your commits. To force a specific first version, add a `Release-As: 0.1.0`
+> line to a commit body on `main`.
 
-The automated Homebrew bump only updates the formula's top-level `url`/`sha256`. If you
-**added, removed, or upgraded a dependency** since the last release, regenerate the pinned
-resources on macOS and open a PR to the tap:
+### Homebrew (per release, on macOS)
+
+Once the release is on PyPI, update the tap formula — this bumps `url`/`sha256` **and**
+regenerates the pinned `resource` stanzas (which no CI action can do in Homebrew's no-network
+sandbox):
 
 ```bash
-brew update-python-resources mgd43b/taps/switchboard
-brew audit --strict --online switchboard
+./scripts/update-tap.sh 0.2.0            # or --dry-run to preview, --skip-test to skip the build test
 ```
+
+The script verifies the sdist is on PyPI, computes its SHA256, runs
+`brew update-python-resources`, optionally test-installs, then commits + pushes to the tap.

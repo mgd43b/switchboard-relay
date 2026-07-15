@@ -1,104 +1,61 @@
 name: Release
 
+# release-please watches conventional commits on main and maintains a release
+# PR that bumps the version + CHANGELOG. Merging that PR creates the tag and
+# GitHub Release; the publish job then builds and pushes to PyPI.
 on:
   push:
-    tags:
-      - "v*.*.*" # release fires only on version tags, e.g. v0.1.0
+    branches: [main]
 
-# Grant nothing by default; each job opts into the minimum it needs.
 permissions: {}
 
 jobs:
-  build:
-    name: Build sdist + wheel
+  release-please:
+    name: Release Please
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ github.token }}
+
+  publish:
+    name: Publish to PyPI (Trusted Publishing / OIDC)
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/switchboard-relay
+    permissions:
+      id-token: write # MANDATORY for OIDC trusted publishing; no API tokens.
+      contents: write # to attach built dists to the GitHub Release
     steps:
       - uses: actions/checkout@v4
 
-      # Guard: the git tag (v0.1.0) MUST equal [project].version (0.1.0).
-      - name: Verify tag matches package version
-        run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          PKG="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
-          echo "git tag: ${GITHUB_REF_NAME} (stripped: ${TAG})  |  pyproject version: ${PKG}"
-          if [ "${TAG}" != "${PKG}" ]; then
-            echo "::error::Tag v${TAG} does not match [project].version ${PKG} in pyproject.toml"
-            exit 1
-          fi
-
       - name: Install uv
         uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13" # pin the build interpreter for reproducible releases
 
       - name: Build sdist and wheel
         run: uv build
 
-      - name: Upload dist artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
-          if-no-files-found: error
-
-  pypi-publish:
-    name: Publish to PyPI (Trusted Publishing / OIDC)
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/switchboard-mcp
-    permissions:
-      id-token: write # MANDATORY for OIDC trusted publishing; no API tokens.
-    steps:
-      - name: Download dist artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
-
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
 
-  github-release:
-    name: Create GitHub Release
-    needs: pypi-publish
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write # required to create the release and upload assets
-    steps:
-      - name: Download dist artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
-
-      - name: Create GitHub Release with auto-generated notes
+      - name: Attach built dists to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
-          gh release create "${GITHUB_REF_NAME}"
-          dist/*
-          --repo "${GITHUB_REPOSITORY}"
-          --title "${GITHUB_REF_NAME}"
-          --generate-notes
-
-  homebrew-bump:
-    name: Bump Homebrew tap formula
-    needs: github-release
-    runs-on: ubuntu-latest
-    # Expose the secret via env so the step can skip cleanly when it is absent
-    # (secrets cannot be referenced in a job- or step-level `if:`).
-    env:
-      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-    steps:
-      - name: Bump switchboard formula (url + sha256)
-        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
-        uses: dawidd6/action-homebrew-bump-formula@v5
-        with:
-          token: ${{ env.HOMEBREW_TAP_TOKEN }}
-          no_fork: true
-          tap: mgd43b/homebrew-taps
-          formula: switchboard
-          tag: ${{ github.ref }}
-      # NOTE: this bumps only the top-level url/sha256. When switchboard's own
-      # dependencies change, the `resource` stanzas must be regenerated on macOS
-      # with `brew update-python-resources` — see RELEASING.md.
+          gh release upload "${{ needs.release-please.outputs.tag_name }}"
+          dist/* --repo "${{ github.repository }}"
+    # Homebrew: after a release, run `scripts/update-tap.sh <version>` on macOS.
+    # It bumps the formula AND regenerates the pinned Python resource stanzas
+    # (which no CI action can do in a sandbox). See RELEASING.md.

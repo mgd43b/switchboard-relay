@@ -345,8 +345,13 @@ def test_messages_survive_new_store_instance(tmp_path):
 def test_wal_mode_enabled(tmp_path):
     path = tmp_path / "sb.db"
     s = Store(path)
-    with sqlite3.connect(str(path)) as conn:
+    # `with sqlite3.connect(...)` only manages the transaction, not the handle;
+    # close it explicitly so it doesn't leak (ResourceWarning under -W error).
+    conn = sqlite3.connect(str(path))
+    try:
         mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        conn.close()
     assert mode.lower() == "wal"
     s.close()
 

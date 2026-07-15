@@ -12,9 +12,9 @@ class Switchboard < Formula
   include Language::Python::Virtualenv
 
   desc "Shared, durable messaging channel for independent Claude Code sessions"
-  homepage "https://github.com/mgd43b/switchboard"
+  homepage "https://github.com/mgd43b/switchboard-relay"
   # PyPI sdist (PEP 625 normalizes the name to underscores). Bump on each release.
-  url "https://files.pythonhosted.org/packages/source/s/switchboard-mcp/switchboard_mcp-0.1.0.tar.gz"
+  url "https://files.pythonhosted.org/packages/source/s/switchboard-relay/switchboard_relay-0.1.0.tar.gz"
   sha256 "REPLACE_WITH_SDIST_SHA256"
   license "MIT"
 

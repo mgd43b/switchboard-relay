@@ -4,9 +4,9 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0]
 
-First release. Everything below ships in `0.1.0` when the first `v0.1.0` tag is cut.
+Initial release. (Future versions are appended above this by release-please.)
 
 ### Added
 
@@ -25,4 +25,4 @@ First release. Everything below ships in `0.1.0` when the first `v0.1.0` tag is 
 - Tooling: ruff lint + format, pytest with an enforced coverage gate (100% today), CI on
   Python 3.10–3.14, PyPI trusted‑publishing release workflow, and a Homebrew tap formula.
 
-[Unreleased]: https://github.com/mgd43b/switchboard/commits/main
+[0.1.0]: https://github.com/mgd43b/switchboard-relay/releases/tag/v0.1.0

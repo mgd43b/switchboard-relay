@@ -144,14 +144,19 @@ class Store:
             timeout=self._busy_timeout_ms / 1000.0,
             isolation_level=None,  # autocommit; we manage transactions explicitly
         )
-        conn.row_factory = sqlite3.Row
-        conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
-        if str(self.db_path) != ":memory:":
-            # journal_mode is a persisted property of the DB file, set once in
-            # _init_schema; here we only set the (non-locking, per-connection)
-            # synchronous level. Re-issuing journal_mode=WAL on every connection
-            # needlessly contends and can hit SQLITE_BUSY under multi-process use.
-            conn.execute("PRAGMA synchronous=NORMAL")
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
+            if str(self.db_path) != ":memory:":
+                # journal_mode is a persisted property of the DB file, set once
+                # in _init_schema; here we only set the (non-locking, per-conn)
+                # synchronous level. Re-issuing journal_mode=WAL on every
+                # connection needlessly contends and can hit SQLITE_BUSY under
+                # multi-process use.
+                conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception:  # pragma: no cover - close the half-open handle on setup failure
+            conn.close()
+            raise
         return conn
 
     @contextmanager

@@ -1,8 +1,8 @@
 # switchboard
 
-[![CI](https://github.com/mgd43b/switchboard/actions/workflows/ci.yml/badge.svg)](https://github.com/mgd43b/switchboard/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/switchboard-mcp)](https://pypi.org/project/switchboard-mcp/)
-[![Python](https://img.shields.io/pypi/pyversions/switchboard-mcp)](https://pypi.org/project/switchboard-mcp/)
+[![CI](https://github.com/mgd43b/switchboard-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/mgd43b/switchboard-relay/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/switchboard-relay)](https://pypi.org/project/switchboard-relay/)
+[![Python](https://img.shields.io/pypi/pyversions/switchboard-relay)](https://pypi.org/project/switchboard-relay/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **A local MCP server that gives independent Claude Code sessions a shared, durable messaging channel.**
@@ -36,10 +36,10 @@ command is on your `PATH`:
 brew install mgd43b/taps/switchboard
 
 # with uv (recommended)
-uv tool install switchboard-mcp
+uv tool install switchboard-relay
 
 # or pipx
-pipx install switchboard-mcp
+pipx install switchboard-relay
 
 # or from a checkout of this repo
 uv tool install .
@@ -56,7 +56,7 @@ tools are available. Verify with `claude mcp list`.
 
 > **No install step?** If you'd rather not install anything, point Claude Code at `uvx`:
 > ```bash
-> claude mcp add --scope user -- uvx switchboard-mcp
+> claude mcp add --scope user -- uvx switchboard-relay
 > ```
 
 ### Make the tools run without a confirmation prompt (allowlist)
