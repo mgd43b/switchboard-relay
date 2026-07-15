@@ -151,8 +151,12 @@ awk -v new="$SHA256" '
 success "Bumped url + sha256"
 
 # -- step 5: regenerate dependency resource stanzas -------------------------
+# --ignore-main-package-cooldown lets us resolve a version published <24h ago
+# (Homebrew otherwise ignores just-uploaded packages). Deps still respect the
+# cooldown; it is a no-op once the release has aged. Only applies to custom taps.
 info "Regenerating Python resources (brew update-python-resources)..."
-brew update-python-resources "${REPO_OWNER}/${TAP_REPO#homebrew-}/${FORMULA_NAME}"
+brew update-python-resources --ignore-main-package-cooldown \
+    "${REPO_OWNER}/${TAP_REPO#homebrew-}/${FORMULA_NAME}"
 success "Resources regenerated"
 
 info "Formula changes:"
