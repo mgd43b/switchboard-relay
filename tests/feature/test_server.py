@@ -568,9 +568,19 @@ def test_build_server_declares_channel_capability():
     # in its initialize response; both transports build options via this call.
     mcp = build_server(Store(":memory:"), ttl=300, board="cap")
     caps = mcp._mcp_server.create_initialization_options().capabilities
-    assert caps.experimental == {_CHANNEL_CAPABILITY: {}}
+    # Assert the key is present and exactly {} rather than exact-matching the
+    # whole dict, so this doesn't break if the SDK starts advertising other
+    # experimental capabilities by default.
+    assert (caps.experimental or {}).get(_CHANNEL_CAPABILITY) == {}
     # Declaring it must not clobber the real tools capability.
     assert caps.tools is not None
+    # Our capability is forced last: a caller can't override it to a non-{}
+    # value, but their other experimental capabilities are preserved.
+    caps2 = mcp._mcp_server.create_initialization_options(
+        experimental_capabilities={_CHANNEL_CAPABILITY: {"bogus": 1}, "other": {}}
+    ).capabilities
+    assert caps2.experimental[_CHANNEL_CAPABILITY] == {}
+    assert caps2.experimental["other"] == {}
 
 
 def test_push_defaults_on_in_daemon_mode_off_for_stdio(monkeypatch):

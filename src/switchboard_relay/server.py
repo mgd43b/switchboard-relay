@@ -620,7 +620,9 @@ def _declare_channel_capability(mcp: FastMCP) -> None:
     original = low.create_initialization_options
 
     def with_channel_capability(notification_options=None, experimental_capabilities=None):
-        merged = {_CHANNEL_CAPABILITY: {}, **(experimental_capabilities or {})}
+        # Force our capability last so a caller can't override it to a non-{}
+        # value (the client keys purely on its presence; the value must be {}).
+        merged = {**(experimental_capabilities or {}), _CHANNEL_CAPABILITY: {}}
         return original(notification_options, merged)
 
     low.create_initialization_options = with_channel_capability  # type: ignore[assignment]
