@@ -219,7 +219,7 @@ Eight tools, grouped by what you reach for:
 
 | Tool | Signature | What it does |
 |------|-----------|--------------|
-| `send` | `send(to, body, reply_to?)` | Append a message to `to`'s durable inbox. `to` matches a participant **name or role**. `reply_to` threads a reply to a message id. Returns the new message `id`. |
+| `send` | `send(to, body, reply_to?)` | Append a message to `to`'s durable inbox. `to` matches a participant **name or role**. `reply_to` threads a reply to a message id. Returns the new message `id` — plus `no_live_recipient: true` and a `warning` if nobody is currently registered as `to` (usually a typo; the message is still queued). |
 | `broadcast` | `broadcast(body)` | Send `body` to every currently‑live participant except yourself. Returns the per‑recipient message ids. |
 
 **Receive** — read your mailbox
@@ -233,7 +233,7 @@ Eight tools, grouped by what you reach for:
 
 | Tool | Signature | What it does |
 |------|-----------|--------------|
-| `ask` | `ask(to, body, timeout_s?)` | Send `body` to `to`, then block until a reply threaded to it comes back (`reply_to` = the returned `question_id`). Leaves other inbox messages untouched; returns `timed_out: true` if no reply in time. |
+| `ask` | `ask(to, body, timeout_s?)` | Send `body` to `to`, then block until a reply threaded to it comes back (`reply_to` = the returned `question_id`). Leaves other inbox messages untouched; returns `timed_out: true` if no reply in time — with `no_live_recipient: true` when nobody was registered as `to` at send time, so you can tell a wrong address from a slow reply. |
 
 > **Durability & addressing.** A message sent to a name that hasn't registered yet simply waits in
 > that mailbox until it's read. Addressing by `role` fans a message out to whichever participant

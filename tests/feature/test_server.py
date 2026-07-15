@@ -55,13 +55,25 @@ def test_register_auto_assigns_name_when_none_given(board):
     # title, so it mints a usable handle, says so, and binds the session to it.
     ctx = _ctx()
     out = board.register(ctx, "   ")
-    assert re.fullmatch(r"session-[0-9a-f]{4}", out["you"])
+    assert re.fullmatch(r"session-[0-9a-f]{6}", out["you"])
     assert "session-" in out["note"]
     assert board.inbox(ctx)["you"] == out["you"]  # bound and usable
 
 
 def test_register_explicit_name_has_no_auto_note(board):
     assert "note" not in board.register(_ctx(), "lead")
+
+
+def test_register_explicit_heartbeat_not_overridden_by_env_role(tmp_path, monkeypatch):
+    # $SWITCHBOARD_ROLE must not clobber an explicitly-named session's role on a
+    # bare re-register: a nameless re-call would inherit it, but an explicit one
+    # passes an empty role through so Store preserves the existing role.
+    monkeypatch.setenv("SWITCHBOARD_ROLE", "worker")
+    sb = Switchboard(Store(tmp_path / "sb.db"), ttl=300)
+    ctx = _ctx()
+    sb.register(ctx, "lead", "coordinator")  # explicit role
+    out = sb.register(ctx, "lead")  # bare heartbeat; env role is set to "worker"
+    assert out["role"] == "coordinator"  # preserved, NOT reset to the env role
 
 
 def test_register_falls_back_to_env_name(tmp_path, monkeypatch):

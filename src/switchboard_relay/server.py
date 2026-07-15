@@ -59,11 +59,13 @@ def _auto_name() -> str:
     """A short, unique-ish fallback address for a session that registers unnamed.
 
     The server can't observe a session's title, so rather than dead-end a bare
-    "register me", we mint a usable handle (e.g. ``session-a3f9``). It's unique
-    enough to address and thread replies to; a caller that wants a memorable
+    "register me", we mint a usable handle (e.g. ``session-a3f9c1``). Store
+    registration is an upsert keyed on the name, so a collision would silently
+    merge two sessions onto one mailbox; 24 bits of entropy keeps that
+    negligible for realistic multi-session use. A caller that wants a memorable
     name just passes one.
     """
-    return f"session-{secrets.token_hex(2)}"
+    return f"session-{secrets.token_hex(3)}"
 
 
 def _resolve_ttl() -> float:
@@ -193,6 +195,8 @@ class Switchboard:
 
     def register(self, ctx: Context, name: str = "", role: str = "") -> dict:
         name = (name or "").strip()
+        role = (role or "").strip()
+        explicit_name = bool(name)
         assigned = False
         if not name:
             # No explicit name: fall back to a pre-seeded identity from the
@@ -203,7 +207,13 @@ class Switchboard:
         if not name:
             name = _auto_name()
             assigned = True
-        role = (role or "").strip() or self._default_role
+        # Only inherit the env role when adopting an env/auto identity (i.e. no
+        # explicit name was given). An explicit registration passes its role
+        # through unchanged -- an empty role then lets Store.register() preserve
+        # any existing role, so a bare re-register is a clean heartbeat that
+        # never disturbs the role.
+        if not role and not explicit_name:
+            role = self._default_role
         p = self.store.register(name, role, now=_now())
         self._bind(ctx, p.name, p.role)
         payload = self._participants_payload()
