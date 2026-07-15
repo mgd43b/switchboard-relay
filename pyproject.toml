@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "switchboard-relay"
-version = "0.2.1"
+version = "0.2.2"
 description = "A local MCP server that gives independent Claude Code sessions a shared, durable messaging channel."
 readme = "README.md"
 requires-python = ">=3.10"
