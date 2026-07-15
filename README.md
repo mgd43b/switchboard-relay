@@ -51,7 +51,7 @@ Then register it with Claude Code at **user scope** (loads in every project, on 
 claude mcp add --scope user -- switchboard
 ```
 
-That's it. Open any Claude Code session (terminal or desktop) and the five `switchboard`
+That's it. Open any Claude Code session (terminal or desktop) and the eight `switchboard`
 tools are available. Verify with `claude mcp list`.
 
 > **No install step?** If you'd rather not install anything, point Claude Code at `uvx`:
@@ -218,7 +218,7 @@ uv run ruff format .          # format
 ```
 
 - `src/switchboard/store.py` — the durable SQLite store (registry + mailboxes). Pure and clock‑free.
-- `src/switchboard/server.py` — the FastMCP server: identity binding, the five tools, the `wait()` poll loop, and best‑effort push.
+- `src/switchboard/server.py` — the FastMCP server: identity binding, the eight tools, the `wait()` poll loop, and best‑effort push.
 - `tests/` is split into three tiers:
   - `tests/unit/` — the SQLite store in isolation.
   - `tests/feature/` — tool/feature behavior through the server layer (identity, push, roles, the CLI) with a fake Context.

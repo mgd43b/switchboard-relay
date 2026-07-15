@@ -122,7 +122,7 @@ def test_send_and_drain_roundtrip(store):
     mid = store.send("b", "hello", sender="a", now=2.0)
     assert isinstance(mid, int) and mid > 0
 
-    msgs = store.inbox("b", now=3.0) if False else store.inbox("b")
+    msgs = store.inbox("b")
     assert len(msgs) == 1
     m = msgs[0].to_dict()
     assert m["id"] == mid
