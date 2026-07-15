@@ -282,6 +282,39 @@ async def test_daemon_push_over_the_wire_is_advertised_and_harmless(tmp_path):
         assert [m["body"] for m in got["messages"]] == ["ping"]
 
 
+async def test_stdio_lifespan_starts_self_watch(tmp_path, monkeypatch):
+    """The daemon-free path: the FastMCP lifespan starts the self-watch loop.
+
+    A stdio server with push enabled runs a background watcher (started by the
+    server lifespan under real ``run()``) that polls the shared board and
+    self-nudges its own client -- turn injection with no daemon. We spy on
+    ``_watch_tick`` to prove the loop is actually wired up and running, without
+    depending on the client understanding the custom channel notification.
+    """
+    mcp = build_server(Store(tmp_path / "switchboard.db"), ttl=300, daemon=False)
+    sb = mcp._switchboard_relay
+    sb._push_enabled = True  # equivalent to launching with SWITCHBOARD_PUSH=1
+
+    ticks = 0
+    original = sb._watch_tick
+
+    async def spy(**kwargs):
+        nonlocal ticks
+        ticks += 1
+        return await original(**kwargs)
+
+    monkeypatch.setattr(sb, "_watch_tick", spy)
+
+    async with sessions(mcp) as (a, _b):
+        data(await a.call_tool("register", {"name": "lead"}))
+        for _ in range(250):  # up to ~5s for the lifespan-started loop to tick
+            if ticks:
+                break
+            await asyncio.sleep(0.02)
+
+    assert ticks >= 1  # the lifespan actually started and ran the watcher
+
+
 # -- durability across a "restart" ------------------------------------------
 
 

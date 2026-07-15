@@ -52,7 +52,7 @@ switchboard just routes named messages, so any addressing scheme works.
 - [The lead / worker pattern](#the-lead--worker-pattern) — recipes + terminal inspection
 - [Configuration](#configuration) — environment variables
 - [How it works](#how-it-works) — and its one honest limitation
-- [Turn injection (push)](#turn-injection-push) — make a session *react* to a message (daemon mode)
+- [Turn injection (push)](#turn-injection-push) — make an open session *react* to a message, no daemon needed
 - [Troubleshooting](#troubleshooting) — the common "huh?" moments
 - [Development](#development)
 
@@ -381,7 +381,7 @@ All optional. Set as environment variables (e.g. via `claude mcp add --env KEY=v
 | `SWITCHBOARD_MAX_BODY` | `262144` (256 KiB) | Reject a `send()` whose body exceeds this many UTF‑8 bytes. Set `0` to disable the cap. |
 | `SWITCHBOARD_NAME` | — | Auto‑register this session under this address (skips an explicit `register`; also the fallback when `register()` is called without a name). |
 | `SWITCHBOARD_ROLE` | — | Role to pair with `SWITCHBOARD_NAME`. |
-| `SWITCHBOARD_PUSH` | *(daemon: on)* | Force [turn‑injection push](#turn-injection-push) on/off. Only meaningful in daemon mode, where it defaults **on** (that's the whole point of `serve`); set `0` to disable, `1` to force. Ignored under stdio (which can't push). |
+| `SWITCHBOARD_PUSH` | *(stdio: off, daemon: on)* | Enable [turn‑injection push](#turn-injection-push). On **stdio** it's off by default (a background poll cost) — set `1` to run the self‑watch loop. In the **daemon** it defaults **on** (set `0` to disable). |
 
 Example — a longer liveness window:
 
@@ -398,10 +398,11 @@ processes don't talk to each other directly — they share state through a SQLit
 per [board](#boards-one-switchboard-per-project)), which gives you durability and cross‑session
 delivery for free. `wait()` long‑polls that database.
 
-**The one honest limitation:** switchboard **cannot wake a session that isn't already doing
-something.** A recipient learns about a message by calling `inbox()` or `wait()` — on its next turn,
-or while parked in a `/loop`. Nothing can push into a fully idle or closed session. That's a property
-of how Claude Code sessions work, not a switchboard limitation.
+**The one honest limitation:** switchboard **cannot wake a *closed* session.** In the baseline
+(poll) model a recipient learns about a message by calling `inbox()` or `wait()` — on its next turn,
+or while parked in a `/loop`. An *open but idle* session can be pushed into a turn with
+[turn injection](#turn-injection-push), but nothing reaches a session that isn't running. That's a
+property of how Claude Code sessions work, not a switchboard limitation.
 
 ---
 
@@ -411,32 +412,35 @@ By default a recipient only learns about a message when *it* next polls (`inbox(
 **Turn injection** removes that wait: a `send()` makes the recipient's open session **react on the
 spot** — the message arrives *as a turn*, and the session drains its inbox and acts, with no manual
 poll. It rides Claude Code's [Channels](https://code.claude.com/docs/en/channels) capability (a
-research preview) and is the "responsive‑lead" setup — a lead that answers the instant a worker asks.
+research preview) — the "responsive‑lead" setup, a lead that answers the instant a worker asks.
 
 ### The three hard constraints (be honest about these)
 
 Turn injection works **only** when all three hold. Miss any one and delivery silently falls back to
 the durable poll — nothing breaks, the message just waits in the inbox as usual:
 
-1. **Daemon mode.** stdio spawns one server *per session* with no handle to any other session, so it
-   can't cross‑push. Only `switchboard-relay serve` (one process holding every connection) can.
+1. **Push is enabled.** It's a background convenience with a small polling cost, so it's **off by
+   default on stdio** — set `SWITCHBOARD_PUSH=1` to turn it on. (The daemon defaults it **on**.)
 2. **The recipient session is open.** Channels inject into a *running* session on its next turn.
    Nothing can wake a fully idle or closed session — see [How it works](#how-it-works).
 3. **The recipient subscribed to switchboard as a channel** — launched with the channel flag below.
    A session that connected normally still works; it just polls instead of reacting.
 
-### Setup
+Note that "daemon" is **not** a constraint: turn injection works over the plain stdio install (below).
+The daemon is an optional alternative for the multi‑client‑on‑one‑process case.
+
+### Setup (recommended: stdio, no daemon)
+
+Because MCP stdio is bidirectional, each session's own switchboard process can push a notification to
+*its own* client. With push enabled, that process runs a background watcher that polls the shared
+board and self‑nudges when a message lands — so you get turn injection with **no daemon, no launchd,
+no reboot story**, and [per‑project boards](#boards-one-switchboard-per-project) keep working.
 
 ```bash
-# 1. Start the shared daemon and leave it running. Push is ON by default in
-#    daemon mode (set SWITCHBOARD_PUSH=0 to disable); the banner prints the
-#    exact subscription flag.
-switchboard-relay serve --host 127.0.0.1 --port 8765
+# 1. Register the stdio server with push enabled (one extra env var):
+claude mcp add --scope user --env SWITCHBOARD_PUSH=1 -- switchboard-relay
 
-# 2. Point every session at the daemon instead of the stdio server:
-claude mcp add --scope user --transport http switchboard-relay http://127.0.0.1:8765/mcp
-
-# 3. Launch each session that should REACT with switchboard subscribed as a
+# 2. Launch each session that should REACT with switchboard subscribed as a
 #    channel. A config‑level MCP server is a `server:` channel, which during the
 #    research preview is never on the first‑party allowlist — so it needs the
 #    development flag (plain `--channels server:…` is skipped as "not on the
@@ -454,21 +458,35 @@ workers `ask()` as usual — the lead reacts the moment a question lands, no pol
 > or channels are blocked (the server still connects and its tools still work — only the *push* is
 > suppressed). Pro/Max users without an org skip that check.
 
+### Alternative: the shared daemon
+
+Prefer one long‑lived process holding every connection (e.g. many clients, or lower‑latency
+push‑on‑write instead of a poll)? Run the daemon instead of stdio. It needs a supervisor and a reboot
+story (launchd/`KeepAlive`, or a container with `--restart unless-stopped`), and it's board‑scoped
+(one process per board), so it's the heavier option — but the subscription flag is identical.
+
+```bash
+# Push is ON by default in the daemon (SWITCHBOARD_PUSH=0 disables); the banner
+# prints the subscription flag.
+switchboard-relay serve --host 127.0.0.1 --port 8765
+claude mcp add --scope user --transport http switchboard-relay http://127.0.0.1:8765/mcp
+# ...then launch each reacting session with the same --dangerously-load-development-channels flag.
+```
+
 ### What's actually sent (and why it stays exactly‑once)
 
-In daemon mode all sessions share one process, so `send()` additionally emits a
-`notifications/claude/channel` notification to any connected recipient of the address. Claude Code
-wraps it into the recipient's next turn as `<channel source="switchboard-relay" msg_from="…"
-msg_id="…">…</channel>`.
+Either way, switchboard emits a `notifications/claude/channel` notification that Claude Code wraps
+into the recipient's next turn as `<channel source="switchboard-relay" msg_from="…"
+msg_id="…">…</channel>`. **stdio:** each session's watcher polls the board for messages addressed to
+*itself* and self‑nudges. **daemon:** `send()` pushes directly to the connected recipient. The
+cross‑session hop is the shared SQLite board in both cases.
 
 The notification is a **nudge that says "drain your inbox and handle it"**, *not* the message body.
 The durable SQLite row stays the single source of truth, which is what preserves **drain‑once**: when
-a **role** is addressed, every connected member is nudged, but only the one that drains the row
-receives the message — the others find an empty inbox (the nudge says so) and do nothing. (Inlining
-the body for a unique‑name/single‑reader target was considered and deliberately declined: it would
-split the source of truth and risk double‑handling.) The daemon also evicts a connection‑registry
-entry once its session idles past the TTL, so a client that drops without `unregister()` doesn't
-linger.
+a **role** is addressed, every connected member is nudged, but only the one that wins the atomic
+`inbox()` drain receives the message — the others find an empty inbox (the nudge says so) and do
+nothing. (Inlining the body for a unique‑name/single‑reader target was considered and deliberately
+declined: it would split the source of truth and risk double‑handling.)
 
 Two things stay true no matter what: push **never replaces durable delivery** (disable it and
 everything still works by polling), and it **can't wake a closed session**. Channels is a research
@@ -477,23 +495,22 @@ a dependency.
 
 ### Verify it end‑to‑end (two real sessions)
 
-The research‑preview reaction can't be unit‑tested, so confirm it by hand once:
+The research‑preview reaction can't be unit‑tested, so confirm it by hand once (stdio, no daemon):
 
-1. **Terminal 1 — daemon:** `switchboard-relay serve --port 8765` (leave running; note the banner
-   says push is ENABLED).
-2. **Terminal 2 — session B (the reactor):** launch subscribed, register, and park it:
+1. **Register the server with push on:** `claude mcp add --scope user --env SWITCHBOARD_PUSH=1 -- switchboard-relay`.
+2. **Terminal 1 — session B (the reactor):** launch subscribed, register, and park it:
    ```bash
    claude --dangerously-load-development-channels server:switchboard-relay
    ```
-   In B: `register(name="lead")`, then run `/loop` with `wait(timeout_s=600)` (or just call `wait`).
-   Leave B **idle** — do not call `inbox()`.
-3. **Terminal 3 — session A (the sender):** launch (subscription optional for a pure sender),
+   In B: `register(name="lead")`, then run `/loop` with `wait(timeout_s=600)` (or just leave it idle).
+   Do **not** call `inbox()` by hand.
+3. **Terminal 2 — session A (the sender):** launch (subscription optional for a pure sender),
    `register(name="worker")`, then `send(to="lead", body="ping — what's 2+2?")`.
-4. **Watch B react with no manual poll:** a `<channel source="switchboard-relay" …>` turn appears in
-   B, and B calls `inbox()` on its own, reads *"ping — what's 2+2?"*, and handles it (e.g. replies
-   with `send(to="worker", body="4", reply_to=<id>)`). If instead B does nothing, re‑check the three
-   constraints above — most often B wasn't launched with `--dangerously-load-development-channels`, or
-   an org policy has `channelsEnabled` off.
+4. **Watch B react with no manual poll:** within ~a second a `<channel source="switchboard-relay" …>`
+   turn appears in B, and B calls `inbox()` on its own, reads *"ping — what's 2+2?"*, and handles it
+   (e.g. replies with `send(to="worker", body="4", reply_to=<id>)`). If instead B does nothing,
+   re‑check the three constraints — most often push wasn't enabled (`SWITCHBOARD_PUSH=1`), B wasn't
+   launched with `--dangerously-load-development-channels`, or an org policy has `channelsEnabled` off.
 
 ---
 

@@ -4,9 +4,12 @@ Two ways to run the same server:
 
 * **stdio (default)** -- ``switchboard``. Every Claude Code session spawns its
   own stdio process; durability and cross-session delivery come from a shared
-  SQLite database. ``wait()`` long-polls that database. This is the v1 default
-  and satisfies all of switchboard's core goals. It cannot *push* -- a session's
-  process has no handle to another session's process -- so recipients poll.
+  SQLite database. ``wait()`` long-polls that database. A process has no handle
+  to *another* session's process, but MCP stdio is bidirectional -- so with push
+  enabled (``$SWITCHBOARD_PUSH=1``) each process runs a background watcher that
+  polls the shared board and pushes a Channels notification to *its own* client,
+  giving turn injection with no daemon. See ``Switchboard._watch_loop`` and the
+  README's "Turn injection" section.
 
 * **HTTP daemon** -- ``switchboard serve``. One process holds every session's
   connection, so ``send()`` can additionally emit a Channels notification
@@ -36,6 +39,7 @@ import os
 import secrets
 import sys
 import time
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -50,6 +54,12 @@ from switchboard_relay.store import DEFAULT_TTL_SECONDS, Store
 # liveness while parked. Poll is a balance between latency and DB churn.
 _WAIT_POLL_SECONDS = 0.25
 _WAIT_HEARTBEAT_SECONDS = 10.0
+
+# How often the stdio self-watch loop polls the shared board for messages to
+# push into its own session (turn injection without a daemon). Gentler than the
+# wait() poll: it runs for the whole session lifetime, and a second of latency
+# on a background nudge is fine. See Switchboard._watch_loop.
+_WATCH_POLL_SECONDS = 1.0
 
 # The Claude Code Channels contract (research preview), verified against the docs
 # (https://code.claude.com/docs/en/channels-reference) and the local `claude`
@@ -216,6 +226,14 @@ class Switchboard:
         # stdio, with $SWITCHBOARD_PUSH forcing either way. Tests set this
         # attribute directly. See _resolve_push().
         self._push_enabled = _resolve_push(daemon=daemon)
+        # Daemon pushes directly on send() (many sessions, one process); a stdio
+        # server instead runs a background self-watch loop. Kept so _watch_loop
+        # can no-op in daemon mode and avoid double-nudging.
+        self._daemon = daemon
+        # Per-session high-water mark (id(session) -> highest message id already
+        # nudged about) so the stdio watcher nudges once per new message, not on
+        # every poll. See _watch_tick.
+        self._watch_hw: dict[int, int] = {}
 
     # -- identity -----------------------------------------------------------
 
@@ -356,32 +374,21 @@ class Switchboard:
             )
         return out
 
-    async def _notify(
-        self, ctx: Context, *, sender: str, to: str, mid: int, reply_to: Optional[int]
+    async def _nudge(
+        self, conn: _Conn, *, sender: str, to: str, mid: int, reply_to: Optional[int]
     ) -> bool:
-        """Best-effort push nudge that makes any connected recipient(s) REACT.
+        """Emit one body-less, reactive Channels nudge to ``conn``. Best-effort.
 
-        Returns True if at least one live delivery was handed to the transport.
-        A channel-subscribed recipient turns this notification into its next turn
-        (see ``_CHANNEL_METHOD``), so the ``content`` is written as an
-        instruction: drain the durable inbox and handle what comes out.
-
-        This is a *nudge*, not the message itself: the durable inbox row is the
-        single source of truth, and the body is deliberately omitted. That keeps
-        push consistent with drain-once -- when a role is addressed every
-        connected member is nudged, but only the one that drains the row receives
-        it; the others find an empty inbox, which the wording anticipates. (The
-        one-round-trip optimization of inlining the body for a unique-name/single
-        -reader target is intentionally declined: it would risk double-handling
-        and split the source of truth. See the README.)
-
-        No-op unless push is enabled (daemon mode).
+        Shared by the daemon send-side push (``_notify``) and the stdio
+        self-watch loop (``_watch_tick``). A channel-subscribed recipient turns
+        this into its next turn (see ``_CHANNEL_METHOD``), so the ``content`` is
+        an instruction: drain inbox() and act on what comes out. The body is
+        deliberately omitted -- the durable row is the single source of truth,
+        which is what keeps delivery drain-once (a role peer that finds an empty
+        inbox, because another member drained the row, is told so). Inlining the
+        body for a unique-name/single-reader target was considered and declined:
+        it would split the source of truth and risk double-handling.
         """
-        if not self._push_enabled:
-            return False
-        targets = self._push_targets(to, exclude_session_id=id(ctx.session))
-        if not targets:
-            return False
         content = (
             f"A switchboard message just arrived for you from '{sender}' "
             f"(message id {mid}). React now: call inbox() to drain your mailbox, "
@@ -395,18 +402,95 @@ class Switchboard:
         # silently drops them (they render as attributes on the <channel> tag).
         # No "source" key: the client already sets source="<server name>" on the
         # tag, so sending one would duplicate the attribute.
-        meta = {
-            "msg_from": str(sender),
-            "msg_to": str(to),
-            "msg_id": str(mid),
-        }
+        meta = {"msg_from": str(sender), "msg_to": str(to), "msg_id": str(mid)}
         if reply_to is not None:
             meta["reply_to"] = str(reply_to)
+        return await self._push(conn, content=content, meta=meta)
+
+    async def _notify(
+        self, ctx: Context, *, sender: str, to: str, mid: int, reply_to: Optional[int]
+    ) -> bool:
+        """Best-effort daemon send-side push to connected recipient(s) of ``to``.
+
+        Returns True if at least one live delivery was handed to the transport.
+        When a role is addressed every connected member is nudged, but only the
+        one that wins the atomic inbox() drain receives the row (drain-once; see
+        ``_nudge``). No-op unless push is enabled. In stdio there is never another
+        session in this process, so this finds no target there -- the recipient's
+        own ``_watch_loop`` does the delivering instead.
+        """
+        if not self._push_enabled:
+            return False
         delivered = False
-        for t in targets:
-            if await self._push(t, content=content, meta=meta):
+        for t in self._push_targets(to, exclude_session_id=id(ctx.session)):
+            if await self._nudge(t, sender=sender, to=to, mid=mid, reply_to=reply_to):
                 delivered = True
         return delivered
+
+    # -- self-watch (stdio turn injection, no daemon) -----------------------
+
+    async def _watch_tick(self, *, heartbeat: bool = False) -> int:
+        """One self-watch pass: nudge each connected session about messages that
+        arrived for it since the last pass. Returns the number of nudges emitted.
+        Best-effort; never raises. See ``_watch_loop`` for the rationale.
+
+        Peeks, never drains: delivery stays the client's atomic inbox() call, so
+        drain-once holds even when several stdio sessions share a role -- each
+        process's watcher nudges its own client, but only one wins the drain. A
+        per-session high-water mark means each new message is nudged once, not on
+        every poll.
+        """
+        now = _now()
+        # Forget high-water marks for sessions that have disconnected.
+        self._watch_hw = {sid: hw for sid, hw in self._watch_hw.items() if sid in self._conns}
+        nudged = 0
+        for sid, conn in list(self._conns.items()):
+            if heartbeat:
+                # A connected session is live even while idle: keep it in the
+                # registry so senders don't see a false no_live_recipient and so
+                # role addressing still finds it.
+                self.store.touch(conn.name, now=now)
+            hw = self._watch_hw.get(sid, 0)
+            try:
+                new = self.store.inbox(conn.name, conn.role, peek=True, since=hw)
+            except Exception:  # pragma: no cover - defensive: a bad read skips this conn
+                continue
+            if not new:
+                continue
+            self._watch_hw[sid] = max(m.id for m in new)
+            latest = new[-1]
+            if await self._nudge(
+                conn, sender=latest.sender, to=conn.name, mid=latest.id, reply_to=latest.reply_to
+            ):
+                nudged += 1
+        return nudged
+
+    async def _watch_loop(self) -> None:
+        """Give a *stdio* session turn injection with no daemon.
+
+        Each Claude Code session spawns its own switchboard process, and MCP
+        stdio is bidirectional, so this process can push a Channels notification
+        straight to its own client. This loop polls the shared board for messages
+        addressed to this process's session(s) and self-nudges; the client reacts
+        and drains. Cross-session delivery still rides the shared SQLite, and
+        drain-once is preserved by the atomic inbox() -- so this needs no daemon,
+        no supervisor, and no reboot story, and per-project boards keep working.
+
+        No-op in daemon mode (the shared process pushes directly on send(), and a
+        watcher would double-nudge) or when push is disabled. Started by the
+        server lifespan; runs until the session -- hence the process -- ends.
+        """
+        if self._daemon or not self._push_enabled:
+            return
+        last_heartbeat = 0.0
+        while True:
+            now = _now()
+            do_heartbeat = now - last_heartbeat >= _WAIT_HEARTBEAT_SECONDS
+            if do_heartbeat:
+                last_heartbeat = now
+            with suppress(Exception):  # a bad pass must never kill the loop
+                await self._watch_tick(heartbeat=do_heartbeat)
+            await anyio.sleep(_WATCH_POLL_SECONDS)
 
     async def send_async(
         self, ctx: Context, to: str, body: str, reply_to: Optional[int] = None
@@ -649,6 +733,19 @@ def build_server(
         daemon=daemon,
     )
 
+    @asynccontextmanager
+    async def _lifespan(_server: FastMCP):
+        # Host the stdio self-watch task for the server's lifetime so a stdio
+        # session gets turn injection without a daemon. It no-ops unless push is
+        # enabled in stdio mode (see Switchboard._watch_loop), so attaching it
+        # for every transport is safe.
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(sb._watch_loop)
+            try:
+                yield {}
+            finally:
+                tg.cancel_scope.cancel()
+
     mcp = FastMCP(
         "switchboard-relay",
         instructions=(
@@ -662,6 +759,7 @@ def build_server(
             "The switchboard is scoped to this project by default, so you only see "
             "sessions on the same board."
         ),
+        lifespan=_lifespan,
     )
     # Expose the wiring for tests and daemon introspection.
     mcp._switchboard_relay = sb  # type: ignore[attr-defined]

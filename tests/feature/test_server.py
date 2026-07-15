@@ -8,9 +8,11 @@ by test_integration.py).
 
 from __future__ import annotations
 
+import functools
 import re
 import time
 
+import anyio
 import pytest
 
 from switchboard_relay.server import (
@@ -608,3 +610,121 @@ def test_push_meta_keys_are_identifiers(board):
     meta = dumped["params"]["meta"]
     assert "reply_to" in meta
     assert all(_META_KEY_RE.match(k) for k in meta)
+
+
+# -- stdio self-watch (turn injection without a daemon) ---------------------
+
+
+def _tick(board, **kw):
+    return anyio.run(functools.partial(board._watch_tick, **kw))
+
+
+def test_watch_tick_nudges_local_session_and_leaves_message(board):
+    # The stdio watcher self-nudges its own client about a message that landed
+    # on the shared board (written here as if by another process's send()).
+    board._push_enabled = True
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    board.store.send("lead", "hello", sender="worker", now=time.time())
+
+    assert _tick(board) == 1
+    dumped = ctx.session.sent[0].model_dump(by_alias=True, mode="json", exclude_none=True)
+    assert dumped["method"] == _CHANNEL_METHOD
+    assert dumped["params"]["meta"]["msg_from"] == "worker"
+    assert "inbox()" in dumped["params"]["content"].lower()
+    # Peeked, NOT drained: the durable row is untouched and still deliverable.
+    assert board.store.has_messages("lead")
+
+
+def test_watch_tick_does_not_renudge_same_message(board):
+    board._push_enabled = True
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    board.store.send("lead", "one", sender="worker", now=time.time())
+    assert _tick(board) == 1
+    assert _tick(board) == 0  # high-water mark: no repeat nudge for the same row
+    assert len(ctx.session.sent) == 1
+
+
+def test_watch_tick_renudges_on_a_new_message(board):
+    board._push_enabled = True
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    board.store.send("lead", "one", sender="worker", now=time.time())
+    assert _tick(board) == 1
+    board.store.send("lead", "two", sender="worker", now=time.time())
+    assert _tick(board) == 1  # a genuinely new message earns a fresh nudge
+    assert len(ctx.session.sent) == 2
+
+
+def test_watch_tick_heartbeat_keeps_connected_session_live(board):
+    # A connected-but-idle session must stay in the live registry so senders
+    # don't see a false no_live_recipient. A heartbeat tick refreshes it.
+    board._push_enabled = True
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    board.store.register("lead", "", now=time.time() - 10_000)  # force it stale
+    assert board._has_live_recipient("lead") is False
+    _tick(board, heartbeat=True)
+    assert board._has_live_recipient("lead") is True
+
+
+def test_watch_tick_best_effort_on_bad_session(board):
+    # A recipient whose session errors on push must not raise, and the watcher
+    # must not spin retrying it (the high-water mark still advances).
+    board._push_enabled = True
+
+    class Boom:
+        async def send_notification(self, *a, **k):
+            raise RuntimeError("stream closed")
+
+    ctx = FakeCtx(Boom())
+    board.register(ctx, "lead")
+    board.store.send("lead", "hi", sender="worker", now=time.time())
+    assert _tick(board) == 0  # push failed -> not counted, but no raise
+    assert _tick(board) == 0  # and no retry storm on the same row
+    assert board.store.has_messages("lead")  # still durable
+
+
+def test_watch_loop_noop_when_push_off_or_daemon():
+    # Both guards return immediately rather than spinning an infinite loop.
+    anyio.run(Switchboard(Store(":memory:"), ttl=300)._watch_loop)  # push off
+    daemon = Switchboard(Store(":memory:"), ttl=300, daemon=True)
+    daemon._push_enabled = True
+    anyio.run(daemon._watch_loop)  # daemon uses direct push, not the watcher
+
+
+def test_watch_loop_delivers_reticks_then_cancels(board, monkeypatch):
+    # Exercise the real background loop across multiple iterations (fast poll):
+    # it heartbeats on the first tick, skips the heartbeat on the next, nudges
+    # the connected session about a queued message, and stops cleanly on cancel.
+    import switchboard_relay.server as server_mod
+
+    monkeypatch.setattr(server_mod, "_WATCH_POLL_SECONDS", 0.01)  # iterate quickly
+    board._push_enabled = True
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    board.store.send("lead", "async ping", sender="worker", now=time.time())
+
+    ticks = 0
+    original = board._watch_tick
+
+    async def spy(**kw):
+        nonlocal ticks
+        ticks += 1
+        return await original(**kw)
+
+    monkeypatch.setattr(board, "_watch_tick", spy)
+
+    async def drive():
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(board._watch_loop)
+            with anyio.fail_after(3):
+                # >=2 ticks so the second (non-heartbeat) iteration also runs.
+                while ticks < 2 or not ctx.session.sent:
+                    await anyio.sleep(0.005)
+            tg.cancel_scope.cancel()
+
+    anyio.run(drive)
+    assert ctx.session.sent  # nudged its own client
+    assert board.store.has_messages("lead")  # peeked, not drained
