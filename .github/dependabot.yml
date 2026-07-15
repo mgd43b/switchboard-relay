@@ -1,15 +1,26 @@
 version: 2
 updates:
+  # GitHub Actions used by the CI and release workflows. Grouped so all bumps
+  # land in a single PR instead of one per action.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 5
     commit-message:
       prefix: "ci"
+    groups:
+      github-actions:
+        patterns: ["*"]
 
+  # Python dependencies declared in pyproject.toml (runtime + test/dev extras).
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 5
     commit-message:
       prefix: "deps"
+    groups:
+      python:
+        patterns: ["*"]
