@@ -89,6 +89,99 @@ def test_wait_times_out_after_polling(board):
     assert out["messages"] == []
 
 
+# -- ask / broadcast / unregister ------------------------------------------
+
+
+def test_ask_times_out_without_reply(board):
+    ctx = _ctx()
+    board.register(ctx, "worker:x", "worker")
+    out = _run(board.ask, ctx, "lead", "are you there?", 0.05)
+    assert out["timed_out"] is True
+    assert out["reply"] is None
+    # The question is still durably queued for the (absent) recipient.
+    assert board.store.has_messages("lead")
+
+
+async def test_ask_returns_reply_when_it_arrives(board):
+    import anyio
+
+    asker, responder = _ctx(), _ctx()
+    board.register(asker, "worker:x", "worker")
+    board.register(responder, "lead")
+
+    async def respond():
+        for _ in range(200):
+            pending = board.store.pending_messages()
+            q = next((m for m in pending if m.to == "lead"), None)
+            if q is not None:
+                board.send(responder, "worker:x", "the answer is 42", q.id)
+                return
+            await anyio.sleep(0.005)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(respond)
+        out = await board.ask(asker, "lead", "what is the answer?", 5.0)
+
+    assert out["timed_out"] is False
+    assert out["reply"]["body"] == "the answer is 42"
+    assert out["reply"]["reply_to"] == out["question_id"]
+
+
+def test_ask_rejects_empty_recipient(board):
+    ctx = _ctx()
+    board.register(ctx, "worker")
+    with pytest.raises(ValueError, match="non-empty address"):
+        _run(board.ask, ctx, "", "q")
+
+
+def test_push_enabled_but_no_connected_target_is_not_live(board):
+    board._push_enabled = True
+    a = _ctx()
+    board.register(a, "lead")
+    # Nobody is connected under "nobody-here", so push finds no target.
+    res = _run(board.send_async, a, "nobody-here", "hi")
+    assert res["delivered_live"] is False
+
+
+def test_broadcast_reaches_all_live_except_sender(board):
+    a, b, c = _ctx(), _ctx(), _ctx()
+    board.register(a, "lead")
+    board.register(b, "worker:1", "worker")
+    board.register(c, "worker:2", "worker")
+
+    out = _run(board.broadcast, a, "all hands")
+    assert out["count"] == 2
+    assert {d["to"] for d in out["delivered"]} == {"worker:1", "worker:2"}
+    assert [m["body"] for m in board.inbox(b)["messages"]] == ["all hands"]
+    assert [m["body"] for m in board.inbox(c)["messages"]] == ["all hands"]
+    assert board.inbox(a)["messages"] == []  # sender does not receive its own broadcast
+
+
+def test_unregister_removes_from_registry(board):
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    out = board.unregister(ctx)
+    assert out == {"ok": True, "was_registered": True, "you": "lead"}
+    # Gone from the live list, and identity no longer resolves.
+    assert board.participants(_ctx())["participants"] == []
+    with pytest.raises(ValueError, match="not registered"):
+        board.inbox(ctx)
+
+
+def test_unregister_when_never_registered(board):
+    out = board.unregister(_ctx())
+    assert out == {"ok": True, "was_registered": False, "you": None}
+
+
+def test_unregister_uses_env_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_NAME", "worker:seed")
+    sb = Switchboard(Store(tmp_path / "sb.db"), ttl=300)
+    sb.store.register("worker:seed", "", now=1.0)
+    # A session that never explicitly registered still unregisters its seeded id.
+    out = sb.unregister(_ctx())
+    assert out == {"ok": True, "was_registered": True, "you": "worker:seed"}
+
+
 def test_wait_survives_drained_race(board, monkeypatch):
     # has_messages() says yes, but another reader drains the row before our
     # inbox() call, so it comes back empty. wait() must NOT falsely report a

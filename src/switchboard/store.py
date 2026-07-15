@@ -212,6 +212,19 @@ class Store:
             name=name, role=row["role"], last_seen=now, registered_at=row["registered_at"]
         )
 
+    def unregister(self, name: str) -> bool:
+        """Remove a participant from the registry. Returns True if one existed.
+
+        The participant's mailbox is left untouched: any undelivered messages
+        remain and will be read if that name registers again later.
+        """
+        name = (name or "").strip()
+        if not name:
+            return False
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM participants WHERE name = ?", (name,))
+            return (cur.rowcount or 0) > 0
+
     def touch(self, name: str, *, now: float) -> None:
         """Refresh a participant's ``last_seen`` if it exists (a heartbeat).
 
@@ -324,6 +337,55 @@ class Store:
             except Exception:  # pragma: no cover - defensive: roll back a failed drain
                 conn.execute("ROLLBACK")
                 raise
+        return [_row_to_message(r) for r in rows]
+
+    def take_reply(self, name: str, role: str = "", *, reply_to: int) -> Optional[Message]:
+        """Atomically remove and return the oldest reply addressed to this participant.
+
+        A "reply" is a message to ``name``/``role`` whose ``reply_to`` matches the
+        given id. Unlike :meth:`inbox`, this drains *only* the matching reply and
+        leaves every other message in the mailbox -- it is the primitive behind
+        the server's ``ask()`` (send-a-question-then-wait-for-its-answer) tool.
+        """
+        addresses = _addresses(name, role)
+        placeholders = ",".join("?" for _ in addresses)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    f"SELECT id, recipient, sender, body, reply_to, created_at "
+                    f"FROM messages WHERE recipient IN ({placeholders}) AND reply_to = ? "
+                    f"ORDER BY id ASC LIMIT 1",
+                    (*addresses, int(reply_to)),
+                ).fetchone()
+                if row is not None:
+                    conn.execute("DELETE FROM messages WHERE id = ?", (row["id"],))
+                conn.execute("COMMIT")
+            except Exception:  # pragma: no cover - defensive: roll back a failed take
+                conn.execute("ROLLBACK")
+                raise
+        return _row_to_message(row) if row is not None else None
+
+    def pending_messages(self, *, since: Optional[int] = None, limit: int = 100) -> list[Message]:
+        """A page of queued (undelivered) messages, oldest first.
+
+        Returns up to ``limit`` messages with ``id`` greater than ``since`` (or
+        from the beginning when ``since`` is None). Callers page through a large
+        backlog by passing the last returned id as ``since``. For human
+        inspection via the ``switchboard tail`` CLI; not part of the MCP tools.
+        """
+        clause = ""
+        params: list = []
+        if since is not None:
+            clause = "WHERE id > ?"
+            params.append(int(since))
+        params.append(int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT id, recipient, sender, body, reply_to, created_at "
+                f"FROM messages {clause} ORDER BY id ASC LIMIT ?",
+                params,
+            ).fetchall()
         return [_row_to_message(r) for r in rows]
 
     def has_messages(self, name: str, role: str = "", *, since: Optional[int] = None) -> bool:

@@ -200,6 +200,89 @@ def test_send_rejects_empty_recipient(store):
         store.send("", "body", sender="a", now=1.0)
 
 
+# -- unregister ------------------------------------------------------------
+
+
+def test_unregister_removes_participant(store):
+    store.register("lead", "coordinator", now=1.0)
+    assert store.unregister("lead") is True
+    assert store.participants(now=1.0) == []
+
+
+def test_unregister_unknown_returns_false(store):
+    assert store.unregister("ghost") is False
+    assert store.unregister("") is False
+
+
+def test_unregister_preserves_mailbox(store):
+    store.register("lead", now=1.0)
+    store.send("lead", "still here", sender="worker", now=2.0)
+    store.unregister("lead")
+    # Leaving does not discard undelivered messages.
+    assert [m.body for m in store.inbox("lead")] == ["still here"]
+
+
+# -- take_reply (ask() primitive) ------------------------------------------
+
+
+def test_take_reply_drains_only_the_matching_reply(store):
+    q = store.send("worker", "question", sender="lead", now=1.0)
+    # An unrelated message and the actual reply both land for worker.
+    store.send("worker", "unrelated", sender="other", now=2.0)
+    store.send("worker", "the answer", sender="lead", reply_to=q, now=3.0)
+
+    reply = store.take_reply("worker", reply_to=q)
+    assert reply is not None
+    assert reply.body == "the answer"
+    assert reply.reply_to == q
+    # The unrelated message is untouched.
+    assert [m.body for m in store.inbox("worker")] == ["question", "unrelated"]
+
+
+def test_take_reply_returns_none_when_no_match(store):
+    store.send("worker", "no reply here", sender="lead", now=1.0)
+    assert store.take_reply("worker", reply_to=999) is None
+
+
+def test_take_reply_matches_role(store):
+    q = 7
+    store.send("worker", "answer", sender="lead", reply_to=q, now=1.0)
+    reply = store.take_reply("worker:1", role="worker", reply_to=q)
+    assert reply is not None and reply.body == "answer"
+
+
+def test_take_reply_oldest_first(store):
+    store.send("w", "first", sender="a", reply_to=5, now=1.0)
+    store.send("w", "second", sender="a", reply_to=5, now=2.0)
+    assert store.take_reply("w", reply_to=5).body == "first"
+    assert store.take_reply("w", reply_to=5).body == "second"
+
+
+# -- pending_messages (CLI inspection) -------------------------------------
+
+
+def test_pending_messages_lists_all_queued(store):
+    store.send("a", "one", sender="x", now=1.0)
+    store.send("b", "two", sender="y", now=2.0)
+    pending = store.pending_messages()
+    assert [(m.to, m.body) for m in pending] == [("a", "one"), ("b", "two")]
+
+
+def test_pending_messages_respects_limit(store):
+    for i in range(5):
+        store.send("a", f"m{i}", sender="x", now=float(i))
+    assert len(store.pending_messages(limit=3)) == 3
+
+
+def test_pending_messages_since_pages_through_backlog(store):
+    ids = [store.send("a", f"m{i}", sender="x", now=float(i)) for i in range(5)]
+    # Everything after the 2nd id.
+    rest = store.pending_messages(since=ids[1])
+    assert [m.id for m in rest] == ids[2:]
+    # since past the end -> empty.
+    assert store.pending_messages(since=ids[-1]) == []
+
+
 # -- role addressing -------------------------------------------------------
 
 

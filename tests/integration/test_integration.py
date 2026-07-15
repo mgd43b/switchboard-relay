@@ -160,6 +160,60 @@ async def test_wait_returns_message_on_arrival(tmp_path):
         assert [m["body"] for m in out["messages"]] == ["async hello"]
 
 
+# -- ask (request/response) -------------------------------------------------
+
+
+async def test_ask_round_trip(tmp_path):
+    mcp = make_board(tmp_path)
+    async with sessions(mcp) as (worker, lead):
+        data(await worker.call_tool("register", {"name": "worker:x", "role": "worker"}))
+        data(await lead.call_tool("register", {"name": "lead"}))
+
+        async def answer():
+            got = data(await lead.call_tool("wait", {"timeout_s": 5.0}))
+            q = got["messages"][0]
+            await lead.call_tool("send", {"to": q["from"], "body": "42", "reply_to": q["id"]})
+
+        answerer = asyncio.create_task(answer())
+        result = data(
+            await worker.call_tool("ask", {"to": "lead", "body": "the answer?", "timeout_s": 5.0})
+        )
+        await answerer
+
+        assert result["timed_out"] is False
+        assert result["reply"]["body"] == "42"
+        assert result["reply"]["reply_to"] == result["question_id"]
+
+
+async def test_broadcast_over_the_wire(tmp_path):
+    mcp = make_board(tmp_path)
+    async with sessions(mcp, 3) as (lead, w1, w2):
+        data(await lead.call_tool("register", {"name": "lead"}))
+        data(await w1.call_tool("register", {"name": "worker:1", "role": "worker"}))
+        data(await w2.call_tool("register", {"name": "worker:2", "role": "worker"}))
+
+        out = data(await lead.call_tool("broadcast", {"body": "standup in 5"}))
+        assert out["count"] == 2
+        assert [m["body"] for m in data(await w1.call_tool("inbox", {}))["messages"]] == [
+            "standup in 5"
+        ]
+        assert [m["body"] for m in data(await w2.call_tool("inbox", {}))["messages"]] == [
+            "standup in 5"
+        ]
+
+
+async def test_unregister_over_the_wire(tmp_path):
+    mcp = make_board(tmp_path)
+    async with sessions(mcp) as (a, b):
+        data(await a.call_tool("register", {"name": "lead"}))
+        data(await b.call_tool("register", {"name": "worker"}))
+        out = data(await a.call_tool("unregister", {}))
+        assert out["was_registered"] is True
+        assert out["you"] == "lead"
+        parts = data(await b.call_tool("participants", {}))
+        assert "lead" not in {p["name"] for p in parts["participants"]}
+
+
 # -- role addressing --------------------------------------------------------
 
 

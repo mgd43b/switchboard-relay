@@ -72,7 +72,10 @@ add them to `permissions.allow` in your user settings (`~/.claude/settings.json`
       "mcp__switchboard__participants",
       "mcp__switchboard__send",
       "mcp__switchboard__inbox",
-      "mcp__switchboard__wait"
+      "mcp__switchboard__wait",
+      "mcp__switchboard__ask",
+      "mcp__switchboard__broadcast",
+      "mcp__switchboard__unregister"
     ]
   }
 }
@@ -91,6 +94,9 @@ Or allowlist the whole server with a single entry: `"mcp__switchboard"`.
 | `send` | `send(to, body, reply_to?)` | Append a message to `to`'s durable inbox. `to` matches a participant **name or role**. `reply_to` threads a reply to a message id. Returns the new message `id`. |
 | `inbox` | `inbox(peek?, since?)` | Read messages addressed to you. **Drains** by default (each message delivered once); `peek=true` reads without removing; `since=<id>` returns only messages newer than that id. |
 | `wait` | `wait(timeout_s?)` | Block up to `timeout_s` seconds (default 30, max 3600) until a message arrives, then drain and return it. Returns `timed_out: true` on timeout. |
+| `ask` | `ask(to, body, timeout_s?)` | **Request/response in one call:** send `body` to `to`, then block until a reply threaded to it comes back (`reply_to` = the returned `question_id`). Leaves other inbox messages untouched; returns `timed_out: true` if no reply in time. |
+| `broadcast` | `broadcast(body)` | Send `body` to every currently‑live participant except yourself. Returns the per‑recipient message ids. |
+| `unregister` | `unregister()` | Leave the switchboard (drop out of `participants()`). Your mailbox is preserved for if you return. |
 
 Messages are **durable**: a message sent to a name that hasn't registered yet simply waits in
 that mailbox until it's read. Addressing by `role` fans a message out to whichever participant
@@ -118,17 +124,30 @@ Claude will `register(name="lead")` and then park in `wait()`. Pair it with the
 **In each worker session:**
 
 ```
-Register me on switchboard as "worker:auth" with role "worker". Ask the lead
-how our auth middleware refreshes tokens: send the question to "lead" and then
-wait() for the reply.
+Register me on switchboard as "worker:auth" with role "worker", then use ask()
+to ask the lead how our auth middleware refreshes tokens.
 ```
 
-The worker `send`s to `"lead"` and `wait()`s; the lead's loop picks it up, answers, and
-replies; the worker's `wait()` returns the answer. No window‑switching.
+The worker calls `ask("lead", "…")` — one call that sends the question and blocks for the
+answer. The lead's loop picks it up, replies with `reply_to` set, and the worker's `ask()`
+returns the reply. No window‑switching, no manual `wait()`.
 
 > **Tip:** launch a worker pre‑addressed with environment variables so it doesn't even need an
 > explicit `register` call — set `SWITCHBOARD_NAME=worker:auth` and `SWITCHBOARD_ROLE=worker`
 > in that session's MCP server env.
+
+### Peek at the traffic from your terminal
+
+`switchboard` doubles as a small inspection CLI over the same database — handy for debugging
+who's connected and what's queued, without an MCP client:
+
+```bash
+switchboard participants     # live participants (name, role, idle time)
+switchboard tail             # queued (undelivered) messages
+switchboard tail --follow    # …and keep watching
+```
+
+Example recipes for the lead loop and workers live in [`examples/`](examples/).
 
 ---
 
