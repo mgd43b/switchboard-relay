@@ -8,10 +8,13 @@ Two ways to run the same server:
   and satisfies all of switchboard's core goals. It cannot *push* -- a session's
   process has no handle to another session's process -- so recipients poll.
 
-* **HTTP daemon (opt-in)** -- ``switchboard serve``. One process holds every
-  session's connection, so ``send()`` can additionally emit a Channels
-  notification (``notifications/claude/channel``) straight into a connected
-  recipient. This is the experimental push path; see the README.
+* **HTTP daemon** -- ``switchboard serve``. One process holds every session's
+  connection, so ``send()`` can additionally emit a Channels notification
+  (``notifications/claude/channel``) straight into a connected recipient, which
+  a channel-subscribed session turns into a reactive turn ("turn injection").
+  Push is on by default here and best-effort: if the recipient isn't a
+  subscribed channel it simply falls back to polling. See the README's "Turn
+  injection" section for the subscription recipe and its constraints.
 
 Identity is bound per MCP connection: ``register(name, role)`` associates the
 calling session with an address, and subsequent ``inbox()``/``wait()``/``send()``
@@ -48,7 +51,21 @@ from switchboard_relay.store import DEFAULT_TTL_SECONDS, Store
 _WAIT_POLL_SECONDS = 0.25
 _WAIT_HEARTBEAT_SECONDS = 10.0
 
+# The Claude Code Channels contract (research preview), verified against the docs
+# (https://code.claude.com/docs/en/channels-reference) and the local `claude`
+# build. A session that has subscribed to this server as a channel turns each
+# such notification into its *next turn* -- the content is wrapped as
+# ``<channel source="<server>" ...>content</channel>`` and injected as a meta
+# prompt. That injected turn is what makes a recipient REACT to a message
+# instead of waiting to poll. See the "Turn injection" section of the README.
 _CHANNEL_METHOD = "notifications/claude/channel"
+
+# The server-side capability that makes turn injection possible: a channel-aware
+# client only registers a listener for ``_CHANNEL_METHOD`` if the server declared
+# this experimental capability in its initialize response. Declared as ``{}``
+# (its presence is the signal; there is no config). Harmless to advertise to a
+# stock MCP client, which ignores experimental capabilities it doesn't know.
+_CHANNEL_CAPABILITY = "claude/channel"
 
 
 def _now() -> float:
@@ -113,6 +130,29 @@ def _resolve_max_body() -> int:
     return val if val > 0 else 0  # 0 / negative -> cap disabled
 
 
+_PUSH_TRUE = ("1", "true", "yes", "on")
+_PUSH_FALSE = ("0", "false", "no", "off")
+
+
+def _resolve_push(*, daemon: bool) -> bool:
+    """Whether to emit Channels push nudges (turn injection).
+
+    ``$SWITCHBOARD_PUSH`` wins when set to a recognized truthy/falsy value.
+    Otherwise the default is ``daemon`` -- push is ON in daemon mode (the only
+    mode that can cross-push, and the whole reason ``serve`` exists) and OFF for
+    per-session stdio (where there is never another session's connection to push
+    to). Push is always best-effort: a recipient that isn't a subscribed channel
+    simply doesn't react and falls back to durable poll, so defaulting it on in
+    daemon mode costs nothing when the feature is unavailable.
+    """
+    raw = (os.environ.get("SWITCHBOARD_PUSH") or "").strip().lower()
+    if raw in _PUSH_TRUE:
+        return True
+    if raw in _PUSH_FALSE:
+        return False
+    return daemon
+
+
 def _clamp_timeout(value: Any, *, default: float = 30.0, cap: float = 3600.0) -> float:
     """Coerce a caller-supplied timeout to a sane [0, cap] range."""
     try:
@@ -148,6 +188,7 @@ class Switchboard:
         board: str = "",
         msg_ttl: float = DEFAULT_MSG_TTL_SECONDS,
         max_body: int = DEFAULT_MAX_BODY_BYTES,
+        daemon: bool = False,
     ):
         self.store = store
         self.ttl = ttl
@@ -167,17 +208,14 @@ class Switchboard:
         # an explicit register() call.
         self._default_name = (os.environ.get("SWITCHBOARD_NAME") or "").strip()
         self._default_role = (os.environ.get("SWITCHBOARD_ROLE") or "").strip()
-        # Push is opt-in. It only does anything in daemon mode (a recipient
-        # connected to the same process) AND only makes sense when recipients
-        # are Claude sessions subscribed as a channel -- a stock MCP client
-        # rejects the custom notification method. Off by default keeps the
-        # common path pure durable-poll with no surprises.
-        self._push_enabled = (os.environ.get("SWITCHBOARD_PUSH") or "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
+        # Whether to emit Channels push nudges. Push only does anything in daemon
+        # mode (a recipient connected to the same process) AND only when that
+        # recipient is a Claude session subscribed to this server as a channel --
+        # a stock MCP client just ignores the notification. It therefore defaults
+        # ON in daemon mode (that is the entire point of `serve`) and OFF for
+        # stdio, with $SWITCHBOARD_PUSH forcing either way. Tests set this
+        # attribute directly. See _resolve_push().
+        self._push_enabled = _resolve_push(daemon=daemon)
 
     # -- identity -----------------------------------------------------------
 
@@ -321,15 +359,22 @@ class Switchboard:
     async def _notify(
         self, ctx: Context, *, sender: str, to: str, mid: int, reply_to: Optional[int]
     ) -> bool:
-        """Best-effort push nudge to any connected recipient(s) of ``to``.
+        """Best-effort push nudge that makes any connected recipient(s) REACT.
 
-        Returns True if at least one live delivery was made. This is a *nudge*,
-        not the message itself: the durable inbox row is the single source of
-        truth. Deliberately omitting the body keeps push consistent with
-        drain-once semantics -- when a role is addressed every connected member
-        is nudged but only the one that drains the row receives it; the others
-        just find an empty inbox, which is harmless. Embedding the body here
-        would let multiple role members act on a message only one of them owns.
+        Returns True if at least one live delivery was handed to the transport.
+        A channel-subscribed recipient turns this notification into its next turn
+        (see ``_CHANNEL_METHOD``), so the ``content`` is written as an
+        instruction: drain the durable inbox and handle what comes out.
+
+        This is a *nudge*, not the message itself: the durable inbox row is the
+        single source of truth, and the body is deliberately omitted. That keeps
+        push consistent with drain-once -- when a role is addressed every
+        connected member is nudged, but only the one that drains the row receives
+        it; the others find an empty inbox, which the wording anticipates. (The
+        one-round-trip optimization of inlining the body for a unique-name/single
+        -reader target is intentionally declined: it would risk double-handling
+        and split the source of truth. See the README.)
+
         No-op unless push is enabled (daemon mode).
         """
         if not self._push_enabled:
@@ -338,11 +383,19 @@ class Switchboard:
         if not targets:
             return False
         content = (
-            f"New switchboard message from {sender} (id {mid}). "
-            f"Call inbox() (or wait()) to read it."
+            f"A switchboard message just arrived for you from '{sender}' "
+            f"(message id {mid}). React now: call inbox() to drain your mailbox, "
+            "then read and act on what it returns -- if it's a question, reply "
+            "with send(to, body, reply_to=<id>). This is an automatic nudge, not "
+            "the message body; the message itself is in your durable inbox. If "
+            "inbox() comes back empty, a peer on your role already handled it -- "
+            "nothing to do."
         )
+        # meta keys must be identifiers ([A-Za-z_][A-Za-z0-9_]*) or the client
+        # silently drops them (they render as attributes on the <channel> tag).
+        # No "source" key: the client already sets source="<server name>" on the
+        # tag, so sending one would duplicate the attribute.
         meta = {
-            "source": "switchboard-relay",
             "msg_from": str(sender),
             "msg_to": str(to),
             "msg_id": str(mid),
@@ -552,6 +605,27 @@ class Switchboard:
 # they double as the user-facing tool descriptions. Keep them action-oriented.
 
 
+def _declare_channel_capability(mcp: FastMCP) -> None:
+    """Advertise the ``claude/channel`` capability in the initialize response.
+
+    Turn injection only happens if the recipient's client saw this experimental
+    capability at connect time and registered a listener for ``_CHANNEL_METHOD``.
+    FastMCP builds its InitializationOptions via the underlying low-level
+    server's ``create_initialization_options()`` (both the stdio and
+    streamable-http transports route through it and call it with no arguments),
+    which takes an ``experimental_capabilities`` dict. We wrap that bound method
+    to inject ours while preserving anything an explicit caller passes.
+    """
+    low = mcp._mcp_server  # the mcp.server.lowlevel.Server FastMCP wraps
+    original = low.create_initialization_options
+
+    def with_channel_capability(notification_options=None, experimental_capabilities=None):
+        merged = {_CHANNEL_CAPABILITY: {}, **(experimental_capabilities or {})}
+        return original(notification_options, merged)
+
+    low.create_initialization_options = with_channel_capability  # type: ignore[assignment]
+
+
 def build_server(
     store: Optional[Store] = None,
     *,
@@ -559,6 +633,7 @@ def build_server(
     board: str = "",
     msg_ttl: Optional[float] = None,
     max_body: Optional[int] = None,
+    daemon: bool = False,
 ) -> FastMCP:
     store = store if store is not None else Store()
     sb = Switchboard(
@@ -569,6 +644,7 @@ def build_server(
         # so programmatic callers behave like the CLI.
         msg_ttl=msg_ttl if msg_ttl is not None else _resolve_msg_ttl(),
         max_body=max_body if max_body is not None else _resolve_max_body(),
+        daemon=daemon,
     )
 
     mcp = FastMCP(
@@ -587,6 +663,12 @@ def build_server(
     )
     # Expose the wiring for tests and daemon introspection.
     mcp._switchboard_relay = sb  # type: ignore[attr-defined]
+
+    # Declare the Channels capability so a subscribed recipient will inject our
+    # push nudges as turns (see _declare_channel_capability / the README). Done
+    # for every transport: harmless to advertise on stdio (which never pushes),
+    # and it keeps the initialize response uniform.
+    _declare_channel_capability(mcp)
 
     @mcp.tool()
     def register(name: str = "", role: str = "", ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
@@ -973,16 +1055,37 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _cli_prune(db_path, ttl, args.older_than_days)
 
     store = Store(db_path)
+    # Only the daemon can cross-push, so push (turn injection) defaults on there
+    # and off for stdio; see _resolve_push().
+    daemon = args.cmd == "serve"
     mcp = build_server(
-        store, ttl=ttl, board=target.board, msg_ttl=_resolve_msg_ttl(), max_body=_resolve_max_body()
+        store,
+        ttl=ttl,
+        board=target.board,
+        msg_ttl=_resolve_msg_ttl(),
+        max_body=_resolve_max_body(),
+        daemon=daemon,
     )
 
-    if args.cmd == "serve":
+    if daemon:
         mcp.settings.host = args.host
         mcp.settings.port = args.port
+        push_on = mcp._switchboard_relay._push_enabled  # type: ignore[attr-defined]
         print(
             f"switchboard-relay daemon (streamable-http) on http://{args.host}:{args.port}"
             f"{mcp.settings.streamable_http_path}  board={target.board}  db={store.db_path}",
+            file=sys.stderr,
+        )
+        # The push path is a Channels research preview: a recipient only reacts
+        # to a send() if that session subscribed to switchboard as a channel.
+        # Spell out the verified recipe so the daemon is self-documenting.
+        print(
+            "  turn injection (push): "
+            + ("ENABLED" if push_on else "disabled (set SWITCHBOARD_PUSH=1 to enable)")
+            + " -- for a session to react, launch it subscribed as a channel:\n"
+            "    claude --dangerously-load-development-channels server:switchboard-relay\n"
+            "  (needs Claude Code Channels; durable poll via wait()/inbox() is the "
+            "fallback. See the README's 'Turn injection' section.)",
             file=sys.stderr,
         )
         mcp.run(transport="streamable-http")

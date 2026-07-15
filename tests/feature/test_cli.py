@@ -22,6 +22,9 @@ class FakeMCP:
     def __init__(self):
         self.settings = types.SimpleNamespace(host=None, port=None, streamable_http_path="/mcp")
         self.ran_transport = "UNSET"
+        # The serve banner reads _switchboard_relay._push_enabled to report
+        # whether turn injection is on; stand it in.
+        self._switchboard_relay = types.SimpleNamespace(_push_enabled=False)
 
     def run(self, transport="stdio"):
         self.ran_transport = transport
@@ -33,12 +36,14 @@ def fake_build(monkeypatch, tmp_path):
     captured = {}
     fake = FakeMCP()
 
-    def _build(store, ttl=None, board="", msg_ttl=None, max_body=None):
+    def _build(store, ttl=None, board="", msg_ttl=None, max_body=None, daemon=False):
         captured["db_path"] = str(store.db_path)
         captured["ttl"] = ttl
         captured["board"] = board
         captured["msg_ttl"] = msg_ttl
         captured["max_body"] = max_body
+        captured["daemon"] = daemon
+        fake._switchboard_relay._push_enabled = daemon
         return fake
 
     monkeypatch.setenv("SWITCHBOARD_DB", str(tmp_path / "cli.db"))

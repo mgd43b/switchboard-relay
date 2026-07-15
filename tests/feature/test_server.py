@@ -13,8 +13,19 @@ import time
 
 import pytest
 
-from switchboard_relay.server import _CHANNEL_METHOD, Switchboard
+from switchboard_relay.server import (
+    _CHANNEL_CAPABILITY,
+    _CHANNEL_METHOD,
+    Switchboard,
+    _resolve_push,
+    build_server,
+)
 from switchboard_relay.store import Store
+
+# The channel client only keeps meta keys that are plain identifiers; anything
+# else is silently dropped before the <channel> tag is rendered. Mirror that
+# rule here so a regression into e.g. a hyphenated key is caught in CI.
+_META_KEY_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
 class FakeSession:
@@ -465,11 +476,22 @@ def test_push_delivers_to_connected_recipient_when_enabled(board):
 
     dumped = b.session.sent[0].model_dump(by_alias=True, mode="json", exclude_none=True)
     assert dumped["method"] == _CHANNEL_METHOD
-    assert dumped["params"]["meta"]["msg_from"] == "lead"
-    assert dumped["params"]["meta"]["msg_id"] == str(res["id"])
-    # The push is a body-less nudge to check inbox, NOT the message content --
-    # the durable row is the single source of truth (see role fan-out below).
-    assert "inbox" in dumped["params"]["content"].lower()
+    meta = dumped["params"]["meta"]
+    assert meta["msg_from"] == "lead"
+    assert meta["msg_to"] == "worker:x"
+    assert meta["msg_id"] == str(res["id"])
+    # No "source" meta key: the client sets source="<server name>" on the tag
+    # itself, so sending one would duplicate the attribute.
+    assert "source" not in meta
+    # Every meta key must be a bare identifier or the client drops it silently.
+    assert all(_META_KEY_RE.match(k) for k in meta)
+    # The nudge makes the recipient REACT, not just "you have mail": it tells it
+    # to drain inbox() and act on / reply to what it gets.
+    content = dumped["params"]["content"].lower()
+    assert "inbox()" in content
+    assert "react" in content or "act on" in content
+    # It is a body-less nudge, NOT the message content -- the durable row is the
+    # single source of truth (see the role fan-out drain-once test below).
     assert "hello there" not in dumped["params"]["content"]
     # The message body is delivered durably, drained once via inbox().
     assert [m["body"] for m in board.inbox(b)["messages"]] == ["hello there"]
@@ -501,6 +523,26 @@ def test_push_by_role_targets_all_matching_and_excludes_sender(board):
     assert lead.session.sent == []  # sender never pushed to itself
 
 
+def test_push_by_role_nudges_all_but_durable_drain_yields_one_handler(board):
+    # The drain-once guarantee under role addressing: a message sent to a role
+    # with two connected members nudges BOTH (so whichever reacts first handles
+    # it), but the single durable row is drained by exactly one -- the body is
+    # never delivered to both. This is why the nudge omits the body.
+    board._push_enabled = True
+    lead = _ctx()
+    w1, w2 = _ctx(), _ctx()
+    board.register(lead, "lead")
+    board.register(w1, "worker:1", "worker")
+    board.register(w2, "worker:2", "worker")
+
+    _run(board.send_async, lead, "worker", "who can take this?")
+    assert len(w1.session.sent) == 1 and len(w2.session.sent) == 1  # both nudged
+
+    # Both react by draining; exactly one gets the message, the other gets empty.
+    drained = board.inbox(w1)["messages"] + board.inbox(w2)["messages"]
+    assert [m["body"] for m in drained] == ["who can take this?"]
+
+
 def test_push_never_raises_on_bad_session(board):
     board._push_enabled = True
 
@@ -516,3 +558,43 @@ def test_push_never_raises_on_bad_session(board):
     assert res["delivered_live"] is False
     # Durable delivery still succeeded.
     assert board.store.has_messages("worker:x", "worker")
+
+
+# -- channel capability + push defaults -------------------------------------
+
+
+def test_build_server_declares_channel_capability():
+    # Turn injection only works if the server advertises the Channels capability
+    # in its initialize response; both transports build options via this call.
+    mcp = build_server(Store(":memory:"), ttl=300, board="cap")
+    caps = mcp._mcp_server.create_initialization_options().capabilities
+    assert caps.experimental == {_CHANNEL_CAPABILITY: {}}
+    # Declaring it must not clobber the real tools capability.
+    assert caps.tools is not None
+
+
+def test_push_defaults_on_in_daemon_mode_off_for_stdio(monkeypatch):
+    monkeypatch.delenv("SWITCHBOARD_PUSH", raising=False)
+    assert Switchboard(Store(":memory:"), daemon=True)._push_enabled is True
+    assert Switchboard(Store(":memory:"), daemon=False)._push_enabled is False
+
+
+def test_push_env_overrides_daemon_default(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_PUSH", "0")
+    assert _resolve_push(daemon=True) is False  # explicit off beats daemon-on
+    monkeypatch.setenv("SWITCHBOARD_PUSH", "on")
+    assert _resolve_push(daemon=False) is True  # explicit on beats stdio-off
+
+
+def test_push_meta_keys_are_identifiers(board):
+    # Guard: every meta key we emit must survive the client's identifier filter,
+    # including the reply_to key that only appears on threaded replies.
+    board._push_enabled = True
+    a, b = _ctx(), _ctx()
+    board.register(a, "lead")
+    board.register(b, "worker:x", "worker")
+    _run(board.send_async, a, "worker:x", "threaded", 7)
+    dumped = b.session.sent[0].model_dump(by_alias=True, mode="json", exclude_none=True)
+    meta = dumped["params"]["meta"]
+    assert "reply_to" in meta
+    assert all(_META_KEY_RE.match(k) for k in meta)

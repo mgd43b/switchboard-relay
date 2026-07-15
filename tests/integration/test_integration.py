@@ -245,6 +245,43 @@ async def test_send_without_registration_errors(tmp_path):
         assert res.isError
 
 
+# -- daemon-mode push / turn injection --------------------------------------
+
+
+async def test_daemon_push_over_the_wire_is_advertised_and_harmless(tmp_path):
+    """The turn-injection path proven over a real MCP session.
+
+    Three things at once, all end-to-end rather than through a fake Context:
+
+    * the server advertises the ``claude/channel`` capability in the initialize
+      handshake, which is what makes a real Claude Code client subscribe;
+    * a daemon-mode ``send()`` to a connected recipient hands a Channels
+      notification to the transport (``delivered_live`` True);
+    * a *generic* MCP client (which, unlike Claude Code, never registered a
+      handler for the custom method) simply drops the unknown notification --
+      so push is best-effort and never breaks the session. The durable row is
+      untouched and still drains normally.
+    """
+    mcp = build_server(Store(tmp_path / "switchboard.db"), ttl=300, daemon=True)
+    async with sessions(mcp) as (lead, worker):
+        # The capability the client sees on the wire (same field the SDK's own
+        # capability checks read); its presence is what a channel client keys on.
+        caps = lead._server_capabilities
+        assert caps is not None and (caps.experimental or {}).get("claude/channel") == {}
+
+        data(await lead.call_tool("register", {"name": "lead"}))
+        data(await worker.call_tool("register", {"name": "worker"}))
+
+        sent = data(await worker.call_tool("send", {"to": "lead", "body": "ping"}))
+        assert sent["delivered_live"] is True  # pushed over the real transport
+
+        # The unknown notification is dropped by the generic client, but the
+        # session is unharmed and the message is still durably deliverable.
+        await asyncio.sleep(0.2)  # let the notification propagate + be dropped
+        got = data(await lead.call_tool("inbox", {}))
+        assert [m["body"] for m in got["messages"]] == ["ping"]
+
+
 # -- durability across a "restart" ------------------------------------------
 
 
