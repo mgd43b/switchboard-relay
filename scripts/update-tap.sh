@@ -101,26 +101,39 @@ command -v brew >/dev/null 2>&1 || { error "Homebrew is required (macOS)."; exit
 info "Updating Homebrew tap for ${FORMULA_NAME} v${VERSION}"
 [[ "$DRY_RUN" == true ]] && warn "DRY RUN — no commit or push"
 
-# -- step 1: verify the sdist exists on PyPI --------------------------------
-# The /source/ URL form is stable (no content hash), so it is reconstructable
-# from the version alone.
-FIRST="${PYPI_NAME:0:1}"
-SDIST_FILE="${PYPI_NAME//-/_}-${VERSION}.tar.gz"
-SDIST_URL="https://files.pythonhosted.org/packages/source/${FIRST}/${PYPI_NAME}/${SDIST_FILE}"
-
-info "Checking PyPI sdist: ${SDIST_URL}"
-if ! curl -sIfL "$SDIST_URL" >/dev/null 2>&1; then
+# -- step 1: resolve the sdist URL + sha256 from PyPI -----------------------
+# FormulaAudit/PyPiUrls requires the canonical hash-path "Source" URL (the
+# predictable /packages/source/ shorthand is rejected by `brew style`), and the
+# hash path can't be constructed from the version -- so ask PyPI's JSON API.
+PYPI_JSON_URL="https://pypi.org/pypi/${PYPI_NAME}/${VERSION}/json"
+info "Resolving sdist via PyPI: ${PYPI_JSON_URL}"
+SDIST_META="$(curl -sfL "$PYPI_JSON_URL" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+for u in data["urls"]:
+    if u["packagetype"] == "sdist":
+        print(u["url"])
+        print(u["digests"]["sha256"])
+        break
+' 2>/dev/null || true)"
+SDIST_URL="$(sed -n 1p <<<"$SDIST_META")"
+SHA256="$(sed -n 2p <<<"$SDIST_META")"
+if [[ -z "$SDIST_URL" || -z "$SHA256" ]]; then
     error "sdist not found on PyPI. Publish ${PYPI_NAME} ${VERSION} first (tag v${VERSION})."
     exit 1
 fi
-success "sdist is published"
+success "sdist: ${SDIST_URL}"
 
-# -- step 2: download + sha256 ----------------------------------------------
+# -- step 2: download and verify the advertised sha256 -----------------------
 TEMP_DIR="$(mktemp -d)"  # cleaned up (and backup restored) by the EXIT trap
-TARBALL="${TEMP_DIR}/${SDIST_FILE}"
+TARBALL="${TEMP_DIR}/$(basename "$SDIST_URL")"
 curl -sLf "$SDIST_URL" -o "$TARBALL" || { error "Download failed"; exit 1; }
-SHA256="$(shasum -a 256 "$TARBALL" | awk '{print $1}')"
-success "SHA256: ${SHA256}"
+DOWNLOADED_SHA="$(shasum -a 256 "$TARBALL" | awk '{print $1}')"
+if [[ "$DOWNLOADED_SHA" != "$SHA256" ]]; then
+    error "sha256 mismatch: PyPI advertises ${SHA256} but the download is ${DOWNLOADED_SHA}"
+    exit 1
+fi
+success "SHA256 verified: ${SHA256}"
 
 # -- step 3: ensure the tap and formula exist -------------------------------
 if [[ ! -d "$TAP_PATH" ]]; then
@@ -139,11 +152,14 @@ BACKUP="${FORMULA_PATH}.bak"
 cp "$FORMULA_PATH" "$BACKUP"
 
 # -- step 4: bump the main package url + sha256 -----------------------------
-# The url filename is package-specific, so this never touches resource urls.
-sed -i '' -E \
-    "s|(url \"https://files\.pythonhosted\.org/packages/source/${FIRST}/${PYPI_NAME}/${PYPI_NAME//-/_}-)[0-9]+\.[0-9]+\.[0-9]+(\.tar\.gz\")|\1${VERSION}\2|" \
-    "$FORMULA_PATH"
-# Replace ONLY the first sha256 (the package's own); resources are regenerated next.
+# Replace ONLY the first url/sha256 (the package's own -- two-space indented at
+# the formula top); resource stanzas are regenerated wholesale in step 5. The
+# whole url line is replaced because the canonical hash path shares no stable
+# prefix between releases.
+awk -v new="$SDIST_URL" '
+    !done && /^  url "/ { sub(/url "[^"]*"/, "url \"" new "\""); done=1 }
+    { print }
+' "$FORMULA_PATH" > "${FORMULA_PATH}.tmp" && mv "${FORMULA_PATH}.tmp" "$FORMULA_PATH"
 awk -v new="$SHA256" '
     !done && /sha256 "/ { sub(/sha256 "[^"]*"/, "sha256 \"" new "\""); done=1 }
     { print }
