@@ -108,8 +108,13 @@ async def test_participants_lists_both(tmp_path):
 
 
 async def test_participant_expires_after_ttl(tmp_path):
-    # Small TTL so the test stays fast but still exercises real elapsed time.
-    mcp = make_board(tmp_path, ttl=0.4)
+    # A short TTL keeps the test fast, but not so short that ordinary scheduling
+    # jitter on a loaded CI runner can exceed it: participants() heartbeats the
+    # caller and then queries liveness, and if the process is descheduled for
+    # longer than the TTL *between* those two steps, the just-touched caller is
+    # wrongly pruned. 1s comfortably clears that jitter while still expiring an
+    # idle peer within the ~1.5s sleep below.
+    mcp = make_board(tmp_path, ttl=1.0)
     async with sessions(mcp) as (ghost, watcher):
         data(await ghost.call_tool("register", {"name": "ghost"}))
         data(await watcher.call_tool("register", {"name": "watcher"}))
@@ -121,7 +126,7 @@ async def test_participant_expires_after_ttl(tmp_path):
 
         # ghost stops heartbeating; watcher keeps active. After the TTL passes,
         # ghost drops out while watcher (which just called a tool) remains.
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(1.5)
         parts = data(await watcher.call_tool("participants", {}))
         names = {p["name"] for p in parts["participants"]}
         assert "ghost" not in names
