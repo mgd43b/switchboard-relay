@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3](https://github.com/mgd43b/switchboard-relay/compare/v0.2.2...v0.2.3) (2026-07-16)
+
+
+### Features
+
+* cross-surface turn injection (CLI Channels watcher + Desktop broker) ([#23](https://github.com/mgd43b/switchboard-relay/issues/23)) ([fce7677](https://github.com/mgd43b/switchboard-relay/commit/fce76775ce00380346799c008cfec916a0e3212c))
+
 ## [0.2.2](https://github.com/mgd43b/switchboard-relay/compare/v0.2.1...v0.2.2) (2026-07-15)
 
 
