@@ -13,7 +13,7 @@ Steps or a minimal snippet (which tools/commands, what you sent, what you expect
 
 **Environment**
 - switchboard-relay version (`switchboard-relay --version`):
-- How it's run: stdio (default) / `serve` daemon:
+- Turn injection: off / `SWITCHBOARD_PUSH=1` (CLI) / `SWITCHBOARD_CCD_INJECT=1` (Desktop):
 - OS + Python version:
 - Number of participating sessions:
 

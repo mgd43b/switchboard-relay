@@ -233,7 +233,7 @@ def test_msg_ttl_zero_disables_ageout(tmp_path):
     assert [m.body for m in sb.store.inbox("lead", peek=True)] == ["ancient"]
 
 
-# -- daemon registry eviction (#18) -----------------------------------------
+# -- connection registry eviction (#18) -------------------------------------
 
 
 def test_conns_evicted_when_participant_expires(tmp_path):
@@ -340,15 +340,6 @@ def test_ask_rejects_empty_recipient(board):
         _run(board.ask, ctx, "", "q")
 
 
-def test_push_enabled_but_no_connected_target_is_not_live(board):
-    board._push_enabled = True
-    a = _ctx()
-    board.register(a, "lead")
-    # Nobody is connected under "nobody-here", so push finds no target.
-    res = _run(board.send_async, a, "nobody-here", "hi")
-    assert res["delivered_live"] is False
-
-
 def test_broadcast_reaches_all_live_except_sender(board):
     a, b, c = _ctx(), _ctx(), _ctx()
     board.register(a, "lead")
@@ -434,7 +425,7 @@ def test_env_seeded_identity(tmp_path, monkeypatch):
 # -- send / participants ----------------------------------------------------
 
 
-def test_send_returns_id_and_no_live_delivery_by_default(board):
+def test_send_returns_id_and_pushes_nothing_by_default(board):
     a, b = _ctx(), _ctx()
     board.register(a, "lead")
     board.register(b, "worker")
@@ -444,7 +435,8 @@ def test_send_returns_id_and_no_live_delivery_by_default(board):
     res = anyio.run(board.send_async, a, "worker", "ping")
     assert isinstance(res["id"], int)
     assert res["from"] == "lead"
-    assert res["delivered_live"] is False  # push disabled by default
+    # No self-push and no ccd inject hint by default (both are opt-in).
+    assert "inject" not in res
     assert b.session.sent == []
 
 
@@ -459,109 +451,13 @@ def test_participants_lists_live_and_counts(board):
     assert all("idle_seconds" in p for p in out["participants"])
 
 
-# -- opt-in push ------------------------------------------------------------
+# -- push helper ------------------------------------------------------------
 
 
 def _run(coro_fn, *args):
     import anyio
 
     return anyio.run(coro_fn, *args)
-
-
-def test_push_delivers_to_connected_recipient_when_enabled(board):
-    board._push_enabled = True
-    a, b = _ctx(), _ctx()
-    board.register(a, "lead")
-    board.register(b, "worker:x", "worker")
-
-    res = _run(board.send_async, a, "worker:x", "hello there")
-    assert res["delivered_live"] is True
-    assert len(b.session.sent) == 1
-
-    dumped = b.session.sent[0].model_dump(by_alias=True, mode="json", exclude_none=True)
-    assert dumped["method"] == _CHANNEL_METHOD
-    meta = dumped["params"]["meta"]
-    assert meta["msg_from"] == "lead"
-    assert meta["msg_to"] == "worker:x"
-    assert meta["msg_id"] == str(res["id"])
-    # No "source" meta key: the client sets source="<server name>" on the tag
-    # itself, so sending one would duplicate the attribute.
-    assert "source" not in meta
-    # Every meta key must be a bare identifier or the client drops it silently.
-    assert all(_META_KEY_RE.match(k) for k in meta)
-    # The nudge makes the recipient REACT, not just "you have mail": it tells it
-    # to drain inbox() and act on / reply to what it gets.
-    content = dumped["params"]["content"].lower()
-    assert "inbox()" in content
-    assert "react" in content or "act on" in content
-    # It is a body-less nudge, NOT the message content -- the durable row is the
-    # single source of truth (see the role fan-out drain-once test below).
-    assert "hello there" not in dumped["params"]["content"]
-    # The message body is delivered durably, drained once via inbox().
-    assert [m["body"] for m in board.inbox(b)["messages"]] == ["hello there"]
-
-
-def test_push_includes_reply_to_in_meta(board):
-    board._push_enabled = True
-    a, b = _ctx(), _ctx()
-    board.register(a, "lead")
-    board.register(b, "worker:x", "worker")
-    res = _run(board.send_async, a, "worker:x", "re: your question", 41)
-    dumped = b.session.sent[0].model_dump(by_alias=True, mode="json", exclude_none=True)
-    assert dumped["params"]["meta"]["reply_to"] == "41"
-    assert res["reply_to"] == 41
-
-
-def test_push_by_role_targets_all_matching_and_excludes_sender(board):
-    board._push_enabled = True
-    lead = _ctx()
-    w1, w2 = _ctx(), _ctx()
-    board.register(lead, "lead")
-    board.register(w1, "worker:1", "worker")
-    board.register(w2, "worker:2", "worker")
-
-    res = _run(board.send_async, lead, "worker", "all-hands")
-    assert res["delivered_live"] is True
-    assert len(w1.session.sent) == 1
-    assert len(w2.session.sent) == 1
-    assert lead.session.sent == []  # sender never pushed to itself
-
-
-def test_push_by_role_nudges_all_but_durable_drain_yields_one_handler(board):
-    # The drain-once guarantee under role addressing: a message sent to a role
-    # with two connected members nudges BOTH (so whichever reacts first handles
-    # it), but the single durable row is drained by exactly one -- the body is
-    # never delivered to both. This is why the nudge omits the body.
-    board._push_enabled = True
-    lead = _ctx()
-    w1, w2 = _ctx(), _ctx()
-    board.register(lead, "lead")
-    board.register(w1, "worker:1", "worker")
-    board.register(w2, "worker:2", "worker")
-
-    _run(board.send_async, lead, "worker", "who can take this?")
-    assert len(w1.session.sent) == 1 and len(w2.session.sent) == 1  # both nudged
-
-    # Both react by draining; exactly one gets the message, the other gets empty.
-    drained = board.inbox(w1)["messages"] + board.inbox(w2)["messages"]
-    assert [m["body"] for m in drained] == ["who can take this?"]
-
-
-def test_push_never_raises_on_bad_session(board):
-    board._push_enabled = True
-
-    class Boom:
-        async def send_notification(self, *a, **k):
-            raise RuntimeError("stream closed")
-
-    sender, recip = _ctx(), FakeCtx(Boom())
-    board.register(sender, "lead")
-    board.register(recip, "worker:x", "worker")
-    # Must not raise even though the recipient's session errors on push.
-    res = _run(board.send_async, sender, "worker:x", "hi")
-    assert res["delivered_live"] is False
-    # Durable delivery still succeeded.
-    assert board.store.has_messages("worker:x", "worker")
 
 
 # -- channel capability + push defaults -------------------------------------
@@ -587,31 +483,14 @@ def test_build_server_declares_channel_capability():
     assert caps2.experimental["other"] == {}
 
 
-def test_push_defaults_on_in_daemon_mode_off_for_stdio(monkeypatch):
+def test_push_off_by_default_on_and_off_via_env(monkeypatch):
     monkeypatch.delenv("SWITCHBOARD_PUSH", raising=False)
-    assert Switchboard(Store(":memory:"), daemon=True)._push_enabled is True
-    assert Switchboard(Store(":memory:"), daemon=False)._push_enabled is False
-
-
-def test_push_env_overrides_daemon_default(monkeypatch):
-    monkeypatch.setenv("SWITCHBOARD_PUSH", "0")
-    assert _resolve_push(daemon=True) is False  # explicit off beats daemon-on
-    monkeypatch.setenv("SWITCHBOARD_PUSH", "on")
-    assert _resolve_push(daemon=False) is True  # explicit on beats stdio-off
-
-
-def test_push_meta_keys_are_identifiers(board):
-    # Guard: every meta key we emit must survive the client's identifier filter,
-    # including the reply_to key that only appears on threaded replies.
-    board._push_enabled = True
-    a, b = _ctx(), _ctx()
-    board.register(a, "lead")
-    board.register(b, "worker:x", "worker")
-    _run(board.send_async, a, "worker:x", "threaded", 7)
-    dumped = b.session.sent[0].model_dump(by_alias=True, mode="json", exclude_none=True)
-    meta = dumped["params"]["meta"]
-    assert "reply_to" in meta
-    assert all(_META_KEY_RE.match(k) for k in meta)
+    assert _resolve_push() is False  # off by default (stdio background poll cost)
+    assert Switchboard(Store(":memory:"))._push_enabled is False
+    monkeypatch.setenv("SWITCHBOARD_PUSH", "1")
+    assert _resolve_push() is True
+    monkeypatch.setenv("SWITCHBOARD_PUSH", "off")
+    assert _resolve_push() is False
 
 
 # -- stdio self-watch (turn injection without a daemon) ---------------------
@@ -623,24 +502,37 @@ def _tick(board, **kw):
 
 def test_watch_tick_nudges_local_session_and_leaves_message(board):
     # The stdio watcher self-nudges its own client about a message that landed
-    # on the shared board (written here as if by another process's send()).
+    # on the shared board (written here as if by another process's send()), and
+    # the emitted notification has the full Channels shape.
     board._push_enabled = True
     ctx = _ctx()
     board.register(ctx, "lead")
-    board.store.send("lead", "hello", sender="worker", now=time.time())
+    board.store.send("lead", "hello", sender="worker", reply_to=41, now=time.time())
 
     assert _tick(board) == 1
     dumped = ctx.session.sent[0].model_dump(by_alias=True, mode="json", exclude_none=True)
     assert dumped["method"] == _CHANNEL_METHOD
-    assert dumped["params"]["meta"]["msg_from"] == "worker"
-    assert "inbox()" in dumped["params"]["content"].lower()
+    meta = dumped["params"]["meta"]
+    assert meta["msg_from"] == "worker"
+    assert meta["msg_to"] == "lead"
+    assert meta["reply_to"] == "41"
+    # No "source" key (the client sets it from the server name); every key is a
+    # bare identifier or the client silently drops it.
+    assert "source" not in meta
+    assert all(_META_KEY_RE.match(k) for k in meta)
+    # Reactive, body-less nudge: tells the recipient to drain inbox() and act,
+    # and never carries the message text (the durable row is the source of truth).
+    content = dumped["params"]["content"].lower()
+    assert "inbox()" in content
+    assert "react" in content or "act on" in content
+    assert "hello" not in dumped["params"]["content"]
     # Peeked, NOT drained: the durable row is untouched and still deliverable.
     assert board.store.has_messages("lead")
 
 
 def test_watch_tick_role_message_reports_role_as_msg_to(board):
     # A role-addressed message must nudge with msg_to = the role (the message's
-    # stored recipient), not the reader's name -- consistent with daemon push.
+    # stored recipient), not the reader's name.
     board._push_enabled = True
     ctx = _ctx()
     board.register(ctx, "worker:7", "worker")
@@ -700,12 +592,9 @@ def test_watch_tick_best_effort_on_bad_session(board):
     assert board.store.has_messages("lead")  # still durable
 
 
-def test_watch_loop_noop_when_push_off_or_daemon():
-    # Both guards return immediately rather than spinning an infinite loop.
-    anyio.run(Switchboard(Store(":memory:"), ttl=300)._watch_loop)  # push off
-    daemon = Switchboard(Store(":memory:"), ttl=300, daemon=True)
-    daemon._push_enabled = True
-    anyio.run(daemon._watch_loop)  # daemon uses direct push, not the watcher
+def test_watch_loop_noop_when_push_off():
+    # With push disabled the loop returns immediately rather than spinning.
+    anyio.run(Switchboard(Store(":memory:"), ttl=300)._watch_loop)
 
 
 def test_watch_loop_delivers_reticks_then_cancels(board, monkeypatch):

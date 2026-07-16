@@ -1,29 +1,20 @@
 """FastMCP server exposing the switchboard-relay tools.
 
-Two ways to run the same server:
-
-* **stdio (default)** -- ``switchboard``. Every Claude Code session spawns its
-  own stdio process; durability and cross-session delivery come from a shared
-  SQLite database. ``wait()`` long-polls that database. A process has no handle
-  to *another* session's process, but MCP stdio is bidirectional -- so with push
-  enabled (``$SWITCHBOARD_PUSH=1``) each process runs a background watcher that
-  polls the shared board and pushes a Channels notification to *its own* client,
-  giving turn injection with no daemon. See ``Switchboard._watch_loop`` and the
-  README's "Turn injection" section.
-
-* **HTTP daemon** -- ``switchboard serve``. One process holds every session's
-  connection, so ``send()`` can additionally emit a Channels notification
-  (``notifications/claude/channel``) straight into a connected recipient, which
-  a channel-subscribed session turns into a reactive turn ("turn injection").
-  Push is on by default here and best-effort: if the recipient isn't a
-  subscribed channel it simply falls back to polling. See the README's "Turn
-  injection" section for the subscription recipe and its constraints.
+Runs over **stdio** -- ``switchboard`` -- so every Claude Code session spawns its
+own process. Durability and cross-session delivery come from a shared SQLite
+database (one file per board); ``wait()`` long-polls it. A process has no handle
+to *another* session's process, but MCP stdio is bidirectional -- so with push
+enabled (``$SWITCHBOARD_PUSH=1``) each process runs a background watcher that
+polls the shared board and pushes a Channels notification to *its own* client,
+giving **turn injection** for a subscribed CLI session with no daemon. On Claude
+Desktop, where a session can't self-inject, ``$SWITCHBOARD_CCD_INJECT=1`` instead
+has ``send()`` hand the sender the payload to inject via ``ccd_session_mgmt``.
+See ``Switchboard._watch_loop`` / ``_ccd_targets`` and the README's "Turn
+injection" section.
 
 Identity is bound per MCP connection: ``register(name, role)`` associates the
 calling session with an address, and subsequent ``inbox()``/``wait()``/``send()``
-calls resolve "who am I" from that connection. In stdio there is exactly one
-connection per process; in the daemon there are many, keyed by the live
-``ServerSession`` object.
+calls resolve "who am I" from that connection -- one connection per process.
 
 Each server is bound to one *board* -- an isolated switchboard with its own
 participant registry and mailboxes, backed by its own SQLite file. By default the
@@ -37,7 +28,6 @@ from __future__ import annotations
 import argparse
 import os
 import secrets
-import sys
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -144,23 +134,16 @@ _PUSH_TRUE = ("1", "true", "yes", "on")
 _PUSH_FALSE = ("0", "false", "no", "off")
 
 
-def _resolve_push(*, daemon: bool) -> bool:
-    """Whether to emit Channels push nudges (turn injection).
+def _resolve_push() -> bool:
+    """Whether to run the stdio self-watch loop (CLI turn injection).
 
-    ``$SWITCHBOARD_PUSH`` wins when set to a recognized truthy/falsy value.
-    Otherwise the default is ``daemon`` -- push is ON in daemon mode (the only
-    mode that can cross-push, and the whole reason ``serve`` exists) and OFF for
-    per-session stdio (where there is never another session's connection to push
-    to). Push is always best-effort: a recipient that isn't a subscribed channel
-    simply doesn't react and falls back to durable poll, so defaulting it on in
-    daemon mode costs nothing when the feature is unavailable.
+    Off by default: the watcher polls the shared board for this session's
+    lifetime, a small background cost that only pays off when the session is
+    subscribed to switchboard as a channel. Opt in with ``$SWITCHBOARD_PUSH=1``.
+    Best-effort: a recipient that isn't a subscribed channel just doesn't react
+    and falls back to durable poll.
     """
-    raw = (os.environ.get("SWITCHBOARD_PUSH") or "").strip().lower()
-    if raw in _PUSH_TRUE:
-        return True
-    if raw in _PUSH_FALSE:
-        return False
-    return daemon
+    return (os.environ.get("SWITCHBOARD_PUSH") or "").strip().lower() in _PUSH_TRUE
 
 
 def _resolve_ccd_inject() -> bool:
@@ -212,10 +195,10 @@ class _Conn:
 class Switchboard:
     """Wires the durable :class:`~switchboard.store.Store` to MCP tools.
 
-    Holds the in-process connection registry used for identity resolution and
-    (in daemon mode) for pushing notifications to connected recipients. The
-    durable state lives entirely in the store; this registry is soft state that
-    is rebuilt as sessions register.
+    Holds the in-process connection registry used for identity resolution and,
+    with push enabled, for the self-watch loop that pushes Channels nudges to
+    this session's own client. The durable state lives entirely in the store;
+    this registry is soft state that is rebuilt as sessions register.
     """
 
     def __init__(
@@ -226,7 +209,6 @@ class Switchboard:
         board: str = "",
         msg_ttl: float = DEFAULT_MSG_TTL_SECONDS,
         max_body: int = DEFAULT_MAX_BODY_BYTES,
-        daemon: bool = False,
     ):
         self.store = store
         self.ttl = ttl
@@ -246,18 +228,11 @@ class Switchboard:
         # an explicit register() call.
         self._default_name = (os.environ.get("SWITCHBOARD_NAME") or "").strip()
         self._default_role = (os.environ.get("SWITCHBOARD_ROLE") or "").strip()
-        # Whether to emit Channels push nudges. Push only does anything in daemon
-        # mode (a recipient connected to the same process) AND only when that
-        # recipient is a Claude session subscribed to this server as a channel --
-        # a stock MCP client just ignores the notification. It therefore defaults
-        # ON in daemon mode (that is the entire point of `serve`) and OFF for
-        # stdio, with $SWITCHBOARD_PUSH forcing either way. Tests set this
-        # attribute directly. See _resolve_push().
-        self._push_enabled = _resolve_push(daemon=daemon)
-        # Daemon pushes directly on send() (many sessions, one process); a stdio
-        # server instead runs a background self-watch loop. Kept so _watch_loop
-        # can no-op in daemon mode and avoid double-nudging.
-        self._daemon = daemon
+        # Whether to run the stdio self-watch loop (CLI turn injection). Off by
+        # default (a background poll cost that only pays off for a channel-
+        # subscribed session); $SWITCHBOARD_PUSH=1 enables it. Tests set this
+        # attribute directly. See _resolve_push() and _watch_loop.
+        self._push_enabled = _resolve_push()
         # Per-session high-water mark (id(session) -> highest message id already
         # nudged about) so the stdio watcher nudges once per new message, not on
         # every poll. See _watch_tick.
@@ -293,14 +268,7 @@ class Switchboard:
             "(or launch with $SWITCHBOARD_NAME set)."
         )
 
-    # -- push (daemon mode) -------------------------------------------------
-
-    def _push_targets(self, address: str, *, exclude_session_id: int) -> list[_Conn]:
-        return [
-            c
-            for sid, c in self._conns.items()
-            if sid != exclude_session_id and (c.name == address or (c.role and c.role == address))
-        ]
+    # -- push (Channels notification to this session's own client) ----------
 
     async def _push(self, conn: _Conn, *, content: str, meta: dict[str, str]) -> bool:
         """Best-effort Channels notification to a connected recipient.
@@ -415,10 +383,10 @@ class Switchboard:
     ) -> bool:
         """Emit one body-less, reactive Channels nudge to ``conn``. Best-effort.
 
-        Shared by the daemon send-side push (``_notify``) and the stdio
-        self-watch loop (``_watch_tick``). A channel-subscribed recipient turns
-        this into its next turn (see ``_CHANNEL_METHOD``), so the ``content`` is
-        an instruction: drain inbox() and act on what comes out. The body is
+        Used by the stdio self-watch loop (``_watch_tick``) to nudge this
+        session's own client. A channel-subscribed recipient turns this into its
+        next turn (see ``_CHANNEL_METHOD``), so the ``content`` is an
+        instruction: drain inbox() and act on what comes out. The body is
         deliberately omitted -- the durable row is the single source of truth,
         which is what keeps delivery drain-once (a role peer that finds an empty
         inbox, because another member drained the row, is told so). Inlining the
@@ -442,26 +410,6 @@ class Switchboard:
         if reply_to is not None:
             meta["reply_to"] = str(reply_to)
         return await self._push(conn, content=content, meta=meta)
-
-    async def _notify(
-        self, ctx: Context, *, sender: str, to: str, mid: int, reply_to: Optional[int]
-    ) -> bool:
-        """Best-effort daemon send-side push to connected recipient(s) of ``to``.
-
-        Returns True if at least one live delivery was handed to the transport.
-        When a role is addressed every connected member is nudged, but only the
-        one that wins the atomic inbox() drain receives the row (drain-once; see
-        ``_nudge``). No-op unless push is enabled. In stdio there is never another
-        session in this process, so this finds no target there -- the recipient's
-        own ``_watch_loop`` does the delivering instead.
-        """
-        if not self._push_enabled:
-            return False
-        delivered = False
-        for t in self._push_targets(to, exclude_session_id=id(ctx.session)):
-            if await self._nudge(t, sender=sender, to=to, mid=mid, reply_to=reply_to):
-                delivered = True
-        return delivered
 
     # -- self-watch (stdio turn injection, no daemon) -----------------------
 
@@ -496,8 +444,7 @@ class Switchboard:
             self._watch_hw[sid] = max(m.id for m in new)
             latest = new[-1]
             # Use the message's stored recipient (its name OR role) so msg_to is
-            # accurate and consistent with the daemon push path -- conn.name would
-            # lose the role on a role-addressed message.
+            # accurate -- conn.name would lose the role on a role-addressed message.
             if await self._nudge(
                 conn, sender=latest.sender, to=latest.to, mid=latest.id, reply_to=latest.reply_to
             ):
@@ -515,11 +462,10 @@ class Switchboard:
         drain-once is preserved by the atomic inbox() -- so this needs no daemon,
         no supervisor, and no reboot story, and per-project boards keep working.
 
-        No-op in daemon mode (the shared process pushes directly on send(), and a
-        watcher would double-nudge) or when push is disabled. Started by the
+        No-op when push is disabled ($SWITCHBOARD_PUSH unset). Started by the
         server lifespan; runs until the session -- hence the process -- ends.
         """
-        if self._daemon or not self._push_enabled:
+        if not self._push_enabled:
             return
         last_heartbeat = 0.0
         while True:
@@ -589,9 +535,6 @@ class Switchboard:
         self, ctx: Context, to: str, body: str, reply_to: Optional[int] = None
     ) -> dict:
         result = self.send(ctx, to, body, reply_to)
-        result["delivered_live"] = await self._notify(
-            ctx, sender=result["from"], to=result["to"], mid=result["id"], reply_to=reply_to
-        )
         hint = self._inject_hint(
             self._ccd_targets(result["to"], sender=result["from"], mid=result["id"])
         )
@@ -617,7 +560,8 @@ class Switchboard:
         live_at_send = self._has_live_recipient(to)
         qid = self.store.send(to, body, sender=conn.name, now=now)
         self.store.touch(conn.name, now=now)
-        await self._notify(ctx, sender=conn.name, to=to, mid=qid, reply_to=None)
+        # A channel-subscribed CLI recipient reacts via its own self-watch loop;
+        # ask() blocks the asker, so there is no sender-side ccd injection here.
 
         timeout_s = _clamp_timeout(timeout_s)
         deadline = _now() + timeout_s
@@ -668,8 +612,7 @@ class Switchboard:
         inject_targets = []
         for p in recipients:
             mid = self.store.send(p.name, body, sender=conn.name, now=now)
-            live = await self._notify(ctx, sender=conn.name, to=p.name, mid=mid, reply_to=None)
-            delivered.append({"to": p.name, "id": mid, "delivered_live": live})
+            delivered.append({"to": p.name, "id": mid})
             if self._ccd_inject and p.ccd_session_id:
                 inject_targets.append(
                     {
@@ -765,12 +708,12 @@ class Switchboard:
         )
 
     def _prune_conns(self, live_names: set[str]) -> None:
-        """Evict daemon registry entries whose participant is no longer live.
+        """Evict registry entries whose participant is no longer live.
 
-        The daemon keys ``_conns`` on the live ``ServerSession`` object, so a
-        client that disconnects without calling ``unregister()`` would otherwise
-        linger forever (issue #18). A connected session heartbeats on every tool
-        call, keeping its participant live; a departed one expires from the store
+        ``_conns`` is keyed on the live ``ServerSession`` object, so a client
+        that disconnects without calling ``unregister()`` would otherwise linger
+        forever (issue #18). A connected session heartbeats on every tool call,
+        keeping its participant live; a departed one expires from the store
         within the TTL and is swept here. Bounds the registry to (live sessions +
         at most one TTL window of stragglers) -- no unbounded leak.
         """
@@ -808,10 +751,10 @@ def _declare_channel_capability(mcp: FastMCP) -> None:
     Turn injection only happens if the recipient's client saw this experimental
     capability at connect time and registered a listener for ``_CHANNEL_METHOD``.
     FastMCP builds its InitializationOptions via the underlying low-level
-    server's ``create_initialization_options()`` (both the stdio and
-    streamable-http transports route through it and call it with no arguments),
-    which takes an ``experimental_capabilities`` dict. We wrap that bound method
-    to inject ours while preserving anything an explicit caller passes.
+    server's ``create_initialization_options()`` (the stdio transport routes
+    through it and calls it with no arguments), which takes an
+    ``experimental_capabilities`` dict. We wrap that bound method to inject ours
+    while preserving anything an explicit caller passes.
     """
     low = mcp._mcp_server  # the mcp.server.lowlevel.Server FastMCP wraps
     original = low.create_initialization_options
@@ -832,7 +775,6 @@ def build_server(
     board: str = "",
     msg_ttl: Optional[float] = None,
     max_body: Optional[int] = None,
-    daemon: bool = False,
 ) -> FastMCP:
     store = store if store is not None else Store()
     sb = Switchboard(
@@ -843,7 +785,6 @@ def build_server(
         # so programmatic callers behave like the CLI.
         msg_ttl=msg_ttl if msg_ttl is not None else _resolve_msg_ttl(),
         max_body=max_body if max_body is not None else _resolve_max_body(),
-        daemon=daemon,
     )
 
     @asynccontextmanager
@@ -874,7 +815,7 @@ def build_server(
         ),
         lifespan=_lifespan,
     )
-    # Expose the wiring for tests and daemon introspection.
+    # Expose the wiring for tests and introspection.
     mcp._switchboard_relay = sb  # type: ignore[attr-defined]
 
     # Declare the Channels capability so a subscribed recipient will inject our
@@ -1019,14 +960,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="store_true", help="Print version and exit.")
 
     sub = parser.add_subparsers(dest="cmd")
-    serve = sub.add_parser(
-        "serve",
-        help="Run as a shared HTTP daemon (streamable-http) so send() can push a live nudge "
-        "into a connected session (the 'responsive lead' setup; needs Claude Code Channels). "
-        "See the README.",
-    )
-    serve.add_argument("--host", default=os.environ.get("SWITCHBOARD_HOST", "127.0.0.1"))
-    serve.add_argument("--port", type=int, default=int(os.environ.get("SWITCHBOARD_PORT", "8765")))
 
     # Human-facing inspection commands (read the DB directly; no MCP server).
     sub.add_parser(
@@ -1273,43 +1206,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _cli_prune(db_path, ttl, args.older_than_days)
 
     store = Store(db_path)
-    # Only the daemon can cross-push, so push (turn injection) defaults on there
-    # and off for stdio; see _resolve_push().
-    daemon = args.cmd == "serve"
     mcp = build_server(
-        store,
-        ttl=ttl,
-        board=target.board,
-        msg_ttl=_resolve_msg_ttl(),
-        max_body=_resolve_max_body(),
-        daemon=daemon,
+        store, ttl=ttl, board=target.board, msg_ttl=_resolve_msg_ttl(), max_body=_resolve_max_body()
     )
-
-    if daemon:
-        mcp.settings.host = args.host
-        mcp.settings.port = args.port
-        push_on = mcp._switchboard_relay._push_enabled  # type: ignore[attr-defined]
-        print(
-            f"switchboard-relay daemon (streamable-http) on http://{args.host}:{args.port}"
-            f"{mcp.settings.streamable_http_path}  board={target.board}  db={store.db_path}",
-            file=sys.stderr,
-        )
-        # The push path is a Channels research preview: a recipient only reacts
-        # to a send() if that session subscribed to switchboard as a channel.
-        # Spell out the verified recipe so the daemon is self-documenting.
-        print(
-            "  turn injection (push): "
-            + ("ENABLED" if push_on else "disabled (set SWITCHBOARD_PUSH=1 to enable)")
-            + " -- for a session to react, launch it subscribed as a channel:\n"
-            "    claude --dangerously-load-development-channels server:switchboard-relay\n"
-            "  (needs Claude Code Channels; durable poll via wait()/inbox() is the "
-            "fallback. See the README's 'Turn injection' section.)",
-            file=sys.stderr,
-        )
-        mcp.run(transport="streamable-http")
-    else:
-        # Default: stdio, one process per Claude Code session.
-        mcp.run()
+    # stdio: one process per Claude Code session.
+    mcp.run()
     return 0
 
 

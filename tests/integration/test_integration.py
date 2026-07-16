@@ -64,7 +64,6 @@ async def test_lead_worker_round_trip(tmp_path):
         sent = data(await b.call_tool("send", {"to": "lead", "body": "what is 2+2?"}))
         qid = sent["id"]
         assert isinstance(qid, int)
-        assert sent["delivered_live"] is False  # stdio-style: no push
 
         got = data(await a.call_tool("inbox", {}))
         assert got["count"] == 1
@@ -250,24 +249,21 @@ async def test_send_without_registration_errors(tmp_path):
         assert res.isError
 
 
-# -- daemon-mode push / turn injection --------------------------------------
+# -- turn injection: channel capability + self-watch over the wire ----------
 
 
-async def test_daemon_push_over_the_wire_is_advertised_and_harmless(tmp_path):
-    """The turn-injection path proven over a real MCP session.
-
-    Three things at once, all end-to-end rather than through a fake Context:
+async def test_channel_capability_advertised_and_push_is_harmless(tmp_path):
+    """Turn injection's wire-level invariants over a real MCP session:
 
     * the server advertises the ``claude/channel`` capability in the initialize
       handshake, which is what makes a real Claude Code client subscribe;
-    * a daemon-mode ``send()`` to a connected recipient hands a Channels
-      notification to the transport (``delivered_live`` True);
-    * a *generic* MCP client (which, unlike Claude Code, never registered a
-      handler for the custom method) simply drops the unknown notification --
-      so push is best-effort and never breaks the session. The durable row is
-      untouched and still drains normally.
+    * the self-watch loop pushes a Channels notification to its own client, and a
+      *generic* MCP client (which, unlike Claude Code, never registered a handler
+      for the custom method) simply drops it -- so push is best-effort and never
+      breaks the session; the durable row is untouched and still drains.
     """
-    mcp = build_server(Store(tmp_path / "switchboard.db"), ttl=300, daemon=True)
+    mcp = build_server(Store(tmp_path / "switchboard.db"), ttl=300)
+    mcp._switchboard_relay._push_enabled = True  # run the self-watch loop
     async with sessions(mcp) as (lead, worker):
         # The capability the client sees on the wire (same field the SDK's own
         # capability checks read); its presence is what a channel client keys on.
@@ -276,27 +272,26 @@ async def test_daemon_push_over_the_wire_is_advertised_and_harmless(tmp_path):
 
         data(await lead.call_tool("register", {"name": "lead"}))
         data(await worker.call_tool("register", {"name": "worker"}))
+        data(await worker.call_tool("send", {"to": "lead", "body": "ping"}))
 
-        sent = data(await worker.call_tool("send", {"to": "lead", "body": "ping"}))
-        assert sent["delivered_live"] is True  # pushed over the real transport
-
-        # The unknown notification is dropped by the generic client, but the
-        # session is unharmed and the message is still durably deliverable.
+        # The watcher pushes a channel notification to lead's own client, which
+        # the generic SDK client drops; the session is unharmed and the durable
+        # message still drains.
         await asyncio.sleep(0.2)  # let the notification propagate + be dropped
         got = data(await lead.call_tool("inbox", {}))
         assert [m["body"] for m in got["messages"]] == ["ping"]
 
 
 async def test_stdio_lifespan_starts_self_watch(tmp_path, monkeypatch):
-    """The daemon-free path: the FastMCP lifespan starts the self-watch loop.
+    """The FastMCP lifespan actually starts the self-watch loop under real run().
 
     A stdio server with push enabled runs a background watcher (started by the
-    server lifespan under real ``run()``) that polls the shared board and
-    self-nudges its own client -- turn injection with no daemon. We spy on
-    ``_watch_tick`` to prove the loop is actually wired up and running, without
-    depending on the client understanding the custom channel notification.
+    server lifespan) that polls the shared board and self-nudges its own client
+    -- turn injection with no daemon. We spy on ``_watch_tick`` to prove the loop
+    is wired up and running, without depending on the client understanding the
+    custom channel notification.
     """
-    mcp = build_server(Store(tmp_path / "switchboard.db"), ttl=300, daemon=False)
+    mcp = build_server(Store(tmp_path / "switchboard.db"), ttl=300)
     sb = mcp._switchboard_relay
     sb._push_enabled = True  # equivalent to launching with SWITCHBOARD_PUSH=1
 
@@ -330,7 +325,7 @@ async def test_messages_persist_across_server_restart(tmp_path):
         data(await a.call_tool("register", {"name": "sender"}))
         data(await a.call_tool("send", {"to": "lead", "body": "still here after restart"}))
 
-    # Fresh server over the same DB file (simulating a daemon/CLI restart).
+    # Fresh server over the same DB file (simulating a process restart).
     mcp2 = make_board(tmp_path)
     async with sessions(mcp2) as (a, _b):
         data(await a.call_tool("register", {"name": "lead"}))

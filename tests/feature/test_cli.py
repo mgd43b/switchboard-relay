@@ -7,7 +7,6 @@ observed rather than actually started, plus the ``$SWITCHBOARD_TTL`` parsing.
 from __future__ import annotations
 
 import time
-import types
 
 import pytest
 
@@ -20,11 +19,7 @@ class FakeMCP:
     """Records how main() runs it instead of starting a real server."""
 
     def __init__(self):
-        self.settings = types.SimpleNamespace(host=None, port=None, streamable_http_path="/mcp")
         self.ran_transport = "UNSET"
-        # The serve banner reads _switchboard_relay._push_enabled to report
-        # whether turn injection is on; stand it in.
-        self._switchboard_relay = types.SimpleNamespace(_push_enabled=False)
 
     def run(self, transport="stdio"):
         self.ran_transport = transport
@@ -36,14 +31,12 @@ def fake_build(monkeypatch, tmp_path):
     captured = {}
     fake = FakeMCP()
 
-    def _build(store, ttl=None, board="", msg_ttl=None, max_body=None, daemon=False):
+    def _build(store, ttl=None, board="", msg_ttl=None, max_body=None):
         captured["db_path"] = str(store.db_path)
         captured["ttl"] = ttl
         captured["board"] = board
         captured["msg_ttl"] = msg_ttl
         captured["max_body"] = max_body
-        captured["daemon"] = daemon
-        fake._switchboard_relay._push_enabled = daemon
         return fake
 
     monkeypatch.setenv("SWITCHBOARD_DB", str(tmp_path / "cli.db"))
@@ -63,15 +56,6 @@ def test_main_defaults_to_stdio(fake_build):
     fake, _ = fake_build
     assert main([]) == 0
     assert fake.ran_transport == "stdio"
-
-
-def test_main_serve_uses_streamable_http(fake_build):
-    fake, _ = fake_build
-    rc = main(["serve", "--host", "9.9.9.9", "--port", "1234"])
-    assert rc == 0
-    assert fake.ran_transport == "streamable-http"
-    assert fake.settings.host == "9.9.9.9"
-    assert fake.settings.port == 1234
 
 
 def test_main_passes_db_and_ttl(fake_build, tmp_path):

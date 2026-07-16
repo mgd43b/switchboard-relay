@@ -384,7 +384,7 @@ All optional. Set as environment variables (e.g. via `claude mcp add --env KEY=v
 | `SWITCHBOARD_MAX_BODY` | `262144` (256 KiB) | Reject a `send()` whose body exceeds this many UTF‑8 bytes. Set `0` to disable the cap. |
 | `SWITCHBOARD_NAME` | — | Auto‑register this session under this address (skips an explicit `register`; also the fallback when `register()` is called without a name). |
 | `SWITCHBOARD_ROLE` | — | Role to pair with `SWITCHBOARD_NAME`. |
-| `SWITCHBOARD_PUSH` | *(stdio: off, daemon: on)* | Enable [turn‑injection push](#turn-injection-push) over Channels (CLI reactors). On **stdio** it's off by default (a background poll cost) — set `1` to run the self‑watch loop. In the **daemon** it defaults **on** (set `0` to disable). |
+| `SWITCHBOARD_PUSH` | `0` | Enable [turn‑injection push](#turn-injection-push) over Channels (CLI reactors) — runs the background self‑watch loop that nudges this session's own client. Off by default (a small background poll cost); set `1` to enable. |
 | `SWITCHBOARD_CCD_INJECT` | `0` | Enable [turn injection on Claude Desktop](#reacting-on-claude-desktop-ccd_session_mgmt): `send()` returns an `inject` hint so the sender's Claude can call `ccd_session_mgmt.send_message`. Off by default (leans on a Desktop tool + a per‑message approval). |
 | `SWITCHBOARD_CCD_SESSION_ID` | *(`local_<CLAUDE_CODE_SESSION_ID>`)* | Override this session's CCD id used for Desktop injection. Needed only when the default derivation is wrong (e.g. an agent/child session). Used verbatim. |
 
@@ -435,16 +435,13 @@ Turn injection over Channels works **only** when all three hold. Miss any one an
 falls back to the durable poll — nothing breaks, the message just waits in the inbox as usual:
 
 1. **Push is enabled.** It's a background convenience with a small polling cost, so it's **off by
-   default on stdio** — set `SWITCHBOARD_PUSH=1` to turn it on. (The daemon defaults it **on**.)
+   default** — set `SWITCHBOARD_PUSH=1` to turn it on.
 2. **The recipient session is open.** Channels inject into a *running* session on its next turn.
    Nothing can wake a fully idle or closed session — see [How it works](#how-it-works).
 3. **The recipient subscribed to switchboard as a channel** — launched with the channel flag below.
    A session that connected normally still works; it just polls instead of reacting.
 
-Note that "daemon" is **not** a constraint: turn injection works over the plain stdio install (below).
-The daemon is an optional alternative for the multi‑client‑on‑one‑process case.
-
-### Setup (recommended: stdio, no daemon)
+### Setup
 
 Because MCP stdio is bidirectional, each session's own switchboard process can push a notification to
 *its own* client. With push enabled, that process runs a background watcher that polls the shared
@@ -472,21 +469,6 @@ workers `ask()` as usual — the lead reacts the moment a question lands, no pol
 > set [`channelsEnabled: true`](https://code.claude.com/docs/en/channels#enterprise-controls) first,
 > or channels are blocked (the server still connects and its tools still work — only the *push* is
 > suppressed). Pro/Max users without an org skip that check.
-
-### Alternative: the shared daemon
-
-Prefer one long‑lived process holding every connection (e.g. many clients, or lower‑latency
-push‑on‑write instead of a poll)? Run the daemon instead of stdio. It needs a supervisor and a reboot
-story (launchd/`KeepAlive`, or a container with `--restart unless-stopped`), and it's board‑scoped
-(one process per board), so it's the heavier option — but the subscription flag is identical.
-
-```bash
-# Push is ON by default in the daemon (SWITCHBOARD_PUSH=0 disables); the banner
-# prints the subscription flag.
-switchboard-relay serve --host 127.0.0.1 --port 8765
-claude mcp add --scope user --transport http switchboard-relay http://127.0.0.1:8765/mcp
-# ...then launch each reacting session with the same --dangerously-load-development-channels flag.
-```
 
 ### Reacting on Claude Desktop (`ccd_session_mgmt`)
 
@@ -527,11 +509,10 @@ reacts. No session ever discloses its id to another — each records only its ow
 
 ### What's actually sent (and why it stays exactly‑once)
 
-Either way, switchboard emits a `notifications/claude/channel` notification that Claude Code wraps
-into the recipient's next turn as `<channel source="switchboard-relay" msg_from="…"
-msg_id="…">…</channel>`. **stdio:** each session's watcher polls the board for messages addressed to
-*itself* and self‑nudges. **daemon:** `send()` pushes directly to the connected recipient. The
-cross‑session hop is the shared SQLite board in both cases.
+On the CLI path, switchboard emits a `notifications/claude/channel` notification that Claude Code
+wraps into the recipient's next turn as `<channel source="switchboard-relay" msg_from="…"
+msg_id="…">…</channel>`. Each session's own watcher polls the board for messages addressed to
+*itself* and self‑nudges; the cross‑session hop is the shared SQLite board.
 
 The notification is a **nudge that says "drain your inbox and handle it"**, *not* the message body.
 The durable SQLite row stays the single source of truth, which is what preserves **drain‑once**: when
@@ -547,7 +528,7 @@ a dependency.
 
 ### Verify it end‑to‑end (two real sessions)
 
-The research‑preview reaction can't be unit‑tested, so confirm it by hand once (stdio, no daemon):
+The research‑preview reaction can't be unit‑tested, so confirm it by hand once:
 
 1. **Register the server with push on:** `claude mcp add --scope user --env SWITCHBOARD_PUSH=1 -- switchboard-relay`.
 2. **Terminal 1 — session B (the reactor):** launch subscribed, register, and park it:
