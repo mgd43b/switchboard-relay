@@ -119,9 +119,9 @@ class Store:
 
     A ``Store`` is cheap to construct and opens a fresh short-lived connection
     per operation. This keeps it safe to share the same database file across
-    many independent processes (every Claude Code session runs its own stdio
-    server) -- WAL mode plus a busy timeout let concurrent readers and writers
-    coexist without external coordination.
+    many independent processes (every Codex or Claude Code session runs its own
+    stdio server) -- WAL mode plus a busy timeout let concurrent readers and
+    writers coexist without external coordination.
     """
 
     def __init__(
@@ -493,7 +493,7 @@ def _migrate_participants(conn: sqlite3.Connection) -> None:
 def _enable_wal(conn: sqlite3.Connection) -> None:
     """Switch the database to WAL mode (persisted), tolerating concurrent init.
 
-    WAL lets many independent processes -- one per Claude Code session -- read
+    WAL lets many independent processes -- one per agent session -- read
     and write the shared database without tripping over each other. Switching
     modes needs a brief exclusive lock that can return SQLITE_BUSY immediately
     (bypassing busy_timeout), so retry until it takes.

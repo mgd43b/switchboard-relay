@@ -9,16 +9,15 @@
 
 **One session asks, another answers — no copy‑pasting between terminals.**
 
-A tiny local [MCP](https://modelcontextprotocol.io) server that gives independent Claude Code
-sessions a shared, durable messaging channel.
+A tiny local [MCP](https://modelcontextprotocol.io) server that gives independent Codex,
+Claude Code, and other MCP client sessions a shared, durable messaging channel.
 
 </div>
 
-Claude Code's built‑in session channel is injected only by the desktop app, so terminal sessions
-can't use it. A *config‑level* MCP server, by contrast, loads on **every** surface — terminal CLI,
-desktop, and IDE — and its tools are allowlistable. `switchboard-relay` is exactly that: it routes
-named messages between any set of Claude Code sessions on one machine, backed by SQLite so mailboxes
-survive restarts.
+Because `switchboard-relay` is a standards-based *config-level* MCP server, the same eight tools work
+in Codex, Claude Code, and generic MCP clients. It routes named messages between any mix of local
+sessions on one machine, backed by SQLite so mailboxes survive restarts. Claude Code can optionally
+add turn-injection push; Codex and other clients use the durable `inbox()` / `wait()` path.
 
 ```
         register("worker:auth")                       register("lead")
@@ -46,7 +45,7 @@ switchboard just routes named messages, so any addressing scheme works.
 
 - [Quickstart](#quickstart) — zero to working in about a minute
 - [Concepts](#concepts) — the five words that explain everything
-- [Install](#install) — Claude Code, Claude Desktop, allowlisting
+- [Install](#install) — Codex, Claude Code, Claude Desktop, approvals
 - [Tools](#tools) — the eight tools, at a glance
 - [Boards: one switchboard per project](#boards-one-switchboard-per-project)
 - [The lead / worker pattern](#the-lead--worker-pattern) — recipes + terminal inspection
@@ -70,13 +69,16 @@ uv tool install switchboard-relay            # or uv
 pipx install switchboard-relay               # or pipx
 ```
 
-**2. Add it to Claude Code** at user scope, so it loads in every project:
+**2. Add it to Codex or Claude Code** at user scope, so it loads in every project:
 
 ```bash
+codex mcp add switchboard-relay -- switchboard-relay
+# or
 claude mcp add --scope user -- switchboard-relay
 ```
 
-**3. Try it.** Open **two** Claude Code sessions *in the same repo*. Paste into the first:
+**3. Try it.** Open **two local Codex or Claude Code sessions** *in the same repo*. They can be
+two sessions from one client or one of each. Paste into the first:
 
 ```
 Register me on switchboard-relay as "lead", then wait() for a message and reply to its sender.
@@ -91,8 +93,8 @@ Register me on switchboard-relay, then ask() "lead": what should I work on next?
 The second session gets its answer back inline — no window‑switching. That's the whole loop. 🎉
 
 > **Why did that just work?** Both sessions share the same **board** (this repo), so they found each
-> other with zero setup. The second session didn't even need a name — it registered under its
-> session title. Read on for how names, roles, durability, and boards fit together.
+> other with zero setup. The second session didn't even need a name — the server assigned it a
+> unique `session-*` address. Read on for how names, roles, durability, and boards fit together.
 
 ---
 
@@ -102,8 +104,8 @@ Five words cover the whole model:
 
 | Term | What it is |
 |------|------------|
-| **Participant** | A registered session. Any Claude Code session becomes one by calling `register()`. |
-| **Name** | Your address that others `send()` to — e.g. `"lead"`, `"worker:auth"`. **Optional:** omit it and Claude registers under your **session title**. |
+| **Participant** | A registered Codex, Claude Code, or other MCP client session. |
+| **Name** | Your address that others `send()` to — e.g. `"lead"`, `"worker:auth"`. **Optional:** omit it and the server assigns a unique `session-*` address. |
 | **Role** | An optional *shared* address for a group (e.g. `"worker"`). A message to a role goes to whichever member reads it first. |
 | **Board** | One isolated switchboard — its own participants and mailboxes. Defaults to **one per project**, so repos don't cross wires. |
 | **Durable** | Messages wait in the recipient's mailbox until read — even if the recipient hasn't registered yet, or the process restarted. |
@@ -112,8 +114,27 @@ Five words cover the whole model:
 
 ## Install
 
-The fastest path is the **Claude Code plugin** — two commands, no Python setup (the server runs via
-`uvx`). Prefer explicit config? Jump to [installing the package manually](#install-the-package-manually).
+Use the native plugin for your client, or register the STDIO MCP server directly. Both plugin
+packages run the published Python package through `uvx`, so no separate Python installation is
+required.
+
+### Codex plugin
+
+This repository includes a Codex plugin manifest at [`.codex-plugin/plugin.json`](.codex-plugin/plugin.json)
+and its local MCP definition at [`.mcp.json`](.mcp.json). Once the repository marketplace is
+published or installed, the plugin supplies the `switchboard-relay` MCP server automatically.
+
+For immediate use without installing a plugin marketplace entry:
+
+```bash
+codex mcp add switchboard-relay -- uvx switchboard-relay
+codex mcp list
+```
+
+The ChatGPT desktop app, Codex CLI, and Codex IDE extension on the same host share this MCP
+configuration. Restart the active client after adding it. The bundled config allows `wait()` and
+`ask()` calls up to the server's 3600-second cap; direct CLI configuration uses Codex's configured
+MCP tool timeout.
 
 ### Claude Code plugin (recommended)
 
@@ -164,6 +185,35 @@ Verify with `claude mcp list`.
 > ```bash
 > claude mcp add --scope user -- uvx switchboard-relay
 > ```
+
+#### Add it to Codex
+
+Register the same STDIO server with Codex:
+
+```bash
+codex mcp add switchboard-relay -- uvx switchboard-relay
+```
+
+Verify with `codex mcp list` or `/mcp`. For a cross-client board shared with Claude Code, pin the
+same explicit board in both clients:
+
+```bash
+codex mcp add switchboard-relay --env SWITCHBOARD_BOARD=team -- uvx switchboard-relay
+claude mcp add --scope user --env SWITCHBOARD_BOARD=team -- uvx switchboard-relay
+```
+
+Direct CLI registration uses Codex's default MCP tool timeout. If a lead should make individual
+`wait()` calls longer than that timeout, set the server entry in `~/.codex/config.toml` explicitly:
+
+```toml
+[mcp_servers.switchboard-relay]
+command = "uvx"
+args = ["switchboard-relay"]
+tool_timeout_sec = 3660
+```
+
+Codex does not consume Claude's experimental Channels notification. Delivery remains durable and
+works through `inbox()`, `wait()`, and `ask()`; leave `SWITCHBOARD_PUSH` off for Codex-only sessions.
 
 #### Add it to Claude Desktop
 
@@ -234,7 +284,7 @@ Eight tools, grouped by what you reach for:
 
 | Tool | Signature | What it does |
 |------|-----------|--------------|
-| `register` | `register(name?, role?)` | Claim an address for this session. `name` is **optional** — omit it and Claude registers under the **session title**. `role` is an optional shared group address. Re‑call to heartbeat or change role. Returns the `board` you joined and the live participants. |
+| `register` | `register(name?, role?)` | Claim an address for this session. `name` is **optional** — omit it and the server assigns a unique `session-*` address. `role` is an optional shared group address. Re-call to heartbeat or change role. Returns the `board` you joined and the live participants. |
 | `participants` | `participants()` | List sessions seen within the TTL window: `name`, `role`, `idle_seconds`. |
 | `unregister` | `unregister()` | Leave the switchboard (drop out of `participants()`). Your mailbox is preserved for when you return. |
 
@@ -276,9 +326,10 @@ The board a session joins is resolved in this order:
 
 1. **`$SWITCHBOARD_BOARD`** — an explicit board name (any string), used verbatim. The special value
    `project` forces the project‑derived board below.
-2. **The current project** *(the default)* — keyed off the git repo (via `CLAUDE_PROJECT_DIR`, which
-   Claude Code injects into the server), falling back to the launch directory when it isn't a git
-   repo. The resulting board name looks like `myrepo-3f9c1a`.
+2. **The current project** *(the default)* — keyed off the git repo. `SWITCHBOARD_PROJECT_DIR` is the
+   client-neutral explicit project root; Claude Code's `CLAUDE_PROJECT_DIR` remains supported for
+   compatibility, and Codex or other MCP hosts fall back to the server launch directory. The
+   resulting board name looks like `myrepo-3f9c1a`.
 
 `register()` returns the `board` you joined, so a session can always see which switchboard it's on.
 Each board is its own SQLite file under `~/.claude/switchboard/<board>.db`. (Setting `SWITCHBOARD_DB`
@@ -292,8 +343,8 @@ sessions on the same named board:
 ```bash
 # lead, in repo B
 claude mcp add --scope user --env SWITCHBOARD_BOARD=team -- switchboard-relay
-# worker, in repo A — same board name
-claude mcp add --scope user --env SWITCHBOARD_BOARD=team -- switchboard-relay
+# Codex worker, in repo A — same board name and the same local SQLite bus
+codex mcp add switchboard-relay --env SWITCHBOARD_BOARD=team -- switchboard-relay
 ```
 
 Any shared string works; pick one name and use it everywhere those sessions should talk.
@@ -320,10 +371,11 @@ whenever a message arrives, answer the question by sending a reply back to its
 sender (use reply_to), then wait() again.
 ```
 
-Claude will `register(name="lead")` and park in `wait()`. A lead keeps a well‑known name so workers
-can address it; anyone who doesn't need a fixed address can just say *"register me on
-switchboard-relay"* and Claude registers under the session title. Keep it going hands‑free with the
-[`/loop`](https://code.claude.com/docs/en/slash-commands) skill:
+The client will `register(name="lead")` and park in `wait()`. A lead keeps a well-known name so
+workers can address it; anyone who doesn't need a fixed address can omit the name and use the
+returned `session-*` address. In Claude Code, keep it going hands-free with the
+[`/loop`](https://code.claude.com/docs/en/slash-commands) skill. In Codex, ask the task to keep
+calling `wait()` until you stop it:
 
 ```
 /loop wait for a switchboard-relay message, answer it, and reply to the sender
@@ -338,9 +390,9 @@ Register me on switchboard-relay with role "worker", then use ask() to ask the
 lead how our auth middleware refreshes tokens.
 ```
 
-The worker registers under its session title and calls `ask("lead", "…")` — one call that sends the
-question and blocks for the answer. The lead's loop picks it up, replies with `reply_to` set, and the
-worker's `ask()` returns the reply. No window‑switching, no manual `wait()`.
+The worker registers under an explicit or assigned name and calls `ask("lead", "…")` — one call
+that sends the question and blocks for the answer. The lead's loop picks it up, replies with
+`reply_to` set, and the worker's `ask()` returns the reply. No window-switching or manual polling.
 
 > **Tip:** launch a worker pre‑addressed via environment variables so it doesn't even need an
 > explicit `register` call — set `SWITCHBOARD_NAME=worker:auth` and `SWITCHBOARD_ROLE=worker` in that
@@ -373,12 +425,14 @@ piling up against a name nobody reads).
 
 ## Configuration
 
-All optional. Set as environment variables (e.g. via `claude mcp add --env KEY=value`):
+All optional. Set as environment variables through `codex mcp add --env KEY=value` or
+`claude mcp add --env KEY=value`:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `SWITCHBOARD_BOARD` | *(project)* | Board to join. An explicit name (any string) puts these sessions on a shared bus; `project` forces per‑project derivation. See [Boards](#boards-one-switchboard-per-project). |
 | `SWITCHBOARD_DB` | *(the board's file)* | Raw SQLite path override — wins over `SWITCHBOARD_BOARD`. Point several sessions at one exact file to share it. |
+| `SWITCHBOARD_PROJECT_DIR` | *(server launch directory)* | Client-neutral project root used to derive the default board. Wins over the compatibility-only `CLAUDE_PROJECT_DIR`. |
 | `SWITCHBOARD_TTL` | `300` | Seconds of inactivity before a participant drops out of `participants()`. |
 | `SWITCHBOARD_MSG_TTL` | `604800` (7 days) | Undelivered messages older than this are pruned automatically during normal operation. Set `0` to disable age‑out. |
 | `SWITCHBOARD_MAX_BODY` | `262144` (256 KiB) | Reject a `send()` whose body exceeds this many UTF‑8 bytes. Set `0` to disable the cap. |
@@ -398,16 +452,16 @@ claude mcp add --scope user --env SWITCHBOARD_TTL=600 -- switchboard-relay
 
 ## How it works
 
-Each Claude Code session spawns its **own** `switchboard-relay` process (stdio transport). Those
-processes don't talk to each other directly — they share state through a SQLite database (one file
-per [board](#boards-one-switchboard-per-project)), which gives you durability and cross‑session
-delivery for free. `wait()` long‑polls that database.
+Each local MCP session spawns its **own** `switchboard-relay` process (STDIO transport). Those
+processes do not talk to each other directly — Codex and Claude Code processes share state through
+the same SQLite database (one file per [board](#boards-one-switchboard-per-project)). `wait()`
+long-polls that database.
 
 **The one honest limitation:** switchboard **cannot wake a *closed* session.** In the baseline
 (poll) model a recipient learns about a message by calling `inbox()` or `wait()` — on its next turn,
-or while parked in a `/loop`. An *open but idle* session can be pushed into a turn with
-[turn injection](#turn-injection-push), but nothing reaches a session that isn't running. That's a
-property of how Claude Code sessions work, not a switchboard limitation.
+or while parked in a polling loop. An open Claude Code session can optionally be pushed into a turn
+with [turn injection](#turn-injection-push); Codex currently uses the polling path. Nothing reaches
+a session that is not running.
 
 ---
 
@@ -423,11 +477,12 @@ runs (the *sender* can be any surface):
 
 | Reactor runs on… | Mechanism | Feel |
 |---|---|---|
+| **Codex (desktop/CLI/IDE)** | Durable `wait()` / `inbox()` polling | **portable**, no Claude-specific protocol |
 | **Claude Code (CLI/terminal)** | [Channels](https://code.claude.com/docs/en/channels) — the recipient self‑injects | **zero‑touch**, fully automatic |
 | **Claude Desktop** | `ccd_session_mgmt.send_message` — the *sender* injects | **one approval click per message** |
 
-Both are best‑effort accelerators on top of durable poll, and both preserve **drain‑once**. Below:
-the CLI setup first, then the Desktop setup.
+The Claude mechanisms are best-effort accelerators on top of the durable polling path, and both
+preserve **drain-once**. Codex requires no push setup.
 
 ### Reacting on the CLI (Channels) — the three hard constraints
 
@@ -554,8 +609,9 @@ messages, and prints a hint for the two most common failures below — usually e
 in one shot.
 
 **"I sent a message but nothing happened."**
-switchboard can't wake an idle session — a recipient only sees a message when *it* calls `inbox()` or
-`wait()`. Keep your lead parked in a [`/loop`](#the-lead--worker-pattern) so it's always listening.
+switchboard cannot wake a closed session — a recipient sees a message when it calls `inbox()` or
+`wait()`. Keep a Codex lead in a requested polling loop, or a Claude lead in
+[`/loop`](#the-lead--worker-pattern), so it stays listening.
 (See [How it works](#how-it-works).)
 
 **"The other session can't see me / `participants()` is empty."**
@@ -597,8 +653,10 @@ Tests are split into three tiers:
 - `tests/feature/` — tool behavior through the server layer (identity, push, roles, hygiene bounds, the CLI) with a fake Context.
 - `tests/integration/` — the tools over a real MCP transport, including **two real stdio subprocesses**, plus an **N‑process exactly‑once stress test** that reconciles sent‑vs‑received ids under contention (including shared‑role drains).
 
-The Claude Code plugin/marketplace manifests live in [`.claude-plugin/`](.claude-plugin/); validate them
-with `claude plugin validate .`.
+The Claude Code plugin/marketplace manifests live in [`.claude-plugin/`](.claude-plugin/); validate
+them with `claude plugin validate .`. Codex packaging lives in
+[`.codex-plugin/`](.codex-plugin/) plus [`.mcp.json`](.mcp.json) and is validated with the Codex
+plugin validator.
 
 CI (Python 3.10–3.14) runs ruff + the full suite with the coverage gate on every push and PR. Releases
 and Homebrew packaging are documented in [RELEASING.md](RELEASING.md).

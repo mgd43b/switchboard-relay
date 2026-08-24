@@ -154,7 +154,24 @@ def test_project_key_falls_back_to_dir_when_not_git(monkeypatch, tmp_path):
 # -- project_board / resolve_board ------------------------------------------
 
 
-def test_project_board_uses_claude_project_dir(monkeypatch, tmp_path):
+def test_project_board_uses_switchboard_project_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(board, "_git_common_dir", lambda base: None)
+    name = board.project_board({"SWITCHBOARD_PROJECT_DIR": str(tmp_path)})
+    assert _NAME_RE.fullmatch(name)
+
+
+def test_project_board_generic_override_wins_over_claude_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(board, "_git_common_dir", lambda base: None)
+    generic = tmp_path / "generic"
+    claude = tmp_path / "claude"
+    env = {
+        "SWITCHBOARD_PROJECT_DIR": str(generic),
+        "CLAUDE_PROJECT_DIR": str(claude),
+    }
+    assert board.project_board(env) == board._derive_board_name(str(generic.resolve()))
+
+
+def test_project_board_uses_claude_project_dir_for_compatibility(monkeypatch, tmp_path):
     monkeypatch.setattr(board, "_git_common_dir", lambda base: None)
     name = board.project_board({"CLAUDE_PROJECT_DIR": str(tmp_path)})
     assert _NAME_RE.fullmatch(name)
@@ -163,9 +180,10 @@ def test_project_board_uses_claude_project_dir(monkeypatch, tmp_path):
 def test_project_board_falls_back_to_cwd(monkeypatch, tmp_path):
     monkeypatch.setattr(board, "_git_common_dir", lambda base: None)
     monkeypatch.chdir(tmp_path)
-    # No CLAUDE_PROJECT_DIR -> derive from the working directory, which lands on
-    # the same board as pointing CLAUDE_PROJECT_DIR at it explicitly.
-    assert board.project_board({}) == board.project_board({"CLAUDE_PROJECT_DIR": str(tmp_path)})
+    # No explicit client project dir -> derive from the working directory.
+    assert board.project_board({}) == board.project_board(
+        {"SWITCHBOARD_PROJECT_DIR": str(tmp_path)}
+    )
 
 
 def test_resolve_board_env_wins_and_is_sanitized():

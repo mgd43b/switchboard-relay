@@ -1,16 +1,14 @@
 """FastMCP server exposing the switchboard-relay tools.
 
-Runs over **stdio** -- ``switchboard`` -- so every Claude Code session spawns its
-own process. Durability and cross-session delivery come from a shared SQLite
-database (one file per board); ``wait()`` long-polls it. A process has no handle
-to *another* session's process, but MCP stdio is bidirectional -- so with push
-enabled (``$SWITCHBOARD_PUSH=1``) each process runs a background watcher that
-polls the shared board and pushes a Channels notification to *its own* client,
-giving **turn injection** for a subscribed CLI session with no daemon. On Claude
-Desktop, where a session can't self-inject, ``$SWITCHBOARD_CCD_INJECT=1`` instead
-has ``send()`` hand the sender the payload to inject via ``ccd_session_mgmt``.
-See ``Switchboard._watch_loop`` / ``_ccd_targets`` and the README's "Turn
-injection" section.
+Runs over **stdio** so every Codex, Claude Code, or other local MCP session
+spawns its own process. Durability and cross-session delivery come from a shared
+SQLite database (one file per board); ``wait()`` long-polls it. The baseline MCP
+tools are client-neutral. Claude-specific turn injection is an optional fast
+path: with ``$SWITCHBOARD_PUSH=1`` each process can push a Channels notification
+to its own subscribed Claude Code client, while ``$SWITCHBOARD_CCD_INJECT=1``
+offers a Claude Desktop broker hint. Generic clients ignore that experimental
+capability and continue to use the durable tools. See ``Switchboard._watch_loop``
+/ ``_ccd_targets`` and the README's "Turn injection" section.
 
 Identity is bound per MCP connection: ``register(name, role)`` associates the
 calling session with an address, and subsequent ``inbox()``/``wait()``/``send()``
@@ -36,6 +34,7 @@ from typing import Any, Optional
 
 import anyio
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import ToolAnnotations
 
 from switchboard_relay.board import boards_dir, describe_target, legacy_db_path
 from switchboard_relay.store import DEFAULT_TTL_SECONDS, Store
@@ -66,6 +65,23 @@ _CHANNEL_METHOD = "notifications/claude/channel"
 # (its presence is the signal; there is no config). Harmless to advertise to a
 # stock MCP client, which ignores experimental capabilities it doesn't know.
 _CHANNEL_CAPABILITY = "claude/channel"
+
+# Standard MCP hints help hosts such as Codex distinguish tool side effects when
+# applying approval policy. They are deliberately conservative: even
+# participants() refreshes presence, inbox()/wait()/ask() can drain durable rows,
+# and send()/broadcast() create externally visible messages.
+_LOCAL_WRITE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+)
+_LOCAL_IDEMPOTENT_WRITE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+_LOCAL_DESTRUCTIVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
+)
+_LOCAL_IDEMPOTENT_DESTRUCTIVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
+)
 
 
 def _now() -> float:
@@ -702,8 +718,9 @@ class Switchboard:
             return None
         where = f" (board '{self.board}')" if self.board else ""
         return (
-            f"You're the only session here{where}. Open another Claude Code session on "
-            "the same board -- the same repo, or one started with the same "
+            f"You're the only session here{where}. Open another Codex, Claude Code, "
+            "or MCP client session on the same board -- the same repo, or one started "
+            "with the same "
             "SWITCHBOARD_BOARD -- and register it to start talking."
         )
 
@@ -741,8 +758,8 @@ class Switchboard:
 
 # -- FastMCP wiring ---------------------------------------------------------
 
-# Tool docstrings are what Claude reads to decide when/how to call each tool, so
-# they double as the user-facing tool descriptions. Keep them action-oriented.
+# Tool docstrings are what MCP clients read to decide when/how to call each
+# tool, so they double as user-facing descriptions. Keep them action-oriented.
 
 
 def _declare_channel_capability(mcp: FastMCP) -> None:
@@ -803,15 +820,15 @@ def build_server(
     mcp = FastMCP(
         "switchboard-relay",
         instructions=(
-            "Shared message bus for independent Claude Code sessions. Call "
-            "register() once to claim an address -- pass a name (e.g. "
-            '"lead" or "worker:feature-x") or, if none is given, register under '
-            "your session's title -- then send(to, body) to message another "
-            "session and inbox()/wait() to receive. For a question that needs an "
-            "answer, ask(to, body) sends and blocks for the reply in one call. "
-            "Messages are durable: they wait in the recipient's mailbox until read. "
-            "The switchboard is scoped to this project by default, so you only see "
-            "sessions on the same board."
+            "Local durable message bus for independent Codex, Claude Code, and other MCP "
+            "client sessions. Call register() once to claim a stable address, such as "
+            '"lead" or "worker:feature-x"; if no name is available, omit it and use the '
+            "assigned session-* address returned in `you`. Use participants() to discover "
+            "live addresses, send(to, body) plus inbox()/wait() for messaging, or "
+            "ask(to, body) for one-call request/reply. Messages remain queued until read. "
+            "All peers must use the same board; project scoping is the default. Codex and "
+            "generic MCP clients receive messages by polling inbox()/wait(); Claude Channels "
+            "push, when configured, is only an optional accelerator."
         ),
         lifespan=_lifespan,
     )
@@ -824,16 +841,16 @@ def build_server(
     # and it keeps the initialize response uniform.
     _declare_channel_capability(mcp)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_LOCAL_WRITE)
     def register(name: str = "", role: str = "", ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Claim an address on the switchboard for this session.
 
         `name` is your address that others send to (e.g. "lead",
         "worker:feature-x"). It is optional: if the user did not give you a
-        specific name, register under your current session's title (a short slug
-        of it) so you are addressable by it -- and if you truly have no name to
-        offer, one is assigned for you (a "session-..." handle, returned in
-        `you`). `role` is an optional shared address for a group (e.g. "worker")
+        specific name, use a short stable name derived from the current task or
+        session title when the client exposes one. If no name is available, omit
+        it and a "session-..." handle is assigned and returned in `you`. `role`
+        is an optional shared address for a group (e.g. "worker")
         -- a message sent to a role is delivered to any participant that reads
         with that role. Re-call to refresh your presence (a heartbeat) or change
         your role. Returns the `board` you joined and the current live
@@ -841,12 +858,12 @@ def build_server(
         """
         return sb.register(ctx, name, role)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_LOCAL_WRITE)
     def participants(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """List participants seen within the TTL window (name, role, idle_seconds)."""
         return sb.participants(ctx)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_LOCAL_WRITE)
     async def send(  # type: ignore[assignment]
         to: str, body: str, reply_to: Optional[int] = None, ctx: Context = None
     ) -> dict[str, Any]:
@@ -864,7 +881,7 @@ def build_server(
         """
         return await sb.send_async(ctx, to, body, reply_to)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_LOCAL_DESTRUCTIVE)
     def inbox(  # type: ignore[assignment]
         peek: bool = False, since: Optional[int] = None, ctx: Context = None
     ) -> dict[str, Any]:
@@ -876,18 +893,18 @@ def build_server(
         """
         return sb.inbox(ctx, peek=peek, since=since)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_LOCAL_DESTRUCTIVE)
     async def wait(timeout_s: float = 30.0, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Block until a message arrives for you, then drain and return it.
 
         Long-polls your inbox for up to `timeout_s` seconds (capped at 3600).
         Returns as soon as any message is available, draining it like inbox().
         On timeout returns an empty list with `timed_out=true`. Ideal for a
-        long-running "lead" session parked in a /loop waiting for questions.
+        long-running "lead" session parked in a polling loop waiting for questions.
         """
         return await sb.wait(ctx, timeout_s)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_LOCAL_DESTRUCTIVE)
     async def ask(  # type: ignore[assignment]
         to: str, body: str, timeout_s: float = 30.0, ctx: Context = None
     ) -> dict[str, Any]:
@@ -907,7 +924,7 @@ def build_server(
         """
         return await sb.ask(ctx, to, body, timeout_s)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_LOCAL_WRITE)
     async def broadcast(body: str, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Send `body` to every currently-live participant except yourself.
 
@@ -917,7 +934,7 @@ def build_server(
         """
         return await sb.broadcast(ctx, body)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_LOCAL_IDEMPOTENT_DESTRUCTIVE)
     def unregister(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Leave the switchboard: remove yourself from the participant registry.
 
@@ -936,7 +953,7 @@ def build_server(
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="switchboard-relay",
-        description="A local MCP server for inter-session messaging between Claude Code sessions.",
+        description="A local MCP server for inter-session messaging between coding agents.",
     )
     parser.add_argument(
         "--db",
@@ -1034,6 +1051,8 @@ def _cli_boards(ttl: float) -> int:
 _DOCTOR_ENV_VARS = (
     "SWITCHBOARD_DB",
     "SWITCHBOARD_BOARD",
+    "SWITCHBOARD_PROJECT_DIR",
+    "CLAUDE_PROJECT_DIR",
     "SWITCHBOARD_TTL",
     "SWITCHBOARD_MSG_TTL",
     "SWITCHBOARD_MAX_BODY",
@@ -1209,7 +1228,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     mcp = build_server(
         store, ttl=ttl, board=target.board, msg_ttl=_resolve_msg_ttl(), max_body=_resolve_max_body()
     )
-    # stdio: one process per Claude Code session.
+    # stdio: one process per local MCP client session.
     mcp.run()
     return 0
 

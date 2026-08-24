@@ -1,4 +1,4 @@
-"""switchboard-relay: a local MCP server for inter-session messaging in Claude Code."""
+"""switchboard-relay: a local MCP server for inter-session agent messaging."""
 
 from importlib.metadata import PackageNotFoundError, version
 

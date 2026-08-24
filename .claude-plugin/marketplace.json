@@ -1,12 +1,14 @@
 {
   "name": "mgd43b",
   "owner": { "name": "mgd43b" },
-  "description": "Plugins by mgd43b.",
+  "metadata": {
+    "description": "Plugins by mgd43b."
+  },
   "plugins": [
     {
       "name": "switchboard-relay",
       "source": "./",
-      "description": "A shared, durable message bus for independent Claude Code sessions (MCP server, installed via uvx)."
+      "description": "A shared, durable message bus for independent Claude Code and Codex sessions (MCP server, installed via uvx)."
     }
   ]
 }
