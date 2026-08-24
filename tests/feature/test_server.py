@@ -236,12 +236,14 @@ def test_msg_ttl_zero_disables_ageout(tmp_path):
 # -- connection registry eviction (#18) -------------------------------------
 
 
-def test_conns_evicted_when_participant_expires(tmp_path):
+def test_conns_evicted_when_participant_expires(tmp_path, monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr("switchboard_relay.server._now", lambda: now[0])
     sb = Switchboard(Store(tmp_path / "sb.db"), ttl=0.02)
     ctx = _ctx()
     sb.register(ctx, "ghost")
     assert id(ctx.session) in sb._conns
-    time.sleep(0.05)  # let ghost's participant expire past the tiny TTL
+    now[0] += 0.05  # move ghost's participant past the tiny TTL deterministically
     sb.participants(_ctx())  # any participants()/register triggers the sweep
     assert id(ctx.session) not in sb._conns
 
@@ -481,6 +483,14 @@ def test_build_server_declares_channel_capability():
     ).capabilities
     assert caps2.experimental[_CHANNEL_CAPABILITY] == {}
     assert caps2.experimental["other"] == {}
+
+
+def test_build_server_guidance_is_client_neutral_and_codex_aware():
+    mcp = build_server(Store(":memory:"), ttl=300, board="compat")
+    assert "Codex" in mcp.instructions
+    assert "Claude Code" in mcp.instructions
+    assert "generic MCP clients" in mcp.instructions
+    assert mcp.instructions.index("Codex") < 512
 
 
 def test_push_off_by_default_on_and_off_via_env(monkeypatch):

@@ -1,10 +1,10 @@
 """Integration test over REAL stdio subprocesses sharing one SQLite database.
 
 This is the truest reproduction of the deployment shape: two separate OS
-processes (as two Claude Code sessions would be), each running the installed
-``switchboard-relay`` console script, talking only through the shared DB file. It
-exercises the console entry point, the stdio transport, and cross-process
-durability all at once.
+processes (as two Codex, Claude Code, or mixed MCP sessions would be), each
+running the installed ``switchboard-relay`` console script, talking only through
+the shared DB file. It exercises the console entry point, the stdio transport,
+and cross-process durability all at once.
 
 Skipped automatically if the ``switchboard-relay`` console script is not on PATH
 (e.g. the package was not installed, only imported).

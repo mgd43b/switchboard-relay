@@ -129,12 +129,18 @@ def _derive_board_name(key: str) -> str:
 def project_board(env: Optional[dict] = None) -> str:
     """The board derived from the current project (git repo, else launch dir).
 
-    Uses ``$CLAUDE_PROJECT_DIR`` -- the project root Claude Code injects into an
-    MCP server's environment -- falling back to the process CWD when it is unset
-    (e.g. the inspection CLI run by hand).
+    ``$SWITCHBOARD_PROJECT_DIR`` is the client-neutral explicit override. For
+    backward compatibility, ``$CLAUDE_PROJECT_DIR`` is used next when Claude
+    Code injects it into the MCP server environment. Other clients, including
+    Codex, fall back to the server process CWD, which local MCP hosts launch in
+    the active project unless configured otherwise.
     """
     env = os.environ if env is None else env
-    base = (env.get("CLAUDE_PROJECT_DIR") or "").strip() or os.getcwd()
+    base = (
+        (env.get("SWITCHBOARD_PROJECT_DIR") or "").strip()
+        or (env.get("CLAUDE_PROJECT_DIR") or "").strip()
+        or os.getcwd()
+    )
     return _derive_board_name(_project_key(base))
 
 

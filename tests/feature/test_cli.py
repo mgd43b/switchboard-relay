@@ -130,6 +130,8 @@ def test_main_doctor_reports_resolution_env_and_hints(monkeypatch, tmp_path, cap
     assert "resolved by: $SWITCHBOARD_DB" in out
     assert "SWITCHBOARD_DB=" in out
     assert "SWITCHBOARD_BOARD (unset)" in out
+    assert "SWITCHBOARD_PROJECT_DIR (unset)" in out
+    assert "CLAUDE_PROJECT_DIR (unset)" in out
     assert "lead" in out and "coordinator" in out
     assert "pending (undelivered) messages: 1" in out
     assert "only 1 live participant" in out  # lone-participant hint

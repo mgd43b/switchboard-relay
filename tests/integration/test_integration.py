@@ -3,9 +3,9 @@
 Two independent client sessions connect to one FastMCP server through the SDK's
 in-memory client/server pipe, so each has its own MCP session (distinct
 identity) while sharing the same durable store -- exactly the shape of two
-Claude Code sessions talking through switchboard-relay. This is the wire-level proof
-of the acceptance criteria (register -> send -> inbox -> reply, TTL expiry,
-wait()).
+Codex, Claude Code, or mixed MCP sessions talking through switchboard-relay.
+This is the wire-level proof of the acceptance criteria (register -> send ->
+inbox -> reply, TTL expiry, wait()).
 """
 
 from __future__ import annotations
@@ -77,6 +77,23 @@ async def test_lead_worker_round_trip(tmp_path):
         assert reply["count"] == 1
         assert reply["messages"][0]["body"] == "4"
         assert reply["messages"][0]["reply_to"] == qid
+
+
+async def test_tools_advertise_codex_approval_hints(tmp_path):
+    mcp = make_board(tmp_path)
+    async with sessions(mcp) as (client, _peer):
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+
+        assert tools["participants"].annotations.readOnlyHint is False
+        assert tools["participants"].annotations.idempotentHint is False
+        assert tools["participants"].annotations.openWorldHint is False
+        assert tools["register"].annotations.readOnlyHint is False
+        assert tools["register"].annotations.idempotentHint is False
+        assert tools["send"].annotations.destructiveHint is False
+        assert tools["inbox"].annotations.destructiveHint is True
+        assert tools["wait"].annotations.destructiveHint is True
+        assert tools["ask"].annotations.destructiveHint is True
+        assert tools["unregister"].annotations.idempotentHint is True
 
 
 async def test_inbox_drains_by_default_peek_does_not(tmp_path):

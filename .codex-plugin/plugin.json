@@ -1,0 +1,38 @@
+{
+  "name": "switchboard-relay",
+  "version": "0.2.4",
+  "description": "A local durable message bus for independent Codex, Claude Code, and other MCP client sessions.",
+  "author": {
+    "name": "mgd43b",
+    "url": "https://github.com/mgd43b"
+  },
+  "homepage": "https://github.com/mgd43b/switchboard-relay",
+  "repository": "https://github.com/mgd43b/switchboard-relay",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "messaging",
+    "inter-session",
+    "codex",
+    "claude-code",
+    "agents"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Switchboard Relay",
+    "shortDescription": "Durable messaging between local coding-agent sessions",
+    "longDescription": "Give independent Codex, Claude Code, and other local MCP sessions a shared SQLite-backed message bus with named participants, durable inboxes, roles, request/reply, and cross-client delivery.",
+    "developerName": "mgd43b",
+    "category": "Development",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/mgd43b/switchboard-relay",
+    "defaultPrompt": [
+      "Register me as lead, wait for messages, and reply to each sender.",
+      "Register me as a worker and ask lead: <your question>.",
+      "Show the live switchboard participants and current board."
+    ]
+  }
+}
