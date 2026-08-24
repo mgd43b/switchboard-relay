@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6](https://github.com/mgd43b/switchboard-relay/compare/v0.2.5...v0.2.6) (2026-08-24)
+
+
+### Features
+
+* **codex:** keep opted-in sessions listening ([#31](https://github.com/mgd43b/switchboard-relay/issues/31)) ([856c270](https://github.com/mgd43b/switchboard-relay/commit/856c27072a85948d295d959e94e6d212ccaadcc9))
+
 ## [0.2.5](https://github.com/mgd43b/switchboard-relay/compare/v0.2.4...v0.2.5) (2026-08-24)
 
 

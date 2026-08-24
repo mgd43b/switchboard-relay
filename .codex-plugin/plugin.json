@@ -1,6 +1,6 @@
 {
   "name": "switchboard-relay",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "A local durable message bus for independent Codex, Claude Code, and other MCP client sessions.",
   "author": {
     "name": "mgd43b",

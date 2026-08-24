@@ -2,7 +2,7 @@
   "name": "switchboard-relay",
   "displayName": "Switchboard Relay",
   "description": "A shared, durable message bus so independent Claude Code and Codex sessions can talk across terminals without copy-pasting.",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "author": {
     "name": "mgd43b"
   },
