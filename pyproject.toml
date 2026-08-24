@@ -36,18 +36,18 @@ classifiers = [
 dependencies = [
     # Official MCP Python SDK (provides FastMCP). Cap below 2.0: the v2 alpha
     # reorganizes `mcp.server.fastmcp` and would break these imports.
-    "mcp>=1.9,<2",
+    "mcp>=2.0.0,<3",
 ]
 
 [project.optional-dependencies]
 test = [
-    "pytest>=7.4",
-    "pytest-asyncio>=0.23",
-    "pytest-cov>=5.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
 ]
 dev = [
     "switchboard-relay[test]",
-    "ruff>=0.9",
+    "ruff>=0.16.4",
 ]
 
 [project.scripts]
