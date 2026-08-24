@@ -206,6 +206,7 @@ class _Conn:
     name: str
     role: str
     session: Any  # mcp.server.session.ServerSession
+    standby: bool = False
 
 
 class Switchboard:
@@ -263,8 +264,15 @@ class Switchboard:
     # -- identity -----------------------------------------------------------
 
     def _bind(self, ctx: Context, name: str, role: str) -> _Conn:
-        conn = _Conn(name=name, role=role, session=ctx.session)
-        self._conns[id(ctx.session)] = conn
+        sid = id(ctx.session)
+        previous = self._conns.get(sid)
+        conn = _Conn(
+            name=name,
+            role=role,
+            session=ctx.session,
+            standby=previous.standby if previous is not None else False,
+        )
+        self._conns[sid] = conn
         return conn
 
     def _resolve(self, ctx: Context) -> _Conn:
@@ -372,6 +380,52 @@ class Switchboard:
         if hint:
             out["hint"] = hint
         return out
+
+    def standby(self, ctx: Context, enabled: bool = True) -> dict:
+        """Opt this MCP session in or out of the Codex Stop-hook listener."""
+        conn = self._resolve(ctx)
+        conn.standby = bool(enabled)
+        self.store.touch(conn.name, now=_now())
+        return {"ok": True, "you": conn.name, "standby": conn.standby}
+
+    async def codex_standby(self, ctx: Context, timeout_s: float = 3600.0) -> dict:
+        """Wait for durable mail and return a Codex Stop-hook decision.
+
+        This is deliberately separate from :meth:`wait`: it peeks instead of
+        draining, so a hook interruption can never lose the message that should
+        wake the next turn. The public ``standby()`` tool is the opt-in gate.
+        """
+        conn = self._conns.get(id(ctx.session))
+        if conn is None or not conn.standby:
+            return {"continue": True}
+
+        timeout_s = _clamp_timeout(timeout_s)
+        deadline = _now() + timeout_s
+        last_heartbeat = 0.0
+        while True:
+            now = _now()
+            if now - last_heartbeat >= _WAIT_HEARTBEAT_SECONDS:
+                self.store.touch(conn.name, now=now)
+                last_heartbeat = now
+            if self.store.has_messages(conn.name, conn.role):
+                return {
+                    "decision": "block",
+                    "reason": (
+                        "A switchboard message is waiting. Call inbox() now, handle every "
+                        "returned message within the user's existing task scope, reply when "
+                        "appropriate, then finish normally to resume standby."
+                    ),
+                }
+            if now >= deadline:
+                return {
+                    "decision": "block",
+                    "reason": (
+                        "No switchboard message arrived during this standby window. Finish "
+                        "this continuation immediately without calling switchboard tools so "
+                        "the Stop hook can resume listening."
+                    ),
+                }
+            await anyio.sleep(min(_WAIT_POLL_SECONDS, max(0.0, deadline - now)))
 
     def send(self, ctx: Context, to: str, body: str, reply_to: Optional[int] = None) -> dict:
         conn = self._resolve(ctx)
@@ -826,6 +880,9 @@ def build_server(
             "assigned session-* address returned in `you`. Use participants() to discover "
             "live addresses, send(to, body) plus inbox()/wait() for messaging, or "
             "ask(to, body) for one-call request/reply. Messages remain queued until read. "
+            "In Codex, a participant that must keep listening after a turn ends should call "
+            "standby(true); the plugin's trusted Stop hook then waits for durable mail and "
+            "continues the turn when inbox() should be drained. Call standby(false) to stop. "
             "All peers must use the same board; project scoping is the default. Codex and "
             "generic MCP clients receive messages by polling inbox()/wait(); Claude Channels "
             "push, when configured, is only an optional accelerator."
@@ -862,6 +919,30 @@ def build_server(
     def participants(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """List participants seen within the TTL window (name, role, idle_seconds)."""
         return sb.participants(ctx)
+
+    @mcp.tool(annotations=_LOCAL_IDEMPOTENT_WRITE)
+    def standby(enabled: bool = True, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Keep this registered Codex session listening after its turn ends.
+
+        Requires the switchboard Codex plugin's trusted Stop hook. Enable this
+        for a lead/reactor that should remain available, then finish normally;
+        new durable mail continues the turn and is read with inbox(). Disable it
+        before finishing when the session should stop. Other MCP clients may
+        ignore this opt-in and continue using wait() directly.
+        """
+        return sb.standby(ctx, enabled)
+
+    @mcp.tool(annotations=_LOCAL_WRITE)
+    async def codex_standby(  # type: ignore[assignment]
+        timeout_s: float = 3600.0, ctx: Context = None
+    ) -> dict[str, Any]:
+        """Internal target for the plugin's Codex Stop hook.
+
+        When standby is enabled, waits without draining durable mail and returns
+        a Codex hook continuation decision. Otherwise returns immediately. Call
+        standby(), not this tool, during normal agent work.
+        """
+        return await sb.codex_standby(ctx, timeout_s)
 
     @mcp.tool(annotations=_LOCAL_WRITE)
     async def send(  # type: ignore[assignment]

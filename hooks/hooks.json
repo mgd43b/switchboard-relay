@@ -1,0 +1,21 @@
+{
+  "description": "Keep opted-in switchboard participants listening between Codex turns.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "switchboard_relay",
+            "tool": "codex_standby",
+            "input": {
+              "timeout_s": 3600
+            },
+            "timeout": 3660,
+            "statusMessage": "Listening for switchboard messages"
+          }
+        ]
+      }
+    ]
+  }
+}
