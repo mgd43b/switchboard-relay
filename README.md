@@ -121,10 +121,28 @@ required.
 ### Codex plugin
 
 This repository includes a Codex plugin manifest at [`.codex-plugin/plugin.json`](.codex-plugin/plugin.json)
-and its local MCP definition at [`.mcp.json`](.mcp.json). Once the repository marketplace is
-published or installed, the plugin supplies the `switchboard-relay` MCP server automatically.
+and its local MCP definition at [`.mcp.json`](.mcp.json). Install the repository marketplace and
+plugin with:
 
-For immediate use without installing a plugin marketplace entry:
+```bash
+codex plugin marketplace add mgd43b/switchboard-relay
+codex plugin add switchboard-relay@mgd43b
+```
+
+The plugin supplies the `switchboard-relay` MCP server and Codex lifecycle hook automatically.
+Its bundled server key is `switchboard_relay_default`, keeping it isolated from project-specific
+plugins that may pin their own switchboard board and package version.
+After a new release, refresh the Git-backed marketplace and reinstall the plugin snapshot:
+
+```bash
+codex plugin marketplace upgrade mgd43b
+codex plugin add switchboard-relay@mgd43b
+```
+
+Restart the ChatGPT desktop app and begin a new task after installing or upgrading so Codex picks
+up the new MCP tools and hooks.
+
+For MCP tools without the plugin lifecycle hook, add only the server:
 
 ```bash
 codex mcp add switchboard_relay -- uvx switchboard-relay

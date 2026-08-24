@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "mcp_tool",
-            "server": "switchboard_relay",
+            "server": "switchboard_relay_default",
             "tool": "codex_standby",
             "input": {
               "timeout_s": 3600

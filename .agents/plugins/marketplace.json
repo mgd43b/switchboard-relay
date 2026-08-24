@@ -1,0 +1,21 @@
+{
+  "name": "mgd43b",
+  "interface": {
+    "displayName": "mgd43b"
+  },
+  "plugins": [
+    {
+      "name": "switchboard-relay",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/mgd43b/switchboard-relay.git",
+        "ref": "main"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Development"
+    }
+  ]
+}
