@@ -36,7 +36,7 @@ classifiers = [
 dependencies = [
     # Official MCP Python SDK (provides FastMCP). Cap below 2.0: the v2 alpha
     # reorganizes `mcp.server.fastmcp` and would break these imports.
-    "mcp>=1.9,<2",
+    "mcp>=1.9,<3",
 ]
 
 [project.optional-dependencies]
