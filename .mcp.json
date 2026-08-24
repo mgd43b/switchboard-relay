@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "switchboard_relay": {
+    "switchboard_relay_default": {
       "command": "uvx",
       "args": [
         "switchboard-relay"
