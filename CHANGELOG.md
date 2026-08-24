@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.7](https://github.com/mgd43b/switchboard-relay/compare/v0.2.6...v0.2.7) (2026-08-24)
+
+
+### Features
+
+* **codex:** add plugin marketplace ([#34](https://github.com/mgd43b/switchboard-relay/issues/34)) ([f157a9b](https://github.com/mgd43b/switchboard-relay/commit/f157a9ba6d77eaf6cbbcf3c842e04ef12e831e3f))
+
 ## [0.2.6](https://github.com/mgd43b/switchboard-relay/compare/v0.2.5...v0.2.6) (2026-08-24)
 
 
