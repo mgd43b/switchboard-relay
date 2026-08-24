@@ -14,10 +14,10 @@ Claude Code, and other MCP client sessions a shared, durable messaging channel.
 
 </div>
 
-Because `switchboard-relay` is a standards-based *config-level* MCP server, the same eight tools work
+Because `switchboard-relay` is a standards-based *config-level* MCP server, the same ten tools work
 in Codex, Claude Code, and generic MCP clients. It routes named messages between any mix of local
 sessions on one machine, backed by SQLite so mailboxes survive restarts. Claude Code can optionally
-add turn-injection push; Codex and other clients use the durable `inbox()` / `wait()` path.
+add turn-injection push; Codex can use opt-in plugin standby or the durable `inbox()` / `wait()` path.
 
 ```
         register("worker:auth")                       register("lead")
@@ -46,7 +46,7 @@ switchboard just routes named messages, so any addressing scheme works.
 - [Quickstart](#quickstart) — zero to working in about a minute
 - [Concepts](#concepts) — the five words that explain everything
 - [Install](#install) — Codex, Claude Code, Claude Desktop, approvals
-- [Tools](#tools) — the eight tools, at a glance
+- [Tools](#tools) — the ten tools, at a glance
 - [Boards: one switchboard per project](#boards-one-switchboard-per-project)
 - [The lead / worker pattern](#the-lead--worker-pattern) — recipes + terminal inspection
 - [Configuration](#configuration) — environment variables
@@ -72,7 +72,7 @@ pipx install switchboard-relay               # or pipx
 **2. Add it to Codex or Claude Code** at user scope, so it loads in every project:
 
 ```bash
-codex mcp add switchboard-relay -- switchboard-relay
+codex mcp add switchboard_relay -- switchboard-relay
 # or
 claude mcp add --scope user -- switchboard-relay
 ```
@@ -127,14 +127,24 @@ published or installed, the plugin supplies the `switchboard-relay` MCP server a
 For immediate use without installing a plugin marketplace entry:
 
 ```bash
-codex mcp add switchboard-relay -- uvx switchboard-relay
+codex mcp add switchboard_relay -- uvx switchboard-relay
 codex mcp list
 ```
 
 The ChatGPT desktop app, Codex CLI, and Codex IDE extension on the same host share this MCP
-configuration. Restart the active client after adding it. The bundled config allows `wait()` and
-`ask()` calls up to the server's 3600-second cap; direct CLI configuration uses Codex's configured
-MCP tool timeout.
+configuration. Restart the active client after adding it. The bundled config allows `wait()`,
+`ask()`, and the standby hook to run through the server's 3600-second polling window.
+
+The plugin also bundles an opt-in Codex `Stop` hook. Installed plugin hooks are not trusted
+automatically: review and trust it with `/hooks`, then call `standby(true)` in a registered lead.
+When the lead finishes a turn, the hook parks it until durable mail arrives and continues the turn
+so it can call `inbox()`. Call `standby(false)` before finishing when the lead should stop. See the
+[official Codex hooks documentation](https://learn.chatgpt.com/docs/hooks#stop).
+
+Direct `codex mcp add` installs only the MCP server, not the plugin hook. To use standby with a
+direct server, merge the `Stop` entry from [`hooks/hooks.json`](hooks/hooks.json) into
+`~/.codex/hooks.json`, review it with `/hooks`, and keep the server name `switchboard_relay` so the
+hook target matches.
 
 ### Claude Code plugin (recommended)
 
@@ -178,7 +188,7 @@ desktop, and IDE):
 claude mcp add --scope user -- switchboard-relay
 ```
 
-That's it — open any Claude Code session and the eight `switchboard-relay` tools are available.
+That's it — open any Claude Code session and the `switchboard-relay` tools are available.
 Verify with `claude mcp list`.
 
 > **No install step?** Point Claude Code at `uvx` and skip installing anything:
@@ -191,14 +201,14 @@ Verify with `claude mcp list`.
 Register the same STDIO server with Codex:
 
 ```bash
-codex mcp add switchboard-relay -- uvx switchboard-relay
+codex mcp add switchboard_relay -- uvx switchboard-relay
 ```
 
 Verify with `codex mcp list` or `/mcp`. For a cross-client board shared with Claude Code, pin the
 same explicit board in both clients:
 
 ```bash
-codex mcp add switchboard-relay --env SWITCHBOARD_BOARD=team -- uvx switchboard-relay
+codex mcp add switchboard_relay --env SWITCHBOARD_BOARD=team -- uvx switchboard-relay
 claude mcp add --scope user --env SWITCHBOARD_BOARD=team -- uvx switchboard-relay
 ```
 
@@ -206,14 +216,15 @@ Direct CLI registration uses Codex's default MCP tool timeout. If a lead should 
 `wait()` calls longer than that timeout, set the server entry in `~/.codex/config.toml` explicitly:
 
 ```toml
-[mcp_servers.switchboard-relay]
+[mcp_servers.switchboard_relay]
 command = "uvx"
 args = ["switchboard-relay"]
 tool_timeout_sec = 3660
 ```
 
 Codex does not consume Claude's experimental Channels notification. Delivery remains durable and
-works through `inbox()`, `wait()`, and `ask()`; leave `SWITCHBOARD_PUSH` off for Codex-only sessions.
+works through `inbox()`, `wait()`, `ask()`, and plugin standby; leave `SWITCHBOARD_PUSH` off for
+Codex-only sessions.
 
 #### Add it to Claude Desktop
 
@@ -278,7 +289,7 @@ server:
 
 ## Tools
 
-Eight tools, grouped by what you reach for:
+Ten tools, grouped by what you reach for:
 
 **Presence** — join and see who's around
 
@@ -301,6 +312,13 @@ Eight tools, grouped by what you reach for:
 |------|-----------|--------------|
 | `inbox` | `inbox(peek?, since?)` | Read messages addressed to you. **Drains** by default (each delivered once); `peek=true` reads without removing; `since=<id>` returns only messages newer than that id. |
 | `wait` | `wait(timeout_s?)` | Block up to `timeout_s` seconds (default 30, max 3600) until a message arrives, then drain and return it. Returns `timed_out: true` on timeout. |
+
+**Codex lifecycle** — opt in to listening between turns
+
+| Tool | Signature | What it does |
+|------|-----------|--------------|
+| `standby` | `standby(enabled?)` | Enable or disable persistent listening for this registered session. With the plugin's trusted `Stop` hook, finishing a turn parks the session until durable mail arrives. |
+| `codex_standby` | `codex_standby(timeout_s?)` | Internal target used by the plugin hook. It peeks for mail without draining it and returns the Codex continuation decision; agents should use `standby()`, not call this directly. |
 
 **Ask** — send and block for the answer in one call
 
@@ -344,7 +362,7 @@ sessions on the same named board:
 # lead, in repo B
 claude mcp add --scope user --env SWITCHBOARD_BOARD=team -- switchboard-relay
 # Codex worker, in repo A — same board name and the same local SQLite bus
-codex mcp add switchboard-relay --env SWITCHBOARD_BOARD=team -- switchboard-relay
+codex mcp add switchboard_relay --env SWITCHBOARD_BOARD=team -- switchboard-relay
 ```
 
 Any shared string works; pick one name and use it everywhere those sessions should talk.
@@ -363,19 +381,21 @@ them on a shared board (see [Boards](#boards-one-switchboard-per-project)).
 
 ### The lead (coordinator)
 
-Keep one session open as the long‑running lead. Paste this and let it run:
+Keep one session open as the long‑running lead. With the Codex plugin hook trusted via `/hooks`,
+paste this and let it run:
 
 ```
-Register me on switchboard-relay as "lead", then keep calling wait() in a loop:
-whenever a message arrives, answer the question by sending a reply back to its
-sender (use reply_to), then wait() again.
+Register me on switchboard-relay as "lead", call standby(true), and answer every
+message that wakes this task. Reply to its sender using reply_to, then finish
+normally so standby resumes. Keep going until I tell you to disable standby.
 ```
 
-The client will `register(name="lead")` and park in `wait()`. A lead keeps a well-known name so
+The client will `register(name="lead")`, opt in, and park in the plugin's Stop hook whenever its
+turn finishes. A lead keeps a well-known name so
 workers can address it; anyone who doesn't need a fixed address can omit the name and use the
-returned `session-*` address. In Claude Code, keep it going hands-free with the
-[`/loop`](https://code.claude.com/docs/en/slash-commands) skill. In Codex, ask the task to keep
-calling `wait()` until you stop it:
+returned `session-*` address. Without the Codex plugin hook, ask the task to keep calling `wait()`;
+in Claude Code, keep that polling loop going hands-free with the
+[`/loop`](https://code.claude.com/docs/en/slash-commands) skill:
 
 ```
 /loop wait for a switchboard-relay message, answer it, and reply to the sender
@@ -457,11 +477,12 @@ processes do not talk to each other directly — Codex and Claude Code processes
 the same SQLite database (one file per [board](#boards-one-switchboard-per-project)). `wait()`
 long-polls that database.
 
-**The one honest limitation:** switchboard **cannot wake a *closed* session.** In the baseline
-(poll) model a recipient learns about a message by calling `inbox()` or `wait()` — on its next turn,
-or while parked in a polling loop. An open Claude Code session can optionally be pushed into a turn
-with [turn injection](#turn-injection-push); Codex currently uses the polling path. Nothing reaches
-a session that is not running.
+**The one honest limitation:** switchboard **cannot wake a *closed* session or a client that is no
+longer running.** In the baseline poll model a recipient learns about a message by calling
+`inbox()` or `wait()` on its next turn or while parked in a polling loop. The Codex plugin's trusted
+Stop hook can keep an opted-in, open task parked between turns; an open Claude Code session can
+optionally be pushed into a turn with [turn injection](#turn-injection-push). Durable mail remains
+queued when neither listener is active.
 
 ---
 
@@ -477,12 +498,12 @@ runs (the *sender* can be any surface):
 
 | Reactor runs on… | Mechanism | Feel |
 |---|---|---|
-| **Codex (desktop/CLI/IDE)** | Durable `wait()` / `inbox()` polling | **portable**, no Claude-specific protocol |
+| **Codex (desktop/CLI/IDE)** | Opt-in plugin `Stop` hook, or `wait()` / `inbox()` polling | **automatic while the opted-in task and client remain open** |
 | **Claude Code (CLI/terminal)** | [Channels](https://code.claude.com/docs/en/channels) — the recipient self‑injects | **zero‑touch**, fully automatic |
 | **Claude Desktop** | `ccd_session_mgmt.send_message` — the *sender* injects | **one approval click per message** |
 
-The Claude mechanisms are best-effort accelerators on top of the durable polling path, and both
-preserve **drain-once**. Codex requires no push setup.
+The lifecycle and Claude mechanisms are accelerators on top of the durable polling path and preserve
+**drain-once**. Codex standby requires the plugin hook to be reviewed and trusted with `/hooks`.
 
 ### Reacting on the CLI (Channels) — the three hard constraints
 
@@ -609,8 +630,10 @@ messages, and prints a hint for the two most common failures below — usually e
 in one shot.
 
 **"I sent a message but nothing happened."**
-switchboard cannot wake a closed session — a recipient sees a message when it calls `inbox()` or
-`wait()`. Keep a Codex lead in a requested polling loop, or a Claude lead in
+switchboard cannot wake a closed session. With the Codex plugin installed, review its hook with
+`/hooks`, register the lead, and call `standby(true)` before finishing; use `standby(false)` when it
+should stop. A direct MCP installation still needs a requested `wait()` loop or the `Stop` entry
+from [`hooks/hooks.json`](hooks/hooks.json) merged into the user's hooks. Keep a Claude lead in
 [`/loop`](#the-lead--worker-pattern), so it stays listening.
 (See [How it works](#how-it-works).)
 
@@ -645,7 +668,7 @@ Source layout — each module is small and single‑purpose:
 
 - [`store.py`](src/switchboard_relay/store.py) — the durable SQLite store (registry + mailboxes). Pure and clock‑free.
 - [`board.py`](src/switchboard_relay/board.py) — board resolution: which switchboard a session joins (env / git worktree → DB path). Pure and transport‑free.
-- [`server.py`](src/switchboard_relay/server.py) — the FastMCP server: identity binding, the eight tools, the `wait()` poll loop, and best‑effort push.
+- [`server.py`](src/switchboard_relay/server.py) — the FastMCP server: identity binding, ten tools, polling/standby loops, and best‑effort push.
 
 Tests are split into three tiers:
 
@@ -655,8 +678,8 @@ Tests are split into three tiers:
 
 The Claude Code plugin/marketplace manifests live in [`.claude-plugin/`](.claude-plugin/); validate
 them with `claude plugin validate .`. Codex packaging lives in
-[`.codex-plugin/`](.codex-plugin/) plus [`.mcp.json`](.mcp.json) and is validated with the Codex
-plugin validator.
+[`.codex-plugin/`](.codex-plugin/), [`.mcp.json`](.mcp.json), and
+[`hooks/hooks.json`](hooks/hooks.json), and is validated with the Codex plugin validator.
 
 CI (Python 3.10–3.14) runs ruff + the full suite with the coverage gate on every push and PR. Releases
 and Homebrew packaging are documented in [RELEASING.md](RELEASING.md).

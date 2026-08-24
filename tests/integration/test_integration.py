@@ -89,11 +89,32 @@ async def test_tools_advertise_codex_approval_hints(tmp_path):
         assert tools["participants"].annotations.openWorldHint is False
         assert tools["register"].annotations.readOnlyHint is False
         assert tools["register"].annotations.idempotentHint is False
+        assert tools["standby"].annotations.idempotentHint is True
+        assert tools["codex_standby"].annotations.readOnlyHint is False
+        assert tools["codex_standby"].annotations.destructiveHint is False
         assert tools["send"].annotations.destructiveHint is False
         assert tools["inbox"].annotations.destructiveHint is True
         assert tools["wait"].annotations.destructiveHint is True
         assert tools["ask"].annotations.destructiveHint is True
         assert tools["unregister"].annotations.idempotentHint is True
+
+
+async def test_codex_standby_tools_work_over_the_wire(tmp_path):
+    mcp = make_board(tmp_path)
+    async with sessions(mcp) as (lead, worker):
+        data(await lead.call_tool("register", {"name": "lead"}))
+        data(await worker.call_tool("register", {"name": "worker"}))
+
+        assert data(await lead.call_tool("codex_standby", {"timeout_s": 0})) == {"continue": True}
+        assert data(await lead.call_tool("standby", {"enabled": True}))["standby"] is True
+        empty = data(await lead.call_tool("codex_standby", {"timeout_s": 0}))
+        assert empty["decision"] == "block"
+
+        data(await worker.call_tool("send", {"to": "lead", "body": "wake"}))
+        wake = data(await lead.call_tool("codex_standby", {"timeout_s": 0}))
+        assert wake["decision"] == "block"
+        assert data(await lead.call_tool("inbox", {}))["messages"][0]["body"] == "wake"
+        assert data(await lead.call_tool("standby", {"enabled": False}))["standby"] is False
 
 
 async def test_inbox_drains_by_default_peek_does_not(tmp_path):

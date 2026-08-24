@@ -297,6 +297,48 @@ def test_wait_times_out_after_polling(board):
     assert out["messages"] == []
 
 
+# -- Codex standby hook -----------------------------------------------------
+
+
+def test_codex_standby_is_inert_until_registered_and_enabled(board):
+    assert _run(board.codex_standby, _ctx(), 0) == {"continue": True}
+
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    assert _run(board.codex_standby, ctx, 0) == {"continue": True}
+
+
+def test_standby_opt_in_survives_reregister_and_can_be_disabled(board):
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    assert board.standby(ctx) == {"ok": True, "you": "lead", "standby": True}
+    board.register(ctx, "lead", "coordinator")
+    assert board._conns[id(ctx.session)].standby is True
+    assert board.standby(ctx, False) == {"ok": True, "you": "lead", "standby": False}
+
+
+def test_codex_standby_wakes_without_draining_durable_mail(board):
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    board.standby(ctx)
+    board.store.send("lead", "wake up", sender="worker", now=time.time())
+
+    out = _run(board.codex_standby, ctx, 0)
+    assert out["decision"] == "block"
+    assert "Call inbox()" in out["reason"]
+    assert board.store.has_messages("lead")
+
+
+def test_codex_standby_rearms_after_an_empty_window(board):
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    board.standby(ctx)
+
+    out = _run(board.codex_standby, ctx, 0.01)
+    assert out["decision"] == "block"
+    assert "resume listening" in out["reason"]
+
+
 # -- ask / broadcast / unregister ------------------------------------------
 
 

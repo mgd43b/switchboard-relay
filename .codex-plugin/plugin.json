@@ -30,7 +30,7 @@
     ],
     "websiteURL": "https://github.com/mgd43b/switchboard-relay",
     "defaultPrompt": [
-      "Register me as lead, wait for messages, and reply to each sender.",
+      "Register me as lead, enable standby, and reply to each sender.",
       "Register me as a worker and ask lead: <your question>.",
       "Show the live switchboard participants and current board."
     ]

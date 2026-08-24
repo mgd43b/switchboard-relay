@@ -2,7 +2,7 @@
 
 Copy-paste prompt recipes for the lead / worker pattern in Codex, Claude Code, or a mix of both.
 These assume switchboard-relay is installed through a native plugin or added as a user-level MCP
-server (`codex mcp add switchboard-relay -- uvx switchboard-relay` or
+server (`codex mcp add switchboard_relay -- uvx switchboard-relay` or
 `claude mcp add --scope user -- uvx switchboard-relay`).
 
 > **Stuck?** Run `switchboard-relay doctor` — it says which board you're on and why nothing's flowing.
@@ -15,7 +15,17 @@ server (`codex mcp add switchboard-relay -- uvx switchboard-relay` or
 ## The lead (coordinator) session
 
 Keep one Codex or Claude Code session open as the long-running "lead". Register it and park it in a
-loop that answers whatever comes in. Paste this, then let it run:
+loop that answers whatever comes in.
+
+With the Codex plugin's Stop hook trusted via `/hooks`, use standby instead of a prompt-driven loop:
+
+```
+Register me on switchboard-relay as "lead" (role "coordinator"), call standby(true),
+and answer every message that wakes this task. Reply to each sender with reply_to set,
+then finish normally so standby resumes. Keep going until I tell you to disable standby.
+```
+
+Without that hook, paste this polling recipe and let it run:
 
 ```
 Register me on switchboard-relay as "lead" (role "coordinator"). Then loop: call wait()
@@ -55,7 +65,7 @@ claude mcp add --scope user --env SWITCHBOARD_NAME=worker:build --env SWITCHBOAR
   -- switchboard-relay
 
 # Codex equivalent
-codex mcp add switchboard-relay --env SWITCHBOARD_NAME=worker:build \
+codex mcp add switchboard_relay --env SWITCHBOARD_NAME=worker:build \
   --env SWITCHBOARD_ROLE=worker -- switchboard-relay
 ```
 
