@@ -50,6 +50,13 @@ _WAIT_HEARTBEAT_SECONDS = 10.0
 # on a background nudge is fine. See Switchboard._watch_loop.
 _WATCH_POLL_SECONDS = 1.0
 
+# How often the background loop refreshes the liveness clock of the sessions
+# connected to this process. It only has to beat the TTL by a comfortable
+# margin, so it is far gentler than the wait() heartbeat: one UPDATE per
+# connected session per minute, for the life of the session. Unlike push, this
+# runs unconditionally -- see Switchboard._watch_loop.
+_KEEPALIVE_SECONDS = 60.0
+
 # The Claude Code Channels contract (research preview), verified against the docs
 # (https://code.claude.com/docs/en/channels-reference) and the local `claude`
 # build. A session that has subscribed to this server as a channel turns each
@@ -483,7 +490,7 @@ class Switchboard:
 
     # -- self-watch (stdio turn injection, no daemon) -----------------------
 
-    async def _watch_tick(self, *, heartbeat: bool = False) -> int:
+    async def _watch_tick(self) -> int:
         """One self-watch pass: nudge each connected session about messages that
         arrived for it since the last pass. Returns the number of nudges emitted.
         Best-effort; never raises. See ``_watch_loop`` for the rationale.
@@ -494,16 +501,10 @@ class Switchboard:
         per-session high-water mark means each new message is nudged once, not on
         every poll.
         """
-        now = _now()
         # Forget high-water marks for sessions that have disconnected.
         self._watch_hw = {sid: hw for sid, hw in self._watch_hw.items() if sid in self._conns}
         nudged = 0
         for sid, conn in list(self._conns.items()):
-            if heartbeat:
-                # A connected session is live even while idle: keep it in the
-                # registry so senders don't see a false no_live_recipient and so
-                # role addressing still finds it.
-                self.store.touch(conn.name, now=now)
             hw = self._watch_hw.get(sid, 0)
             try:
                 new = self.store.inbox(conn.name, conn.role, peek=True, since=hw)
@@ -521,31 +522,68 @@ class Switchboard:
                 nudged += 1
         return nudged
 
-    async def _watch_loop(self) -> None:
-        """Give a *stdio* session turn injection with no daemon.
+    def _keepalive_conns(self) -> int:
+        """Refresh the liveness clock of every session connected to this process.
 
-        Each Claude Code session spawns its own switchboard process, and MCP
-        stdio is bidirectional, so this process can push a Channels notification
-        straight to its own client. This loop polls the shared board for messages
+        A connected session is live even while it is silent. Each session spawns
+        its own switchboard process over stdio, so this process existing at all
+        is proof that its client does -- which makes connectedness a better
+        liveness signal than "called a switchboard tool recently". Without this,
+        a peer heads-down on a build or a CI wait falls out of participants() on
+        the TTL alone: senders see a false no_live_recipient, role addressing
+        stops finding it, and broadcast() drops it from the recipient list
+        outright, so the message is never queued rather than merely late.
+
+        Calls Store.keepalive rather than touch, so liveness moves and
+        idle_seconds does not -- a session that has genuinely not touched
+        switchboard for twenty minutes still reports as such.
+
+        Returns the number of sessions refreshed. Best-effort; never raises, and
+        one unwritable row does not skip the rest.
+        """
+        now = _now()
+        refreshed = 0
+        for conn in list(self._conns.values()):
+            with suppress(Exception):  # e.g. a momentarily locked DB
+                self.store.keepalive(conn.name, now=now)
+                refreshed += 1
+        return refreshed
+
+    async def _watch_loop(self) -> None:
+        """Keep this process's sessions live; with push on, also inject turns.
+
+        Two jobs share one background task because both want the same shape --
+        wake periodically for as long as the session lives.
+
+        *Keepalive*, always. ``_keepalive_conns`` refreshes every connected
+        session's liveness clock, so the TTL only ever expires a session whose
+        process is actually gone.
+
+        *Turn injection*, only with ``$SWITCHBOARD_PUSH=1``. Each Claude Code
+        session spawns its own switchboard process, and MCP stdio is
+        bidirectional, so this process can push a Channels notification straight
+        to its own client. The loop polls the shared board for messages
         addressed to this process's session(s) and self-nudges; the client reacts
         and drains. Cross-session delivery still rides the shared SQLite, and
         drain-once is preserved by the atomic inbox() -- so this needs no daemon,
         no supervisor, and no reboot story, and per-project boards keep working.
 
-        No-op when push is disabled ($SWITCHBOARD_PUSH unset). Started by the
-        server lifespan; runs until the session -- hence the process -- ends.
+        Started by the server lifespan; runs until the session -- hence the
+        process -- ends.
         """
-        if not self._push_enabled:
-            return
-        last_heartbeat = 0.0
+        # Push wants a responsive poll; the keepalive on its own can idle for
+        # the whole interval, which is why leaving push off stays cheap.
+        poll = _WATCH_POLL_SECONDS if self._push_enabled else _KEEPALIVE_SECONDS
+        last_keepalive = 0.0
         while True:
             now = _now()
-            do_heartbeat = now - last_heartbeat >= _WAIT_HEARTBEAT_SECONDS
-            if do_heartbeat:
-                last_heartbeat = now
-            with suppress(Exception):  # a bad pass must never kill the loop
-                await self._watch_tick(heartbeat=do_heartbeat)
-            await anyio.sleep(_WATCH_POLL_SECONDS)
+            if now - last_keepalive >= _KEEPALIVE_SECONDS:
+                last_keepalive = now
+                self._keepalive_conns()
+            if self._push_enabled:
+                with suppress(Exception):  # a bad pass must never kill the loop
+                    await self._watch_tick()
+            await anyio.sleep(poll)
 
     # -- turn injection on Desktop (ccd_session_mgmt broker) ----------------
 
@@ -783,10 +821,11 @@ class Switchboard:
 
         ``_conns`` is keyed on the live ``ServerSession`` object, so a client
         that disconnects without calling ``unregister()`` would otherwise linger
-        forever (issue #18). A connected session heartbeats on every tool call,
-        keeping its participant live; a departed one expires from the store
-        within the TTL and is swept here. Bounds the registry to (live sessions +
-        at most one TTL window of stragglers) -- no unbounded leak.
+        forever (issue #18). A connected session is kept live by the loop's
+        keepalive (and by any tool call it makes); a departed one stops being
+        keepalived, expires from the store within the TTL, and is swept here.
+        Bounds the registry to (live sessions + at most one TTL window of
+        stragglers) -- no unbounded leak.
         """
         stale = [sid for sid, c in self._conns.items() if c.name not in live_names]
         for sid in stale:
@@ -805,7 +844,7 @@ class Switchboard:
         out = []
         for p in live:
             d = p.to_dict()
-            d["idle_seconds"] = round(now - p.last_seen, 1)
+            d["idle_seconds"] = round(now - p.last_active, 1)
             out.append(d)
         return out
 
@@ -917,7 +956,14 @@ def build_server(
 
     @mcp.tool(annotations=_LOCAL_WRITE)
     def participants(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """List participants seen within the TTL window (name, role, idle_seconds)."""
+        """List the live participants (name, role, idle_seconds).
+
+        A session stays listed for as long as it is connected, whatever it is
+        busy with, so this is "who can I address", not "who is paying
+        attention". ``idle_seconds`` is the second question: how long since that
+        peer last used switchboard. A large one means a reply may wait until the
+        peer reaches its next turn -- not that the address is wrong.
+        """
         return sb.participants(ctx)
 
     @mcp.tool(annotations=_LOCAL_IDEMPOTENT_WRITE)
@@ -1192,7 +1238,7 @@ def _cli_doctor(target, ttl: float) -> int:
     print(f"  live participants: {len(parts)}")
     for p in parts:
         role = f" [{p.role}]" if p.role else ""
-        print(f"    {p.name}{role}  idle={round(now - p.last_seen, 1)}s")
+        print(f"    {p.name}{role}  idle={round(now - p.last_active, 1)}s")
 
     live_addresses = {p.name for p in parts} | {p.role for p in parts if p.role}
     total_queued, dead_queued = _count_queued(store, live_addresses)
@@ -1233,7 +1279,7 @@ def _cli_participants(db_path, ttl: float) -> int:
         return 0
     for p in parts:
         role = f" [{p.role}]" if p.role else ""
-        print(f"{p.name}{role}  idle={round(now - p.last_seen, 1)}s")
+        print(f"{p.name}{role}  idle={round(now - p.last_active, 1)}s")
     return 0
 
 

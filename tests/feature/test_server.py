@@ -398,6 +398,22 @@ def test_broadcast_reaches_all_live_except_sender(board):
     assert board.inbox(a)["messages"] == []  # sender does not receive its own broadcast
 
 
+def test_broadcast_reaches_a_connected_peer_that_has_gone_quiet(board):
+    # The failure the keepalive exists to prevent. broadcast() enumerates only
+    # live participants, so a peer heads-down on a build or a CI wait was
+    # dropped from the recipient list outright -- the message was never queued,
+    # not merely late. Connectedness, not recent chatter, is what makes it live.
+    lead, busy = _ctx(), _ctx()
+    board.register(lead, "lead")
+    board.register(busy, "worker")
+    board.store.register("worker", "", now=time.time() - 10_000)  # ~3h without a call
+
+    assert _run(board.broadcast, lead, "before")["count"] == 0  # would have been lost
+    board._keepalive_conns()
+    assert _run(board.broadcast, lead, "after")["count"] == 1
+    assert [m["body"] for m in board.inbox(busy)["messages"]] == ["after"]
+
+
 def test_unregister_removes_from_registry(board):
     ctx = _ctx()
     board.register(ctx, "lead")
@@ -615,16 +631,29 @@ def test_watch_tick_renudges_on_a_new_message(board):
     assert len(ctx.session.sent) == 2
 
 
-def test_watch_tick_heartbeat_keeps_connected_session_live(board):
-    # A connected-but-idle session must stay in the live registry so senders
-    # don't see a false no_live_recipient. A heartbeat tick refreshes it.
-    board._push_enabled = True
+def test_keepalive_keeps_connected_session_live_without_resetting_idle(board):
+    # A connected-but-silent session must stay in the live registry so senders
+    # don't see a false no_live_recipient -- but it must still report honestly
+    # how long it has been since it last used switchboard. Two clocks, and the
+    # keepalive moves only one. Runs with push OFF: this is unconditional.
     ctx = _ctx()
     board.register(ctx, "lead")
     board.store.register("lead", "", now=time.time() - 10_000)  # force it stale
     assert board._has_live_recipient("lead") is False
-    _tick(board, heartbeat=True)
+
+    assert board._keepalive_conns() == 1
     assert board._has_live_recipient("lead") is True
+    entry = next(p for p in board._participants_payload() if p["name"] == "lead")
+    assert entry["idle_seconds"] > 9_000  # idle clock untouched by the keepalive
+
+
+def test_keepalive_survives_an_unwritable_row(board, monkeypatch):
+    # One bad write must neither raise nor skip the remaining sessions.
+    board.register(_ctx(), "lead")
+    monkeypatch.setattr(
+        board.store, "keepalive", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("locked"))
+    )
+    assert board._keepalive_conns() == 0
 
 
 def test_watch_tick_best_effort_on_bad_session(board):
@@ -644,15 +673,35 @@ def test_watch_tick_best_effort_on_bad_session(board):
     assert board.store.has_messages("lead")  # still durable
 
 
-def test_watch_loop_noop_when_push_off():
-    # With push disabled the loop returns immediately rather than spinning.
-    anyio.run(Switchboard(Store(":memory:"), ttl=300)._watch_loop)
+def test_watch_loop_keeps_alive_but_never_nudges_when_push_off(board, monkeypatch):
+    # With push disabled the loop still runs -- it just does the keepalive and
+    # nothing else. No nudges, no board polling, no _watch_tick at all.
+    import switchboard_relay.server as server_mod
+
+    monkeypatch.setattr(server_mod, "_KEEPALIVE_SECONDS", 0.01)  # iterate quickly
+    assert board._push_enabled is False
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    board.store.register("lead", "", now=time.time() - 10_000)  # force it stale
+    board.store.send("lead", "unread", sender="worker", now=time.time())
+
+    async def drive():
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(board._watch_loop)
+            with anyio.fail_after(3):
+                while not board._has_live_recipient("lead"):
+                    await anyio.sleep(0.005)
+            tg.cancel_scope.cancel()
+
+    anyio.run(drive)
+    assert not ctx.session.sent  # push stayed off: no turn injection
+    assert board.store.has_messages("lead")
 
 
 def test_watch_loop_delivers_reticks_then_cancels(board, monkeypatch):
     # Exercise the real background loop across multiple iterations (fast poll):
-    # it heartbeats on the first tick, skips the heartbeat on the next, nudges
-    # the connected session about a queued message, and stops cleanly on cancel.
+    # it keepalives on the first pass, skips it on the next, nudges the
+    # connected session about a queued message, and stops cleanly on cancel.
     import switchboard_relay.server as server_mod
 
     monkeypatch.setattr(server_mod, "_WATCH_POLL_SECONDS", 0.01)  # iterate quickly

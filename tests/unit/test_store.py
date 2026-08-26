@@ -74,9 +74,9 @@ def test_register_stores_and_preserves_ccd_session_id(store):
     assert "ccd_session_id" not in live.to_dict()
 
 
-def test_migrate_adds_ccd_column_to_legacy_db(tmp_path):
-    # A DB created by an older schema (no ccd_session_id) must gain the column
-    # when reopened, without losing existing rows.
+def test_migrate_adds_new_columns_to_legacy_db(tmp_path):
+    # A DB created by an older schema (no ccd_session_id, no last_active) must
+    # gain both columns when reopened, without losing existing rows.
     path = tmp_path / "legacy.db"
     conn = sqlite3.connect(str(path))
     conn.executescript(
@@ -92,6 +92,10 @@ def test_migrate_adds_ccd_column_to_legacy_db(tmp_path):
     s = Store(path)  # opening runs the migration
     old = next(p for p in s.participants(now=1.0, ttl=1e9) if p.name == "old")
     assert old.ccd_session_id == ""  # existing row defaults cleanly
+    # last_active is seeded from last_seen, not left at the ADD COLUMN default:
+    # before the split the two were the same thing, and a legacy row parked at 0
+    # would report as idle since the epoch.
+    assert old.last_active == old.last_seen == 1.0
     s.register("old", now=2.0, ccd_session_id="local_xyz")  # and is now settable
     assert next(p for p in s.participants(now=2.0, ttl=1e9)).ccd_session_id == "local_xyz"
 
@@ -146,6 +150,37 @@ def test_touch_refreshes_liveness(store):
 
 def test_touch_unregistered_is_noop(store):
     store.touch("nobody", now=1.0)  # must not raise
+    assert store.participants(now=1.0) == []
+
+
+def test_touch_moves_both_clocks_keepalive_moves_only_liveness(store):
+    # The two clocks answer different questions. last_seen is "is this session
+    # still there", which the connection keepalive can vouch for; last_active is
+    # "when did this peer last actually use switchboard", which only a real call
+    # can move. Collapsing them would make idle_seconds read 0 for every
+    # connected session, however long it had been silent.
+    store.register("x", now=0.0)
+    store.keepalive("x", now=1000.0)
+    p = next(iter(store.participants(now=1000.0, ttl=1e9)))
+    assert p.last_seen == 1000.0  # live: the connection is still open
+    assert p.last_active == 0.0  # and honestly idle since t=0
+    store.touch("x", now=2000.0)
+    p = next(iter(store.participants(now=2000.0, ttl=1e9)))
+    assert (p.last_seen, p.last_active) == (2000.0, 2000.0)
+
+
+def test_keepalive_alone_keeps_a_participant_live_past_the_ttl(store):
+    # The point of the whole exercise: a session that makes no switchboard call
+    # for an hour stays live as long as its process is still connected.
+    store.register("busy", now=0.0)
+    assert store.participants(now=3600.0, ttl=1800.0) == []  # silence alone expires it
+    store.keepalive("busy", now=3599.0)
+    assert [p.name for p in store.participants(now=3600.0, ttl=1800.0)] == ["busy"]
+
+
+def test_keepalive_unregistered_is_noop(store):
+    store.keepalive("nobody", now=1.0)  # must not raise
+    store.keepalive("", now=1.0)  # nor an empty name
     assert store.participants(now=1.0) == []
 
 

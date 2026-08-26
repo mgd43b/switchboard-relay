@@ -314,7 +314,7 @@ Ten tools, grouped by what you reach for:
 | Tool | Signature | What it does |
 |------|-----------|--------------|
 | `register` | `register(name?, role?)` | Claim an address for this session. `name` is **optional** — omit it and the server assigns a unique `session-*` address. `role` is an optional shared group address. Re-call to heartbeat or change role. Returns the `board` you joined and the live participants. |
-| `participants` | `participants()` | List sessions seen within the TTL window: `name`, `role`, `idle_seconds`. |
+| `participants` | `participants()` | List the live sessions: `name`, `role`, `idle_seconds`. A session stays listed for as long as its process is connected, whatever it's busy with; `idle_seconds` separately reports how long it's been since that peer last *used* switchboard, so a quiet peer reads as live-but-idle rather than dropping off the list. |
 | `unregister` | `unregister()` | Leave the switchboard (drop out of `participants()`). Your mailbox is preserved for when you return. |
 
 **Send** — put a message in someone's mailbox
@@ -471,16 +471,16 @@ All optional. Set as environment variables through `codex mcp add --env KEY=valu
 | `SWITCHBOARD_BOARD` | *(project)* | Board to join. An explicit name (any string) puts these sessions on a shared bus; `project` forces per‑project derivation. See [Boards](#boards-one-switchboard-per-project). |
 | `SWITCHBOARD_DB` | *(the board's file)* | Raw SQLite path override — wins over `SWITCHBOARD_BOARD`. Point several sessions at one exact file to share it. |
 | `SWITCHBOARD_PROJECT_DIR` | *(server launch directory)* | Client-neutral project root used to derive the default board. Wins over the compatibility-only `CLAUDE_PROJECT_DIR`. |
-| `SWITCHBOARD_TTL` | `1800` (30 min) | Seconds of inactivity before a participant drops out of `participants()` — and stops receiving `broadcast()`. Sized so a session heads‑down on a build or a CI wait isn't declared dead. |
+| `SWITCHBOARD_TTL` | `1800` (30 min) | Seconds without a sign of life before a participant drops out of `participants()` — and stops receiving `broadcast()`. A connected session keeps itself alive automatically, so in practice this is the window for noticing a session whose *process* went away without a clean `unregister()`. |
 | `SWITCHBOARD_MSG_TTL` | `604800` (7 days) | Undelivered messages older than this are pruned automatically during normal operation. Set `0` to disable age‑out. |
 | `SWITCHBOARD_MAX_BODY` | `262144` (256 KiB) | Reject a `send()` whose body exceeds this many UTF‑8 bytes. Set `0` to disable the cap. |
 | `SWITCHBOARD_NAME` | — | Auto‑register this session under this address (skips an explicit `register`; also the fallback when `register()` is called without a name). |
 | `SWITCHBOARD_ROLE` | — | Role to pair with `SWITCHBOARD_NAME`. |
-| `SWITCHBOARD_PUSH` | `0` | Enable [turn‑injection push](#turn-injection-push) over Channels (CLI reactors) — runs the background self‑watch loop that nudges this session's own client. Off by default (a small background poll cost); set `1` to enable. |
+| `SWITCHBOARD_PUSH` | `0` | Enable [turn‑injection push](#turn-injection-push) over Channels (CLI reactors) — has the background loop poll the board and nudge this session's own client. Off by default (a small background poll cost); set `1` to enable. The loop itself always runs: with push off it only does the once‑a‑minute liveness keepalive. |
 | `SWITCHBOARD_CCD_INJECT` | `0` | Enable [turn injection on Claude Desktop](#reacting-on-claude-desktop-ccd_session_mgmt): `send()` returns an `inject` hint so the sender's Claude can call `ccd_session_mgmt.send_message`. Off by default (leans on a Desktop tool + a per‑message approval). |
 | `SWITCHBOARD_CCD_SESSION_ID` | *(`local_<CLAUDE_CODE_SESSION_ID>`)* | Override this session's CCD id used for Desktop injection. Needed only when the default derivation is wrong (e.g. an agent/child session). Used verbatim. |
 
-Example — a longer liveness window, for peers that go quiet for an hour at a time:
+Example — a longer liveness window, for peers whose process may outlive their attention:
 
 ```bash
 claude mcp add --scope user --env SWITCHBOARD_TTL=3600 -- switchboard-relay
@@ -662,8 +662,11 @@ repo, or the same `SWITCHBOARD_BOARD`. (See [Boards](#boards-one-switchboard-per
 
 **"`ask()` timed out, or a `send()` came back with `no_live_recipient`."**
 Nobody is registered under that name/role right now — usually a typo (`"leed"` vs `"lead"`) or the
-recipient is offline. Check live addresses with `participants()` or `switchboard-relay participants`.
-The message is still queued durably, so a correctly‑named recipient gets it later.
+recipient's session is closed. A session that's merely *busy* still counts as live, so this isn't
+what you'll see from a peer that's deep in a build or a CI wait; check live addresses with
+`participants()` or `switchboard-relay participants`. The message is still queued durably, so a
+correctly‑named recipient gets it later — and `ask()` can simply be timing out because the peer
+hasn't reached its next turn yet (`idle_seconds` tells you how long it's been away).
 
 **"register() gave me a `session-…` name I didn't choose."**
 No `name` was passed and none could be derived, so one was assigned. That's fine for a worker that
