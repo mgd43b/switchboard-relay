@@ -36,7 +36,16 @@ from typing import Optional
 # seconds drops out of participants(). Overridable via $SWITCHBOARD_TTL and, per
 # call, via the ttl argument. Any tool call by an identified participant is a
 # heartbeat that refreshes last_seen, so only genuinely idle sessions expire.
-DEFAULT_TTL_SECONDS = 300.0
+#
+# Sized for how long a live session goes heads-down *between* switchboard calls,
+# not for how fast a dead one should disappear. A peer running a build, a test
+# suite, or a CI wait makes no switchboard call for twenty minutes while being
+# entirely alive, and expiring it there is the expensive direction to be wrong:
+# broadcast() skips non-live recipients outright, so the message is never queued
+# at all, and send() reports a false no_live_recipient. Erring long only leaves a
+# stale row -- a session that really did leave lingers for one window and then
+# goes, and unregister() drops it immediately on a clean exit.
+DEFAULT_TTL_SECONDS = 1800.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS participants (

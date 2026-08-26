@@ -1053,7 +1053,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--ttl",
         type=float,
         default=None,
-        help="Participant liveness window in seconds (default: $SWITCHBOARD_TTL or 300).",
+        help="Participant liveness window in seconds (default: $SWITCHBOARD_TTL or 1800).",
     )
     parser.add_argument("--version", action="store_true", help="Print version and exit.")
 

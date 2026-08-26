@@ -128,6 +128,15 @@ def test_default_ttl_applied_when_unspecified(store):
     assert store.participants(now=DEFAULT_TTL_SECONDS + 1) == []
 
 
+def test_default_ttl_survives_a_long_heads_down_stretch(store):
+    """The default window is sized for a live peer that goes quiet, not for how
+    fast a dead one disappears: a session running a build or waiting on CI makes
+    no switchboard call for twenty minutes and must still count as live, because
+    broadcast() skips non-live recipients outright and never queues to them."""
+    store.register("busy", now=0.0)
+    assert [p.name for p in store.participants(now=20 * 60.0)] == ["busy"]
+
+
 def test_touch_refreshes_liveness(store):
     store.register("x", now=0.0)
     store.touch("x", now=290.0)
