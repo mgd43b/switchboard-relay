@@ -1099,7 +1099,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--ttl",
         type=float,
         default=None,
-        help="Participant liveness window in seconds (default: $SWITCHBOARD_TTL or 1800).",
+        # Formatted from the constant so the help text can't drift from the
+        # real default the way a hardcoded number would.
+        help=(
+            "Participant liveness window in seconds "
+            f"(default: $SWITCHBOARD_TTL or {DEFAULT_TTL_SECONDS:g})."
+        ),
     )
     parser.add_argument("--version", action="store_true", help="Print version and exit.")
 
