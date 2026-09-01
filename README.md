@@ -689,7 +689,7 @@ Source layout — each module is small and single‑purpose:
 
 - [`store.py`](src/switchboard_relay/store.py) — the durable SQLite store (registry + mailboxes). Pure and clock‑free.
 - [`board.py`](src/switchboard_relay/board.py) — board resolution: which switchboard a session joins (env / git worktree → DB path). Pure and transport‑free.
-- [`server.py`](src/switchboard_relay/server.py) — the FastMCP server: identity binding, ten tools, polling/standby loops, and best‑effort push.
+- [`server.py`](src/switchboard_relay/server.py) — the MCP server: identity binding, ten tools, polling/standby loops, and best‑effort push.
 
 Tests are split into three tiers:
 

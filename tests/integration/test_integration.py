@@ -1,6 +1,6 @@
 """Integration tests: drive the switchboard-relay tools over a real MCP transport.
 
-Two independent client sessions connect to one FastMCP server through the SDK's
+Two independent client sessions connect to one MCPServer through the SDK's
 in-memory client/server pipe, so each has its own MCP session (distinct
 identity) while sharing the same durable store -- exactly the shape of two
 Codex, Claude Code, or mixed MCP sessions talking through switchboard-relay.
@@ -13,10 +13,45 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 
-from mcp.shared.memory import create_connected_server_and_client_session as connect
+import anyio
+from mcp.client.session import ClientSession
+from mcp.shared.memory import create_client_server_memory_streams
 
 from switchboard_relay.server import build_server
 from switchboard_relay.store import Store
+
+
+@asynccontextmanager
+async def connect(mcp):
+    """Yield an initialized ClientSession wired to `mcp` over an in-memory pipe.
+
+    mcp 2.x dropped `mcp.shared.memory.create_connected_server_and_client_session`
+    with no replacement, so we rebuild it on `create_client_server_memory_streams`,
+    the primitive that did survive. Each call is one distinct MCP session, which is
+    what these tests turn on: switchboard identity is per session, not per server.
+    """
+    async with create_client_server_memory_streams() as (client_streams, server_streams):
+        client_read, client_write = client_streams
+        server_read, server_write = server_streams
+        low = mcp._lowlevel_server  # the lowlevel Server that MCPServer wraps
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                lambda: low.run(
+                    server_read,
+                    server_write,
+                    low.create_initialization_options(),
+                    raise_exceptions=False,
+                )
+            )
+            try:
+                async with ClientSession(
+                    read_stream=client_read, write_stream=client_write
+                ) as session:
+                    await session.initialize()
+                    yield session
+            finally:
+                tg.cancel_scope.cancel()
 
 
 def make_board(tmp_path, *, ttl: float = 300.0):
@@ -25,8 +60,8 @@ def make_board(tmp_path, *, ttl: float = 300.0):
 
 def data(result):
     """Return a tool call's structured payload, asserting it did not error."""
-    assert not result.isError, _text(result)
-    return result.structuredContent
+    assert not result.is_error, _text(result)
+    return result.structured_content
 
 
 def _text(result):
@@ -84,19 +119,19 @@ async def test_tools_advertise_codex_approval_hints(tmp_path):
     async with sessions(mcp) as (client, _peer):
         tools = {tool.name: tool for tool in (await client.list_tools()).tools}
 
-        assert tools["participants"].annotations.readOnlyHint is False
-        assert tools["participants"].annotations.idempotentHint is False
-        assert tools["participants"].annotations.openWorldHint is False
-        assert tools["register"].annotations.readOnlyHint is False
-        assert tools["register"].annotations.idempotentHint is False
-        assert tools["standby"].annotations.idempotentHint is True
-        assert tools["codex_standby"].annotations.readOnlyHint is False
-        assert tools["codex_standby"].annotations.destructiveHint is False
-        assert tools["send"].annotations.destructiveHint is False
-        assert tools["inbox"].annotations.destructiveHint is True
-        assert tools["wait"].annotations.destructiveHint is True
-        assert tools["ask"].annotations.destructiveHint is True
-        assert tools["unregister"].annotations.idempotentHint is True
+        assert tools["participants"].annotations.read_only_hint is False
+        assert tools["participants"].annotations.idempotent_hint is False
+        assert tools["participants"].annotations.open_world_hint is False
+        assert tools["register"].annotations.read_only_hint is False
+        assert tools["register"].annotations.idempotent_hint is False
+        assert tools["standby"].annotations.idempotent_hint is True
+        assert tools["codex_standby"].annotations.read_only_hint is False
+        assert tools["codex_standby"].annotations.destructive_hint is False
+        assert tools["send"].annotations.destructive_hint is False
+        assert tools["inbox"].annotations.destructive_hint is True
+        assert tools["wait"].annotations.destructive_hint is True
+        assert tools["ask"].annotations.destructive_hint is True
+        assert tools["unregister"].annotations.idempotent_hint is True
 
 
 async def test_codex_standby_tools_work_over_the_wire(tmp_path):
@@ -276,7 +311,7 @@ async def test_unregistered_session_gets_helpful_error(tmp_path):
     mcp = make_board(tmp_path)
     async with sessions(mcp) as (a, _b):
         res = await a.call_tool("inbox", {})
-        assert res.isError
+        assert res.is_error
         assert "not registered" in _text(res).lower()
 
 
@@ -284,7 +319,7 @@ async def test_send_without_registration_errors(tmp_path):
     mcp = make_board(tmp_path)
     async with sessions(mcp) as (a, _b):
         res = await a.call_tool("send", {"to": "lead", "body": "hi"})
-        assert res.isError
+        assert res.is_error
 
 
 # -- turn injection: channel capability + self-watch over the wire ----------
@@ -305,7 +340,7 @@ async def test_channel_capability_advertised_and_push_is_harmless(tmp_path):
     async with sessions(mcp) as (lead, worker):
         # The capability the client sees on the wire (same field the SDK's own
         # capability checks read); its presence is what a channel client keys on.
-        caps = lead._server_capabilities
+        caps = lead.server_capabilities
         assert caps is not None and (caps.experimental or {}).get("claude/channel") == {}
 
         data(await lead.call_tool("register", {"name": "lead"}))
@@ -321,7 +356,7 @@ async def test_channel_capability_advertised_and_push_is_harmless(tmp_path):
 
 
 async def test_stdio_lifespan_starts_self_watch(tmp_path, monkeypatch):
-    """The FastMCP lifespan actually starts the self-watch loop under real run().
+    """The MCPServer lifespan actually starts the self-watch loop under real run().
 
     A stdio server with push enabled runs a background watcher (started by the
     server lifespan) that polls the shared board and self-nudges its own client

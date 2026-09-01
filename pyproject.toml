@@ -44,9 +44,10 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    # Official MCP Python SDK (provides FastMCP). Cap below 2.0: the v2 alpha
-    # reorganizes `mcp.server.fastmcp` and would break these imports.
-    "mcp>=1.9,<2",
+    # Official MCP Python SDK (provides MCPServer, formerly FastMCP). Floor at
+    # 2.0: v2 renamed `mcp.server.fastmcp` -> `mcp.server.mcpserver` and dropped
+    # `create_connected_server_and_client_session`, so 1.x no longer imports.
+    "mcp>=2,<3",
 ]
 
 [project.optional-dependencies]
