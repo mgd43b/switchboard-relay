@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.9](https://github.com/mgd43b/switchboard-relay/compare/v0.2.8...v0.2.9) (2026-09-01)
+
+
+### Bug Fixes
+
+* **deps:** migrate to the mcp 2.x SDK (mcp&gt;=2,&lt;3) ([#33](https://github.com/mgd43b/switchboard-relay/issues/33)) ([6644c28](https://github.com/mgd43b/switchboard-relay/commit/6644c28d11e8436888ae71d27b0684e5a82f77f1))
+
+
+### Miscellaneous Chores
+
+* **packaging:** broaden metadata for discoverability ([#38](https://github.com/mgd43b/switchboard-relay/issues/38)) ([2234557](https://github.com/mgd43b/switchboard-relay/commit/223455734332ea188aac0222da00af0a21e5780d))
+
 ## [0.2.8](https://github.com/mgd43b/switchboard-relay/compare/v0.2.7...v0.2.8) (2026-08-26)
 
 
