@@ -50,8 +50,8 @@ def _params(db_path: str) -> StdioServerParameters:
 
 
 def _data(result):
-    assert not result.isError, result.content[0].text if result.content else result
-    return result.structuredContent
+    assert not result.is_error, result.content[0].text if result.content else result
+    return result.structured_content
 
 
 async def test_two_real_processes_round_trip(tmp_path):

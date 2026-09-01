@@ -1,6 +1,6 @@
 """Durable SQLite-backed store for switchboard.
 
-This module is intentionally free of any MCP / FastMCP / transport concerns so
+This module is intentionally free of any MCP / MCPServer / transport concerns so
 it can be unit-tested in isolation. All time is passed in explicitly (``now``)
 and TTL is a parameter, so the store contains no clocks and no sleeps -- the
 server layer owns wall-clock time and identity.

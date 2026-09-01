@@ -14,6 +14,7 @@ import time
 
 import anyio
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from switchboard_relay.server import (
     _CHANNEL_CAPABILITY,
@@ -32,18 +33,35 @@ from switchboard_relay.store import Store
 _META_KEY_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
-class FakeSession:
-    """Stand-in for an MCP ServerSession that records pushed notifications."""
+class FakeConnection:
+    """Stand-in for mcp.server.connection.Connection: records pushed nudges."""
 
     def __init__(self):
-        self.sent: list = []
+        self.sent: list[dict] = []
 
-    async def send_notification(self, notification, related_request_id=None):
-        self.sent.append(notification)
+    async def notify(self, method, params, opts=None):
+        self.sent.append({"method": method, "params": params})
+
+
+class FakeSession:
+    """Stand-in for a per-request ServerSession.
+
+    In mcp 2.x this object is rebuilt for every call and carries the long-lived
+    Connection, which is what switchboard keys identity on -- so the fake mirrors
+    that shape. ``sent`` reads through to the connection because "what got pushed
+    to this session's client" is still the thing the tests care about.
+    """
+
+    def __init__(self, connection=None):
+        self._connection = FakeConnection() if connection is None else connection
+
+    @property
+    def sent(self) -> list:
+        return self._connection.sent
 
 
 class FakeCtx:
-    """Minimal Context: identity is keyed off `id(ctx.session)`."""
+    """Minimal Context: identity is keyed off `id(ctx.session._connection)`."""
 
     def __init__(self, session: FakeSession):
         self.session = session
@@ -62,7 +80,7 @@ def _ctx() -> FakeCtx:
 
 
 def test_resolve_requires_registration(board):
-    with pytest.raises(ValueError, match="not registered"):
+    with pytest.raises(ToolError, match="not registered"):
         board.inbox(_ctx())
 
 
@@ -180,7 +198,7 @@ def test_send_rejects_oversized_body(tmp_path):
     sb = _sb(tmp_path, max_body=10)
     ctx = _ctx()
     sb.register(ctx, "lead")
-    with pytest.raises(ValueError, match="over the 10-byte limit"):
+    with pytest.raises(ToolError, match="over the 10-byte limit"):
         sb.send(ctx, "worker", "x" * 11)
 
 
@@ -202,9 +220,9 @@ def test_ask_and_broadcast_also_enforce_body_cap(tmp_path):
     sb = _sb(tmp_path, max_body=5)
     ctx = _ctx()
     sb.register(ctx, "lead", "worker")
-    with pytest.raises(ValueError, match="byte limit"):
+    with pytest.raises(ToolError, match="byte limit"):
         _run(sb.ask, ctx, "peer", "toolong", 0.05)
-    with pytest.raises(ValueError, match="byte limit"):
+    with pytest.raises(ToolError, match="byte limit"):
         _run(sb.broadcast, ctx, "toolong")
 
 
@@ -242,10 +260,10 @@ def test_conns_evicted_when_participant_expires(tmp_path, monkeypatch):
     sb = Switchboard(Store(tmp_path / "sb.db"), ttl=0.02)
     ctx = _ctx()
     sb.register(ctx, "ghost")
-    assert id(ctx.session) in sb._conns
+    assert id(ctx.session._connection) in sb._conns
     now[0] += 0.05  # move ghost's participant past the tiny TTL deterministically
     sb.participants(_ctx())  # any participants()/register triggers the sweep
-    assert id(ctx.session) not in sb._conns
+    assert id(ctx.session._connection) not in sb._conns
 
 
 def test_register_and_participants_report_board(tmp_path):
@@ -264,7 +282,7 @@ def test_board_omitted_from_payload_when_unset(board):
 def test_send_rejects_empty_recipient(board):
     ctx = _ctx()
     board.register(ctx, "lead")
-    with pytest.raises(ValueError, match="non-empty address"):
+    with pytest.raises(ToolError, match="non-empty address"):
         board.send(ctx, "", "body")
 
 
@@ -313,7 +331,7 @@ def test_standby_opt_in_survives_reregister_and_can_be_disabled(board):
     board.register(ctx, "lead")
     assert board.standby(ctx) == {"ok": True, "you": "lead", "standby": True}
     board.register(ctx, "lead", "coordinator")
-    assert board._conns[id(ctx.session)].standby is True
+    assert board._conns[id(ctx.session._connection)].standby is True
     assert board.standby(ctx, False) == {"ok": True, "you": "lead", "standby": False}
 
 
@@ -380,7 +398,7 @@ async def test_ask_returns_reply_when_it_arrives(board):
 def test_ask_rejects_empty_recipient(board):
     ctx = _ctx()
     board.register(ctx, "worker")
-    with pytest.raises(ValueError, match="non-empty address"):
+    with pytest.raises(ToolError, match="non-empty address"):
         _run(board.ask, ctx, "", "q")
 
 
@@ -421,7 +439,7 @@ def test_unregister_removes_from_registry(board):
     assert out == {"ok": True, "was_registered": True, "you": "lead"}
     # Gone from the live list, and identity no longer resolves.
     assert board.participants(_ctx())["participants"] == []
-    with pytest.raises(ValueError, match="not registered"):
+    with pytest.raises(ToolError, match="not registered"):
         board.inbox(ctx)
 
 
@@ -527,7 +545,7 @@ def test_build_server_declares_channel_capability():
     # Turn injection only works if the server advertises the Channels capability
     # in its initialize response; both transports build options via this call.
     mcp = build_server(Store(":memory:"), ttl=300, board="cap")
-    caps = mcp._mcp_server.create_initialization_options().capabilities
+    caps = mcp._lowlevel_server.create_initialization_options().capabilities
     # Assert the key is present and exactly {} rather than exact-matching the
     # whole dict, so this doesn't break if the SDK starts advertising other
     # experimental capabilities by default.
@@ -536,7 +554,7 @@ def test_build_server_declares_channel_capability():
     assert caps.tools is not None
     # Our capability is forced last: a caller can't override it to a non-{}
     # value, but their other experimental capabilities are preserved.
-    caps2 = mcp._mcp_server.create_initialization_options(
+    caps2 = mcp._lowlevel_server.create_initialization_options(
         experimental_capabilities={_CHANNEL_CAPABILITY: {"bogus": 1}, "other": {}}
     ).capabilities
     assert caps2.experimental[_CHANNEL_CAPABILITY] == {}
@@ -578,7 +596,7 @@ def test_watch_tick_nudges_local_session_and_leaves_message(board):
     board.store.send("lead", "hello", sender="worker", reply_to=41, now=time.time())
 
     assert _tick(board) == 1
-    dumped = ctx.session.sent[0].model_dump(by_alias=True, mode="json", exclude_none=True)
+    dumped = ctx.session.sent[0]
     assert dumped["method"] == _CHANNEL_METHOD
     meta = dumped["params"]["meta"]
     assert meta["msg_from"] == "worker"
@@ -606,7 +624,7 @@ def test_watch_tick_role_message_reports_role_as_msg_to(board):
     board.register(ctx, "worker:7", "worker")
     board.store.send("worker", "any worker?", sender="lead", now=time.time())  # to the role
     assert _tick(board) == 1
-    dumped = ctx.session.sent[0].model_dump(by_alias=True, mode="json", exclude_none=True)
+    dumped = ctx.session.sent[0]
     assert dumped["params"]["meta"]["msg_to"] == "worker"
 
 
@@ -662,10 +680,10 @@ def test_watch_tick_best_effort_on_bad_session(board):
     board._push_enabled = True
 
     class Boom:
-        async def send_notification(self, *a, **k):
+        async def notify(self, *a, **k):
             raise RuntimeError("stream closed")
 
-    ctx = FakeCtx(Boom())
+    ctx = FakeCtx(FakeSession(Boom()))
     board.register(ctx, "lead")
     board.store.send("lead", "hi", sender="worker", now=time.time())
     assert _tick(board) == 0  # push failed -> not counted, but no raise

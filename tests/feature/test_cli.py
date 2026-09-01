@@ -1,6 +1,6 @@
 """Feature tests for the CLI entry point and env-var configuration.
 
-These drive ``main()`` with a fake FastMCP so the blocking ``mcp.run()`` call is
+These drive ``main()`` with a fake MCPServer so the blocking ``mcp.run()`` call is
 observed rather than actually started, plus the ``$SWITCHBOARD_TTL`` parsing.
 """
 

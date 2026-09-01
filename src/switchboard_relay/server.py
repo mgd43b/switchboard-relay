@@ -1,4 +1,4 @@
-"""FastMCP server exposing the switchboard-relay tools.
+"""MCP server exposing the switchboard-relay tools.
 
 Runs over **stdio** so every Codex, Claude Code, or other local MCP session
 spawns its own process. Durability and cross-session delivery come from a shared
@@ -33,7 +33,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 import anyio
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from switchboard_relay.board import boards_dir, describe_target, legacy_db_path
@@ -78,16 +79,16 @@ _CHANNEL_CAPABILITY = "claude/channel"
 # participants() refreshes presence, inbox()/wait()/ask() can drain durable rows,
 # and send()/broadcast() create externally visible messages.
 _LOCAL_WRITE = ToolAnnotations(
-    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+    read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False
 )
 _LOCAL_IDEMPOTENT_WRITE = ToolAnnotations(
-    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
+    read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False
 )
 _LOCAL_DESTRUCTIVE = ToolAnnotations(
-    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
+    read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=False
 )
 _LOCAL_IDEMPOTENT_DESTRUCTIVE = ToolAnnotations(
-    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
+    read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False
 )
 
 
@@ -208,11 +209,11 @@ def _clamp_timeout(value: Any, *, default: float = 30.0, cap: float = 3600.0) ->
 
 @dataclass
 class _Conn:
-    """One connected participant: an address bound to a live MCP session."""
+    """One connected participant: an address bound to a live MCP connection."""
 
     name: str
     role: str
-    session: Any  # mcp.server.session.ServerSession
+    connection: Any  # mcp.server.connection.Connection
     standby: bool = False
 
 
@@ -244,8 +245,8 @@ class Switchboard:
         # opportunistically; max_body caps a single send. <= 0 disables either.
         self.msg_ttl = msg_ttl
         self.max_body = max_body
-        # id(ctx.session) -> _Conn. Keyed by object identity because one
-        # ServerSession maps to exactly one client connection for its lifetime.
+        # id(Connection) -> _Conn. Keyed by object identity because one
+        # Connection maps to exactly one client connection for its lifetime.
         self._conns: dict[int, _Conn] = {}
         # Optional identity seeded from the environment so scripted worker
         # sessions can be launched pre-addressed (SWITCHBOARD_NAME/ROLE) without
@@ -257,7 +258,7 @@ class Switchboard:
         # subscribed session); $SWITCHBOARD_PUSH=1 enables it. Tests set this
         # attribute directly. See _resolve_push() and _watch_loop.
         self._push_enabled = _resolve_push()
-        # Per-session high-water mark (id(session) -> highest message id already
+        # Per-connection high-water mark (id(Connection) -> highest message id already
         # nudged about) so the stdio watcher nudges once per new message, not on
         # every poll. See _watch_tick.
         self._watch_hw: dict[int, int] = {}
@@ -270,13 +271,45 @@ class Switchboard:
 
     # -- identity -----------------------------------------------------------
 
+    @staticmethod
+    def _connection(ctx: Context):
+        """Return the stable per-client ``Connection`` behind this request.
+
+        Identity is the whole game here, so it has to key off an object that
+        lives exactly as long as the client's connection. In mcp 2.x that is
+        ``Connection``; ``ctx.session`` is a per-request ``ServerSession``
+        facade built fresh for every call, so keying on it would give each tool
+        call a different identity. The SDK exposes no public accessor, hence the
+        private attribute -- fail loudly rather than silently handing back
+        something short-lived and merging two participants into one mailbox.
+        """
+        try:
+            return ctx.session._connection
+        except AttributeError as exc:  # pragma: no cover - SDK contract change
+            raise RuntimeError(
+                "switchboard-relay could not find the per-connection object on "
+                "this MCP session (expected ServerSession._connection from "
+                "mcp>=2). The installed MCP SDK is incompatible."
+            ) from exc
+
+    def _sid(self, ctx: Context) -> int:
+        """Identity key for this connection.
+
+        ``id()`` is only safe while something holds the object alive, otherwise
+        CPython can recycle the address onto an unrelated connection. The
+        ``_Conn`` we store keeps a reference for exactly as long as the key is
+        in ``_conns``, which is what makes this sound.
+        """
+        return id(self._connection(ctx))
+
     def _bind(self, ctx: Context, name: str, role: str) -> _Conn:
-        sid = id(ctx.session)
+        connection = self._connection(ctx)
+        sid = id(connection)
         previous = self._conns.get(sid)
         conn = _Conn(
             name=name,
             role=role,
-            session=ctx.session,
+            connection=connection,
             standby=previous.standby if previous is not None else False,
         )
         self._conns[sid] = conn
@@ -284,7 +317,7 @@ class Switchboard:
 
     def _resolve(self, ctx: Context) -> _Conn:
         """Return the caller's bound identity, or raise a helpful error."""
-        conn = self._conns.get(id(ctx.session))
+        conn = self._conns.get(self._sid(ctx))
         if conn is not None:
             return conn
         if self._default_name:
@@ -293,7 +326,7 @@ class Switchboard:
                 self._default_name, self._default_role, now=_now(), ccd_session_id=self._ccd_id()
             )
             return self._bind(ctx, self._default_name, self._default_role)
-        raise ValueError(
+        raise ToolError(
             'This session is not registered. Call register(name="...", '
             'role="...") first so switchboard knows which mailbox is yours '
             "(or launch with $SWITCHBOARD_NAME set)."
@@ -310,20 +343,11 @@ class Switchboard:
         falls back to the recipient polling inbox()/wait().
         """
         try:
-            import mcp.types as types
-            from pydantic import BaseModel, ConfigDict
-
-            class _ChannelParams(BaseModel):
-                model_config = ConfigDict(extra="allow")
-
-            notification = types.Notification[_ChannelParams, str](
-                method=_CHANNEL_METHOD,
-                params=_ChannelParams.model_validate({"content": content, "meta": meta}),
-            )
-            # related_request_id is intentionally omitted: this notification
-            # targets a *different* session than the current request, so it must
-            # ride the recipient's standalone stream, not our request's stream.
-            await conn.session.send_notification(notification)  # type: ignore[arg-type]
+            # Connection.notify() puts this on the recipient's standalone stream,
+            # which is what we want: the notification targets a *different*
+            # session than the one serving the current request, so it must not
+            # ride this request's stream.
+            await conn.connection.notify(_CHANNEL_METHOD, {"content": content, "meta": meta})
             return True
         except Exception:
             return False
@@ -374,7 +398,7 @@ class Switchboard:
 
     def participants(self, ctx: Context) -> dict:
         # A read is also a heartbeat for the caller, if registered.
-        conn = self._conns.get(id(ctx.session))
+        conn = self._conns.get(self._sid(ctx))
         if conn is not None:
             self.store.touch(conn.name, now=_now())
         payload = self._participants_payload()
@@ -402,7 +426,7 @@ class Switchboard:
         draining, so a hook interruption can never lose the message that should
         wake the next turn. The public ``standby()`` tool is the opt-in gate.
         """
-        conn = self._conns.get(id(ctx.session))
+        conn = self._conns.get(self._sid(ctx))
         if conn is None or not conn.standby:
             return {"continue": True}
 
@@ -438,7 +462,7 @@ class Switchboard:
         conn = self._resolve(ctx)
         to = (to or "").strip()
         if not to:
-            raise ValueError("`to` must be a non-empty address (a participant name or role).")
+            raise ToolError("`to` must be a non-empty address (a participant name or role).")
         self._check_body(body)
         now = _now()
         mid = self.store.send(to, body, sender=conn.name, reply_to=reply_to, now=now)
@@ -660,7 +684,7 @@ class Switchboard:
         conn = self._resolve(ctx)
         to = (to or "").strip()
         if not to:
-            raise ValueError("`to` must be a non-empty address (a participant name or role).")
+            raise ToolError("`to` must be a non-empty address (a participant name or role).")
         self._check_body(body)
         now = _now()
         # Note whether anyone is live to answer *before* we send -- used to explain
@@ -740,7 +764,7 @@ class Switchboard:
 
     def unregister(self, ctx: Context) -> dict:
         """Remove the caller from the participant registry (a clean leave)."""
-        conn = self._conns.pop(id(ctx.session), None)
+        conn = self._conns.pop(self._sid(ctx), None)
         name = conn.name if conn is not None else (self._default_name or None)
         if not name:
             return {"ok": True, "was_registered": False, "you": None}
@@ -790,7 +814,7 @@ class Switchboard:
         if self.max_body > 0 and isinstance(body, str):
             n = len(body.encode("utf-8"))
             if n > self.max_body:
-                raise ValueError(
+                raise ToolError(
                     f"Message body is {n} bytes, over the {self.max_body}-byte limit "
                     "(set $SWITCHBOARD_MAX_BODY to change it, or 0 to disable). Send a "
                     "shorter message, or a reference/path instead of inlining large content."
@@ -849,24 +873,24 @@ class Switchboard:
         return out
 
 
-# -- FastMCP wiring ---------------------------------------------------------
+# -- MCPServer wiring -------------------------------------------------------
 
 # Tool docstrings are what MCP clients read to decide when/how to call each
 # tool, so they double as user-facing descriptions. Keep them action-oriented.
 
 
-def _declare_channel_capability(mcp: FastMCP) -> None:
+def _declare_channel_capability(mcp: MCPServer) -> None:
     """Advertise the ``claude/channel`` capability in the initialize response.
 
     Turn injection only happens if the recipient's client saw this experimental
     capability at connect time and registered a listener for ``_CHANNEL_METHOD``.
-    FastMCP builds its InitializationOptions via the underlying low-level
+    MCPServer builds its InitializationOptions via the underlying low-level
     server's ``create_initialization_options()`` (the stdio transport routes
     through it and calls it with no arguments), which takes an
     ``experimental_capabilities`` dict. We wrap that bound method to inject ours
     while preserving anything an explicit caller passes.
     """
-    low = mcp._mcp_server  # the mcp.server.lowlevel.Server FastMCP wraps
+    low = mcp._lowlevel_server  # the mcp.server.lowlevel.Server MCPServer wraps
     original = low.create_initialization_options
 
     def with_channel_capability(notification_options=None, experimental_capabilities=None):
@@ -885,7 +909,7 @@ def build_server(
     board: str = "",
     msg_ttl: Optional[float] = None,
     max_body: Optional[int] = None,
-) -> FastMCP:
+) -> MCPServer:
     store = store if store is not None else Store()
     sb = Switchboard(
         store,
@@ -898,7 +922,7 @@ def build_server(
     )
 
     @asynccontextmanager
-    async def _lifespan(_server: FastMCP):
+    async def _lifespan(_server: MCPServer):
         # Host the stdio self-watch task for the server's lifetime so a stdio
         # session gets turn injection without a daemon. It no-ops unless push is
         # enabled in stdio mode (see Switchboard._watch_loop), so attaching it
@@ -910,7 +934,7 @@ def build_server(
             finally:
                 tg.cancel_scope.cancel()
 
-    mcp = FastMCP(
+    mcp = MCPServer(
         "switchboard-relay",
         instructions=(
             "Local durable message bus for independent Codex, Claude Code, and other MCP "
