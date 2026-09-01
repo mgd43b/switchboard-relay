@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.8](https://github.com/mgd43b/switchboard-relay/compare/v0.2.7...v0.2.8) (2026-08-26)
+
+
+### Features
+
+* **server:** make liveness mean "still connected", not "recently chatty" ([#36](https://github.com/mgd43b/switchboard-relay/issues/36)) ([b424773](https://github.com/mgd43b/switchboard-relay/commit/b4247737394aa03199ce1d09902be56cc957685b))
+
 ## [0.2.7](https://github.com/mgd43b/switchboard-relay/compare/v0.2.6...v0.2.7) (2026-08-24)
 
 

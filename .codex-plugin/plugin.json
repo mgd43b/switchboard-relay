@@ -1,6 +1,6 @@
 {
   "name": "switchboard-relay",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "A local durable message bus for independent Codex, Claude Code, and other MCP client sessions.",
   "author": {
     "name": "mgd43b",
@@ -11,11 +11,15 @@
   "license": "MIT",
   "keywords": [
     "mcp",
+    "mcp-server",
     "messaging",
+    "message-bus",
     "inter-session",
     "codex",
     "claude-code",
-    "agents"
+    "agents",
+    "multi-agent",
+    "agent-communication"
   ],
   "mcpServers": "./.mcp.json",
   "interface": {

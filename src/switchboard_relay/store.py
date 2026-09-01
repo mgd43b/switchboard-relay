@@ -7,11 +7,20 @@ server layer owns wall-clock time and identity.
 
 Data model
 ----------
-participants(name PK, role, last_seen, registered_at)
+participants(name PK, role, last_seen, last_active, registered_at)
     A participant is an *address*. ``name`` is the primary address
     ("lead", "worker:feature-x"); ``role`` is an optional secondary address
-    shared by a group of participants ("worker"). ``last_seen`` drives the TTL
-    liveness window surfaced by :meth:`Store.participants`.
+    shared by a group of participants ("worker").
+
+    Two clocks, deliberately separate. ``last_seen`` answers "is this session
+    still there" and drives the TTL window surfaced by
+    :meth:`Store.participants`; it is refreshed by any tool call *and* by the
+    server's connection keepalive, because a connected stdio session is proof
+    of life even while it is heads-down on work of its own.
+    ``last_active`` answers "when did this peer last actually use switchboard"
+    and is refreshed only by a real call, never by the keepalive -- it is what
+    ``idle_seconds`` reports, and keeping it separate is what stops that number
+    from collapsing to zero for every connected session.
 
 messages(id PK, recipient, sender, body, reply_to, created_at)
     A message row is stored with ``recipient`` set to the *literal* ``to``
@@ -36,13 +45,23 @@ from typing import Optional
 # seconds drops out of participants(). Overridable via $SWITCHBOARD_TTL and, per
 # call, via the ttl argument. Any tool call by an identified participant is a
 # heartbeat that refreshes last_seen, so only genuinely idle sessions expire.
-DEFAULT_TTL_SECONDS = 300.0
+#
+# Sized for how long a live session goes heads-down *between* switchboard calls,
+# not for how fast a dead one should disappear. A peer running a build, a test
+# suite, or a CI wait makes no switchboard call for twenty minutes while being
+# entirely alive, and expiring it there is the expensive direction to be wrong:
+# broadcast() skips non-live recipients outright, so the message is never queued
+# at all, and send() reports a false no_live_recipient. Erring long only leaves a
+# stale row -- a session that really did leave lingers for one window and then
+# goes, and unregister() drops it immediately on a clean exit.
+DEFAULT_TTL_SECONDS = 1800.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS participants (
     name            TEXT PRIMARY KEY,
     role            TEXT NOT NULL DEFAULT '',
     last_seen       REAL NOT NULL,
+    last_active     REAL NOT NULL DEFAULT 0,
     registered_at   REAL NOT NULL,
     ccd_session_id  TEXT NOT NULL DEFAULT ''
 );
@@ -75,7 +94,10 @@ def default_db_path() -> Path:
 class Participant:
     name: str
     role: str
+    # Liveness clock (keepalive-refreshed) vs idle clock (real calls only).
+    # See the module docstring for why these are separate.
     last_seen: float
+    last_active: float
     registered_at: float
     # The CCD (Claude Desktop) session id used to inject a turn into this
     # participant via ccd_session_mgmt.send_message. Empty unless the session
@@ -88,6 +110,7 @@ class Participant:
             "name": self.name,
             "role": self.role,
             "last_seen": self.last_seen,
+            "last_active": self.last_active,
             "registered_at": self.registered_at,
         }
 
@@ -224,15 +247,17 @@ class Store:
             # ccd_session_id when the refresh omits one.
             _with_lock_retry(
                 lambda: conn.execute(
-                    "INSERT INTO participants (name, role, last_seen, registered_at, "
-                    "  ccd_session_id) VALUES (:name, :role, :now, :now, :ccd) "
+                    "INSERT INTO participants (name, role, last_seen, last_active, "
+                    "  registered_at, ccd_session_id) "
+                    "VALUES (:name, :role, :now, :now, :now, :ccd) "
                     "ON CONFLICT(name) DO UPDATE SET "
                     "  role = CASE WHEN excluded.role != '' "
                     "              THEN excluded.role ELSE participants.role END, "
                     "  ccd_session_id = CASE WHEN excluded.ccd_session_id != '' "
                     "              THEN excluded.ccd_session_id "
                     "              ELSE participants.ccd_session_id END, "
-                    "  last_seen = excluded.last_seen",
+                    "  last_seen = excluded.last_seen, "
+                    "  last_active = excluded.last_active",
                     {"name": name, "role": role, "now": now, "ccd": ccd},
                 )
             )
@@ -244,6 +269,7 @@ class Store:
             name=name,
             role=row["role"],
             last_seen=now,
+            last_active=now,
             registered_at=row["registered_at"],
             ccd_session_id=row["ccd_session_id"],
         )
@@ -262,10 +288,34 @@ class Store:
             return (cur.rowcount or 0) > 0
 
     def touch(self, name: str, *, now: float) -> None:
-        """Refresh a participant's ``last_seen`` if it exists (a heartbeat).
+        """Refresh both of a participant's clocks if it exists (a heartbeat).
 
+        A tool call is a deliberate act by the participant, so it bumps
+        ``last_active`` (the idle clock) as well as ``last_seen`` (liveness).
         No-op for an unregistered name. Used by the server on every tool call
         so active sessions stay live without an explicit re-register.
+        """
+        if not name:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE participants SET last_seen = ?, last_active = ? WHERE name = ?",
+                (now, now, name),
+            )
+
+    def keepalive(self, name: str, *, now: float) -> None:
+        """Refresh only ``last_seen`` -- the liveness clock -- for ``name``.
+
+        The connection-level counterpart to :meth:`touch`, called by the
+        server's watch loop for every *connected* session. Each session owns its
+        own switchboard process, so the process existing at all is proof that
+        the session does: a peer that is building, running a suite, or waiting
+        on CI makes no switchboard call for many minutes and must not be
+        declared dead, because broadcast() skips non-live recipients outright.
+
+        Deliberately leaves ``last_active`` alone. That is what keeps
+        ``idle_seconds`` meaning "how long since this peer last used
+        switchboard" instead of collapsing to zero for everyone connected.
         """
         if not name:
             return
@@ -273,12 +323,19 @@ class Store:
             conn.execute("UPDATE participants SET last_seen = ? WHERE name = ?", (now, name))
 
     def participants(self, *, now: float, ttl: float = DEFAULT_TTL_SECONDS) -> list[Participant]:
-        """Return participants seen within ``ttl`` seconds of ``now``, freshest first."""
+        """Return participants live within ``ttl`` seconds of ``now``, freshest first.
+
+        Liveness filters on ``last_seen``; the ordering is by ``last_active``,
+        because the keepalive lifts every connected session's ``last_seen`` to
+        roughly the same instant and sorting on it would be close to arbitrary.
+        "Freshest" is most-recently-*active* first, which is what a caller
+        scanning the list for someone to talk to actually wants.
+        """
         cutoff = now - ttl
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT name, role, last_seen, registered_at, ccd_session_id FROM participants "
-                "WHERE last_seen >= ? ORDER BY last_seen DESC",
+                "SELECT name, role, last_seen, last_active, registered_at, ccd_session_id "
+                "FROM participants WHERE last_seen >= ? ORDER BY last_active DESC",
                 (cutoff,),
             ).fetchall()
         return [
@@ -286,6 +343,7 @@ class Store:
                 name=r["name"],
                 role=r["role"],
                 last_seen=r["last_seen"],
+                last_active=r["last_active"],
                 registered_at=r["registered_at"],
                 ccd_session_id=r["ccd_session_id"],
             )
@@ -481,13 +539,22 @@ def _migrate_participants(conn: sqlite3.Connection) -> None:
     """Add columns introduced after the original schema to an existing DB.
 
     ``CREATE TABLE IF NOT EXISTS`` is a no-op on a database created by an older
-    version, so a new column has to be added explicitly. Currently just
-    ``ccd_session_id`` (turn injection on Desktop). Idempotent: checks the
-    column list first, and a fresh DB already has it from ``_SCHEMA``.
+    version, so a new column has to be added explicitly: ``ccd_session_id``
+    (turn injection on Desktop) and ``last_active`` (the idle clock, split out
+    from ``last_seen`` once the keepalive started refreshing the latter).
+    Idempotent: checks the column list first, and a fresh DB already has both
+    from ``_SCHEMA``.
     """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(participants)").fetchall()}
     if "ccd_session_id" not in cols:
         conn.execute("ALTER TABLE participants ADD COLUMN ccd_session_id TEXT NOT NULL DEFAULT ''")
+    if "last_active" not in cols:
+        # SQLite requires a constant default on ADD COLUMN, so seed from
+        # last_seen afterwards: before this column existed the two clocks were
+        # the same thing, and leaving legacy rows at 0 would report every one of
+        # them as idle since the epoch.
+        conn.execute("ALTER TABLE participants ADD COLUMN last_active REAL NOT NULL DEFAULT 0")
+        conn.execute("UPDATE participants SET last_active = last_seen")
 
 
 def _enable_wal(conn: sqlite3.Connection) -> None:

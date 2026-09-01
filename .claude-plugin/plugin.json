@@ -2,7 +2,7 @@
   "name": "switchboard-relay",
   "displayName": "Switchboard Relay",
   "description": "A shared, durable message bus so independent Claude Code and Codex sessions can talk across terminals without copy-pasting.",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "author": {
     "name": "mgd43b"
   },
@@ -11,11 +11,15 @@
   "license": "MIT",
   "keywords": [
     "mcp",
+    "mcp-server",
     "messaging",
+    "message-bus",
     "inter-session",
     "claude-code",
     "codex",
-    "agents"
+    "agents",
+    "multi-agent",
+    "agent-communication"
   ],
   "mcpServers": {
     "switchboard-relay": {
