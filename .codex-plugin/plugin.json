@@ -11,11 +11,15 @@
   "license": "MIT",
   "keywords": [
     "mcp",
+    "mcp-server",
     "messaging",
+    "message-bus",
     "inter-session",
     "codex",
     "claude-code",
-    "agents"
+    "agents",
+    "multi-agent",
+    "agent-communication"
   ],
   "mcpServers": "./.mcp.json",
   "interface": {
