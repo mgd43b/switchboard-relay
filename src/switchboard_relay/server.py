@@ -31,7 +31,9 @@ import os
 import re
 import secrets
 import signal
+import sys
 import time
+import weakref
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -327,6 +329,22 @@ class Switchboard:
         """
         return 0 if self._stdio else id(self._connection(ctx))
 
+    def _token(self, ctx: Context) -> str:
+        """Protocol token for this connection, kept for as long as it is open.
+
+        Keyed like ``_conns`` but held through a weak reference, so the token
+        outlives a ``_prune_conns`` eviction of a still-open connection yet is
+        never inherited by a later connection that reuses the same ``id()``.
+        """
+        connection = self._connection(ctx)
+        sid = 0 if self._stdio else id(connection)
+        entry = self._tokens.get(sid)
+        if entry is not None and (self._stdio or entry[0]() is connection):
+            return entry[1]
+        token = secrets.token_hex(16)
+        self._tokens[sid] = (weakref.ref(connection), token)
+        return token
+
     def _bind(self, ctx: Context, name: str, role: str) -> _Conn:
         connection = self._connection(ctx)
         sid = 0 if self._stdio else id(connection)
@@ -338,7 +356,7 @@ class Switchboard:
             standby=previous.standby
             if previous is not None
             else (self._automatic and os.getenv("SWITCHBOARD_AUTO_LISTEN", "1") != "0"),
-            token=self._tokens.setdefault(sid, secrets.token_hex(16)),
+            token=self._token(ctx),
         )
         self._conns[sid] = conn
         return conn
@@ -413,7 +431,7 @@ class Switchboard:
             role = self._default_role
         if previous and previous.name != name and self._active_receivers:
             raise ToolError("session_busy: finish outstanding receives before renaming")
-        token = self._tokens.setdefault(self._sid(ctx), secrets.token_hex(16))
+        token = self._token(ctx)
         try:
             name = self.protocol.claim(
                 token,
@@ -671,11 +689,9 @@ class Switchboard:
         last_keepalive = 0.0
         while True:
             now = _now()
-            if now - last_keepalive >= (
-                _KEEPALIVE_SECONDS
-                if not self._automatic
-                else min(_KEEPALIVE_SECONDS, self.protocol.lease / 3)
-            ):
+            # Refresh within a third of the lease in every mode: an idle
+            # session's lease must never lapse while its process still holds it.
+            if now - last_keepalive >= min(_KEEPALIVE_SECONDS, self.protocol.lease / 3):
                 last_keepalive = now
                 self._keepalive_conns()
             if self._push_enabled:
@@ -855,6 +871,7 @@ class Switchboard:
         removed = self.store.unregister(name)
         if conn:
             self.protocol.leave(conn.token, _now())
+            self._tokens.pop(self._sid(ctx), None)
         self._disabled = True
         return {"ok": True, "was_registered": removed, "you": name}
 
@@ -957,6 +974,10 @@ class Switchboard:
         stale = [sid for sid, c in self._conns.items() if c.name not in live_names]
         for sid in stale:
             del self._conns[sid]
+        if not self._stdio:  # stdio has one connection and one token for life
+            dead = [sid for sid, (ref, _) in self._tokens.items() if ref() is None]
+            for sid in dead:
+                del self._tokens[sid]
 
     def _participants_payload(self) -> list[dict]:
         now = _now()
@@ -1047,7 +1068,9 @@ def build_server(
                             signal.signal(signal.SIGTERM, signal.SIG_DFL)
                             os.kill(os.getpid(), signal.SIGTERM)
 
-            if stdio:
+            # Windows asyncio has no add_signal_handler, so the receiver would
+            # raise and take the lifespan down with it.
+            if stdio and sys.platform != "win32":
                 tg.start_soon(terminate)
             try:
                 yield {}
@@ -1175,6 +1198,12 @@ def build_server(
     @mcp.tool(annotations=_LOCAL_WRITE)
     async def host_standby(timeout_s: float = 900, ctx: Context = None) -> dict[str, Any]:
         """Host hook: peek for mail; on timeout explicitly re-arm then finish."""
+        # A session that cannot (re)register -- after unregister(), or with
+        # automatic joining off and no SWITCHBOARD_NAME -- just ends its turn.
+        if sb._conns.get(sb._sid(ctx)) is None and (
+            sb._disabled or (not sb._automatic and not sb._default_name)
+        ):
+            return {"continue": True}
         conn = sb._resolve(ctx)
         if not conn.standby:
             return {"continue": True}

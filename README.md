@@ -163,14 +163,19 @@ between turns by default. When a turn finishes, the hook waits up to 15 minutes 
 mail arrives, it continues the turn so the session can call `inbox()` and reply. If the window ends
 quietly, it continues the turn once so the session can re-arm with `standby(true)` and finish. Call
 `standby(false)` to stop listening for the rest of the session, or set `SWITCHBOARD_AUTO_LISTEN=0`
-to start with listening off. Until the hook is trusted, the session reports `listen_status`
-`configured` rather than `armed`. See the
+to start with listening off. A newly joined session reports `listen_status` `polling-only`. It
+becomes `configured` after `standby()` or a completed hook call, and reads `armed` only while the
+hook is waiting. A session still `polling-only` after a turn has finished means the hook did not
+run, usually because it is not yet trusted. See the
 [official Codex hooks documentation](https://learn.chatgpt.com/docs/hooks#stop).
 
 Direct `codex mcp add` installs only the MCP server, not the plugin hook. To listen between turns
 with a direct server named `switchboard_relay` (as in the commands below), add this `Stop` entry to
 `~/.codex/hooks.json` and review it with `/hooks`. The `server` value must match the name you gave
-`codex mcp add`:
+`codex mcp add`. Codex applies the shorter of the hook's `timeout` and the server's tool timeout, so
+also set `tool_timeout_sec` to at least 960 on that server entry (see the
+[`config.toml` example](#add-it-to-codex) below); the default is shorter than the hook's 900-second
+wait, and an idle hook would otherwise end without re-arming:
 
 ```json
 {
@@ -214,9 +219,10 @@ for durable mail. If mail arrives, it continues the turn so the session can read
 the window ends quietly, it continues the turn once so the session can re-arm with `standby(true)`
 and finish. An idle Claude session therefore takes about four short re-arm turns an hour. Call
 `standby(false)` to stop listening for the rest of the session, or set `SWITCHBOARD_AUTO_LISTEN=0`
-to start with listening off. Allowlist the `standby` tool (see
-[below](#run-the-tools-without-a-confirmation-prompt-optional)) so an unattended re-arm doesn't stop
-at a permission prompt.
+to start with listening off. Allowlist the `standby` tool under its plugin-scoped name,
+`mcp__plugin_switchboard-relay_switchboard-relay__standby` (see
+[below](#run-the-tools-without-a-confirmation-prompt-optional)), so an unattended re-arm doesn't
+stop at a permission prompt.
 
 The 15-minute window stays under Claude Code's 30-minute limit for an MCP call that sends no
 response or progress. Claude Code aborts such a call and reports an error (adjust it with the
@@ -351,6 +357,11 @@ server:
 { "permissions": { "allow": ["mcp__switchboard-relay"] } }
 ```
 
+That name covers a server you added yourself with `claude mcp add`. The plugin's server has a
+plugin-scoped name, so for a plugin install allowlist
+`mcp__plugin_switchboard-relay_switchboard-relay` instead (or prefix each tool below the same way,
+e.g. `mcp__plugin_switchboard-relay_switchboard-relay__standby`).
+
 <details>
 <summary>Or allowlist each tool individually</summary>
 
@@ -386,7 +397,7 @@ The tools, grouped by what you reach for:
 
 | Tool | Signature | What it does |
 |------|-----------|--------------|
-| `register` | `register(name?, role?)` | Claim or change this session's address. A session is already registered automatically under a unique generated address when it connects, so call this to pick an explicit `name` (e.g. `"lead"`). Explicit names are protected: if another live session holds the name, the call fails instead of sharing its mailbox. Registering a new name renames this session and drops the old one. Mail already queued for the old address stays queued under that address; it isn't moved. `role` is an optional shared group address. Returns the `board` you joined and the live participants. |
+| `register` | `register(name?, role?)` | Claim or change this session's address. A session is already registered automatically under a unique generated address when it connects, so call this to pick an explicit `name` (e.g. `"lead"`). Explicit names are protected: if another live session holds the name, the call fails instead of sharing its mailbox. Registering a new name renames this session and drops the old one. Mail already queued for the old address moves with you to the new one. `role` is an optional shared group address. Returns the `board` you joined and the live participants. |
 | `participants` | `participants()` | List the live sessions: `name`, `role`, `idle_seconds`. A session stays listed for as long as its process is connected, whatever it's busy with; `idle_seconds` separately reports how long it's been since that peer last *used* switchboard, so a quiet peer reads as live-but-idle rather than dropping off the list. |
 | `unregister` | `unregister()` | Leave the switchboard (drop out of `participants()`). Your mailbox is preserved for when you return. |
 

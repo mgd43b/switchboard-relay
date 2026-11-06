@@ -55,6 +55,7 @@ async def test_auto_join_charter_and_identity(tmp_path, modern):
         await call(a, "standby", {"enabled": False})
         assert (await call(a, "host_standby", {"timeout_s": 0})) == {"continue": True}
         await call(a, "unregister")
+        assert (await call(a, "host_standby", {"timeout_s": 0})) == {"continue": True}
         result = await a.call_tool("inbox", {})
         assert result.is_error
         await call(a, "register", {"name": "back"})
