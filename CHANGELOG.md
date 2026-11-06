@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.10](https://github.com/mgd43b/switchboard-relay/compare/v0.2.9...v0.2.10) (2026-11-06)
+
+
+### Features
+
+* discover sessions automatically and share board charters ([#40](https://github.com/mgd43b/switchboard-relay/issues/40)) ([5009967](https://github.com/mgd43b/switchboard-relay/commit/50099678fdeab71950f8f454f27b8cd29ffb20a1))
+
+
+### Bug Fixes
+
+* address review follow-ups from the session discovery change ([#42](https://github.com/mgd43b/switchboard-relay/issues/42)) ([02a947b](https://github.com/mgd43b/switchboard-relay/commit/02a947b152fa98e79f5e5f795452b19b7dff8766))
+
 ## [0.2.9](https://github.com/mgd43b/switchboard-relay/compare/v0.2.8...v0.2.9) (2026-09-01)
 
 
