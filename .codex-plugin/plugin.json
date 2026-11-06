@@ -22,6 +22,7 @@
     "agent-communication"
   ],
   "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/codex.json",
   "interface": {
     "displayName": "Switchboard Relay",
     "shortDescription": "Durable messaging between local coding-agent sessions",
@@ -34,7 +35,7 @@
     ],
     "websiteURL": "https://github.com/mgd43b/switchboard-relay",
     "defaultPrompt": [
-      "Register me as lead, enable standby, and reply to each sender.",
+      "Register me as lead, keep standby on, and reply to each sender.",
       "Register me as a worker and ask lead: <your question>.",
       "Show the live switchboard participants and current board."
     ]

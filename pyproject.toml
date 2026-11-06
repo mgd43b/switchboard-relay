@@ -47,7 +47,7 @@ dependencies = [
     # Official MCP Python SDK (provides MCPServer, formerly FastMCP). Floor at
     # 2.0: v2 renamed `mcp.server.fastmcp` -> `mcp.server.mcpserver` and dropped
     # `create_connected_server_and_client_session`, so 1.x no longer imports.
-    "mcp>=2,<3",
+    "mcp>=2.3,<3",
 ]
 
 [project.optional-dependencies]
@@ -77,6 +77,7 @@ packages = ["src/switchboard_relay"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 addopts = "-ra --cov=switchboard_relay --cov-report=term-missing --cov-fail-under=95"
 markers = [
     "unit: pure component tests (the store in isolation)",

@@ -31,7 +31,7 @@ def fake_build(monkeypatch, tmp_path):
     captured = {}
     fake = FakeMCP()
 
-    def _build(store, ttl=None, board="", msg_ttl=None, max_body=None):
+    def _build(store, ttl=None, board="", msg_ttl=None, max_body=None, **kwargs):
         captured["db_path"] = str(store.db_path)
         captured["ttl"] = ttl
         captured["board"] = board

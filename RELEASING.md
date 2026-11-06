@@ -65,3 +65,22 @@ sandbox):
 
 The script verifies the sdist is on PyPI, computes its SHA256, runs
 `brew update-python-resources`, optionally test-installs, then commits + pushes to the tap.
+
+## 0.3 upgrade and rollback
+
+Before upgrading a board, stop its sessions and back up its SQLite database with
+SQLite's backup API (include any custom `SWITCHBOARD_DB` location). Upgrade all
+participants together and restart them. Existing messages and custom charters
+are retained; legacy processes cannot enforce the new ownership rules.
+
+If rollback is needed, stop every participant before reinstalling 0.2.9. The old
+server ignores the additive `relay_*` tables. Retain the upgraded database to
+preserve messages received since the upgrade; restoring a backup discards those
+newer messages. Re-register the same current names to reach their mailboxes.
+
+Before publishing, validate both plugin installs in fresh Codex and Claude Code
+sessions: review/trust hooks, confirm automatic join, run bootstrap, exchange a
+threaded message, finish a turn and verify wake/re-arm, then disable standby.
+Record client versions, actual resolved MCP server names, and the observed tool
+result text. Automated manifest and stdio tests do not establish host hook trust
+or activation. Generic clients are polling-only without a host wake mechanism.

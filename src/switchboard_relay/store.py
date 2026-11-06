@@ -391,6 +391,7 @@ class Store:
         *,
         peek: bool = False,
         since: Optional[int] = None,
+        owner_token: Optional[str] = None,
     ) -> list[Message]:
         """Read messages addressed to ``name`` or ``role``.
 
@@ -407,6 +408,13 @@ class Store:
             params.append(int(since))
 
         with self._connect() as conn:
+            if (
+                owner_token
+                and not conn.execute(
+                    "SELECT 1 FROM relay_sessions WHERE token=? AND name=?", (owner_token, name)
+                ).fetchone()
+            ):
+                raise ValueError("session ownership lost")
             if peek:
                 rows = conn.execute(
                     f"SELECT id, recipient, sender, body, reply_to, created_at "
@@ -419,6 +427,13 @@ class Store:
             # concurrent drainers can never return the same message.
             conn.execute("BEGIN IMMEDIATE")
             try:
+                if (
+                    owner_token
+                    and not conn.execute(
+                        "SELECT 1 FROM relay_sessions WHERE token=? AND name=?", (owner_token, name)
+                    ).fetchone()
+                ):
+                    raise ValueError("session ownership lost")
                 rows = conn.execute(
                     f"SELECT id, recipient, sender, body, reply_to, created_at "
                     f"FROM messages WHERE {clause} ORDER BY id ASC",
@@ -434,7 +449,9 @@ class Store:
                 raise
         return [_row_to_message(r) for r in rows]
 
-    def take_reply(self, name: str, role: str = "", *, reply_to: int) -> Optional[Message]:
+    def take_reply(
+        self, name: str, role: str = "", *, reply_to: int, owner_token: Optional[str] = None
+    ) -> Optional[Message]:
         """Atomically remove and return the oldest reply addressed to this participant.
 
         A "reply" is a message to ``name``/``role`` whose ``reply_to`` matches the
@@ -447,6 +464,13 @@ class Store:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                if (
+                    owner_token
+                    and not conn.execute(
+                        "SELECT 1 FROM relay_sessions WHERE token=? AND name=?", (owner_token, name)
+                    ).fetchone()
+                ):
+                    raise ValueError("session ownership lost")
                 row = conn.execute(
                     f"SELECT id, recipient, sender, body, reply_to, created_at "
                     f"FROM messages WHERE recipient IN ({placeholders}) AND reply_to = ? "

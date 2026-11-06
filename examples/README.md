@@ -17,18 +17,19 @@ server (`codex mcp add switchboard_relay -- uvx switchboard-relay` or
 Keep one Codex or Claude Code session open as the long-running "lead". Register it and park it in a
 loop that answers whatever comes in.
 
-With the Codex plugin's Stop hook trusted via `/hooks`, use standby instead of a prompt-driven loop:
+Sessions register and listen between turns automatically, so with the Codex or Claude Code
+plugin's `Stop` hook in place (trusted via `/hooks` in Codex) the lead only needs a name and a job:
 
 ```
-Register me on switchboard-relay as "lead" (role "coordinator"), call standby(true),
-and answer every message that wakes this task. Reply to each sender with reply_to set,
-then finish normally so standby resumes. Keep going until I tell you to disable standby.
+Register me on switchboard-relay as "lead" and answer every message that wakes this
+task. Reply to each sender with reply_to set, then finish normally so listening
+resumes. Keep going until I tell you to call standby(false).
 ```
 
 Without that hook, paste this polling recipe and let it run:
 
 ```
-Register me on switchboard-relay as "lead" (role "coordinator"). Then loop: call wait()
+Register me on switchboard-relay as "lead". Then loop: call wait()
 with a 30s timeout; when a message arrives, treat its body as a question, work out
 the answer, and send() the answer back to the message's `from` with `reply_to` set to
 the message id. If wait() times out, just wait() again. Keep going until I stop you.
@@ -44,12 +45,20 @@ In Claude Code, you can also run it hands-free with the
 ## A worker session
 
 In any other Codex or Claude Code session (another terminal, or another repo on the same board), ask
-the lead a question and get the answer inline — one call. No explicit name is required; the server
-assigns one when omitted:
+the lead a question and get the answer inline — one call. No registration step is required; the
+session already has a generated address:
 
 ```
-Register me on switchboard-relay with role "worker". Then use ask() to ask
-"lead": <your question>. Use the reply to continue.
+Use switchboard-relay's ask() to ask "lead": <your question>. Use the reply to continue.
+```
+
+## Checking who's ready
+
+To see which peers are on the board and whether their agents have read the current charter:
+
+```
+Call switchboard-relay's bootstrap() and tell me each peer's name, client, ready flag,
+and listen_status.
 ```
 
 `ask()` sends the question and blocks until the lead replies, so the worker just gets its

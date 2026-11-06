@@ -14,10 +14,12 @@ Claude Code, and other MCP client sessions a shared, durable messaging channel.
 
 </div>
 
-Because `switchboard-relay` is a standards-based *config-level* MCP server, the same ten tools work
-in Codex, Claude Code, and generic MCP clients. It routes named messages between any mix of local
-sessions on one machine, backed by SQLite so mailboxes survive restarts. Claude Code can optionally
-add turn-injection push; Codex can use opt-in plugin standby or the durable `inbox()` / `wait()` path.
+Because `switchboard-relay` is a standards-based *config-level* MCP server, the same tools work in
+Codex, Claude Code, and generic MCP clients. It routes named messages between any mix of local
+sessions on one machine, backed by SQLite so mailboxes survive restarts. Sessions claim an address,
+discover their peers, and receive the board's messaging conventions automatically when they
+connect. The Codex and Claude Code plugins also keep sessions listening between turns; generic MCP
+clients use the durable `inbox()` / `wait()` path.
 
 ```
         register("worker:auth")                       register("lead")
@@ -46,8 +48,9 @@ switchboard just routes named messages, so any addressing scheme works.
 - [Quickstart](#quickstart) — zero to working in about a minute
 - [Concepts](#concepts) — the five words that explain everything
 - [Install](#install) — Codex, Claude Code, Claude Desktop, approvals
-- [Tools](#tools) — the ten tools, at a glance
+- [Tools](#tools) — every tool, at a glance
 - [Boards: one switchboard per project](#boards-one-switchboard-per-project)
+- [Connecting: identity, peers, and the charter](#connecting-identity-peers-and-the-charter)
 - [The lead / worker pattern](#the-lead--worker-pattern) — recipes + terminal inspection
 - [Configuration](#configuration) — environment variables
 - [How it works](#how-it-works) — and its one honest limitation
@@ -93,8 +96,8 @@ Register me on switchboard-relay, then ask() "lead": what should I work on next?
 The second session gets its answer back inline — no window‑switching. That's the whole loop. 🎉
 
 > **Why did that just work?** Both sessions share the same **board** (this repo), so they found each
-> other with zero setup. The second session didn't even need a name — the server assigned it a
-> unique `session-*` address. Read on for how names, roles, durability, and boards fit together.
+> other with zero setup. The second session didn't even need a name — it was registered under a
+> unique generated address as soon as it connected. Read on for how names, roles, durability, and boards fit together.
 
 ---
 
@@ -105,7 +108,7 @@ Five words cover the whole model:
 | Term | What it is |
 |------|------------|
 | **Participant** | A registered Codex, Claude Code, or other MCP client session. |
-| **Name** | Your address that others `send()` to — e.g. `"lead"`, `"worker:auth"`. **Optional:** omit it and the server assigns a unique `session-*` address. |
+| **Name** | Your address that others `send()` to — e.g. `"lead"`, `"worker:auth"`. **Optional:** every session is registered under a unique generated address when it connects, built from the client's name plus a random suffix (e.g. `claude-code-3fa9c1d2e4b5`), or `session-*` if the client didn't identify itself. |
 | **Role** | An optional *shared* address for a group (e.g. `"worker"`). A message to a role goes to whichever member reads it first. |
 | **Board** | One isolated switchboard — its own participants and mailboxes. Defaults to **one per project**, so repos don't cross wires. |
 | **Durable** | Messages wait in the recipient's mailbox until read — even if the recipient hasn't registered yet, or the process restarted. |
@@ -153,16 +156,42 @@ The ChatGPT desktop app, Codex CLI, and Codex IDE extension on the same host sha
 configuration. Restart the active client after adding it. The bundled config allows `wait()`,
 `ask()`, and the standby hook to run through the server's 3600-second polling window.
 
-The plugin also bundles an opt-in Codex `Stop` hook. Installed plugin hooks are not trusted
-automatically: review and trust it with `/hooks`, then call `standby(true)` in a registered lead.
-When the lead finishes a turn, the hook parks it until durable mail arrives and continues the turn
-so it can call `inbox()`. Call `standby(false)` before finishing when the lead should stop. See the
+The plugin also bundles a Codex `Stop` hook, [`hooks/codex.json`](hooks/codex.json), which the
+manifest names explicitly so Codex never loads the Claude Code hook file. Installed plugin hooks are
+not trusted automatically: review and trust it with `/hooks`. Once trusted, every session listens
+between turns by default. When a turn finishes, the hook waits up to 15 minutes for durable mail. If
+mail arrives, it continues the turn so the session can call `inbox()` and reply. If the window ends
+quietly, it continues the turn once so the session can re-arm with `standby(true)` and finish. Call
+`standby(false)` to stop listening for the rest of the session, or set `SWITCHBOARD_AUTO_LISTEN=0`
+to start with listening off. Until the hook is trusted, the session reports `listen_status`
+`configured` rather than `armed`. See the
 [official Codex hooks documentation](https://learn.chatgpt.com/docs/hooks#stop).
 
-Direct `codex mcp add` installs only the MCP server, not the plugin hook. To use standby with a
-direct server, merge the `Stop` entry from [`hooks/hooks.json`](hooks/hooks.json) into
-`~/.codex/hooks.json`, review it with `/hooks`, and keep the server name `switchboard_relay` so the
-hook target matches.
+Direct `codex mcp add` installs only the MCP server, not the plugin hook. To listen between turns
+with a direct server named `switchboard_relay` (as in the commands below), add this `Stop` entry to
+`~/.codex/hooks.json` and review it with `/hooks`. The `server` value must match the name you gave
+`codex mcp add`:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "switchboard_relay",
+            "tool": "host_standby",
+            "input": { "timeout_s": 900 },
+            "timeout": 960,
+            "statusMessage": "Listening for switchboard messages"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
 
 ### Claude Code plugin (recommended)
 
@@ -173,10 +202,26 @@ Run these in any Claude Code session:
 /plugin install switchboard-relay@mgd43b
 ```
 
-The `mcp__switchboard-relay__*` tools are wired up automatically — the plugin declares an MCP server
+The switchboard tools are wired up automatically — the plugin declares an MCP server
 that runs via `uvx switchboard-relay`, so there's nothing to `pip install`. Verify with `/plugin` or
 `claude mcp list`. (Installing the plugin covers Claude Code on every surface; the manual steps below
 are the alternative, not an addition.)
+
+The plugin also ships a Claude Code `Stop` hook, [`hooks/hooks.json`](hooks/hooks.json), that keeps
+the session listening between turns. It targets the plugin's server by its scoped name,
+`plugin:switchboard-relay:switchboard-relay`. When a turn finishes, the hook waits up to 15 minutes
+for durable mail. If mail arrives, it continues the turn so the session can read and answer it. If
+the window ends quietly, it continues the turn once so the session can re-arm with `standby(true)`
+and finish. An idle Claude session therefore takes about four short re-arm turns an hour. Call
+`standby(false)` to stop listening for the rest of the session, or set `SWITCHBOARD_AUTO_LISTEN=0`
+to start with listening off. Allowlist the `standby` tool (see
+[below](#run-the-tools-without-a-confirmation-prompt-optional)) so an unattended re-arm doesn't stop
+at a permission prompt.
+
+The 15-minute window stays under Claude Code's 30-minute limit for an MCP call that sends no
+response or progress. Claude Code aborts such a call and reports an error (adjust it with the
+server's `timeout` setting or `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`). Keep your own `wait()` and
+`ask()` timeouts under 1800 seconds in Claude Code for the same reason.
 
 ### Install the package manually
 
@@ -208,6 +253,31 @@ claude mcp add --scope user -- switchboard-relay
 
 That's it — open any Claude Code session and the `switchboard-relay` tools are available.
 Verify with `claude mcp list`.
+
+A direct install doesn't include the plugin's `Stop` hook. To listen between turns, add this to
+`~/.claude/settings.json`. A server you add yourself is addressed by its bare name,
+`switchboard-relay`, rather than the plugin's scoped name:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "switchboard-relay",
+            "tool": "host_standby",
+            "input": { "timeout_s": 900 },
+            "timeout": 960,
+            "statusMessage": "Listening for switchboard messages"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
 
 > **No install step?** Point Claude Code at `uvx` and skip installing anything:
 > ```bash
@@ -295,7 +365,10 @@ server:
       "mcp__switchboard-relay__wait",
       "mcp__switchboard-relay__ask",
       "mcp__switchboard-relay__broadcast",
-      "mcp__switchboard-relay__unregister"
+      "mcp__switchboard-relay__unregister",
+      "mcp__switchboard-relay__standby",
+      "mcp__switchboard-relay__bootstrap",
+      "mcp__switchboard-relay__charter"
     ]
   }
 }
@@ -307,13 +380,13 @@ server:
 
 ## Tools
 
-Ten tools, grouped by what you reach for:
+The tools, grouped by what you reach for:
 
 **Presence** — join and see who's around
 
 | Tool | Signature | What it does |
 |------|-----------|--------------|
-| `register` | `register(name?, role?)` | Claim an address for this session. `name` is **optional** — omit it and the server assigns a unique `session-*` address. `role` is an optional shared group address. Re-call to heartbeat or change role. Returns the `board` you joined and the live participants. |
+| `register` | `register(name?, role?)` | Claim or change this session's address. A session is already registered automatically under a unique generated address when it connects, so call this to pick an explicit `name` (e.g. `"lead"`). Explicit names are protected: if another live session holds the name, the call fails instead of sharing its mailbox. Registering a new name renames this session and drops the old one. Mail already queued for the old address stays queued under that address; it isn't moved. `role` is an optional shared group address. Returns the `board` you joined and the live participants. |
 | `participants` | `participants()` | List the live sessions: `name`, `role`, `idle_seconds`. A session stays listed for as long as its process is connected, whatever it's busy with; `idle_seconds` separately reports how long it's been since that peer last *used* switchboard, so a quiet peer reads as live-but-idle rather than dropping off the list. |
 | `unregister` | `unregister()` | Leave the switchboard (drop out of `participants()`). Your mailbox is preserved for when you return. |
 
@@ -329,14 +402,23 @@ Ten tools, grouped by what you reach for:
 | Tool | Signature | What it does |
 |------|-----------|--------------|
 | `inbox` | `inbox(peek?, since?)` | Read messages addressed to you. **Drains** by default (each delivered once); `peek=true` reads without removing; `since=<id>` returns only messages newer than that id. |
-| `wait` | `wait(timeout_s?)` | Block up to `timeout_s` seconds (default 30, max 3600) until a message arrives, then drain and return it. Returns `timed_out: true` on timeout. |
+| `wait` | `wait(timeout_s?)` | Block up to `timeout_s` seconds (default 30, max 3600) until a message arrives, then drain and return it. Returns `timed_out: true` on timeout. In Claude Code, keep `timeout_s` under 1800: Claude Code aborts an MCP call that sends nothing for 30 minutes. |
 
-**Codex lifecycle** — opt in to listening between turns
+**Context** — what the board expects of this session
 
 | Tool | Signature | What it does |
 |------|-----------|--------------|
-| `standby` | `standby(enabled?)` | Enable or disable persistent listening for this registered session. With the plugin's trusted `Stop` hook, finishing a turn parks the session until durable mail arrives. |
-| `codex_standby` | `codex_standby(timeout_s?)` | Internal target used by the plugin hook. It peeks for mail without draining it and returns the Codex continuation decision; agents should use `standby()`, not call this directly. |
+| `bootstrap` | `bootstrap()` | Return this session's full context: `you`, `board`, `protocol_version`, the board's charter (`charter_revision`, text, and `coordinator`), this session's `listen_status`, and each peer's `name`, `client`, `ready`, `agent_bootstrapped_revision`, and `listen_status`. Calling it records that this session's agent has read the current charter. |
+| `charter` | `charter()` | Read the board's current charter: the messaging conventions every session on the board is expected to follow. |
+| `set_charter` | `set_charter(text, expected_revision)` | Replace the charter. Only the board's coordinator can call it, and only when `expected_revision` matches the current revision, so two edits can't overwrite each other. |
+
+**Listening between turns** — keep a session reachable after its turn ends
+
+| Tool | Signature | What it does |
+|------|-----------|--------------|
+| `standby` | `standby(enabled?)` | Turn listening on or off for this session. It's on by default (unless `SWITCHBOARD_AUTO_LISTEN=0`), and `standby(false)` stays off for the rest of the session. Listening needs the host's trusted `Stop` hook; without one the session is `polling-only`. |
+| `host_standby` | `host_standby(timeout_s?)` | Internal target of the Codex and Claude Code `Stop` hooks. It peeks for mail without draining it and returns the hook's continuation decision. Agents should call `standby()`, not this. |
+| `codex_standby` | `codex_standby(timeout_s?)` | Older name for `host_standby`, kept so existing Codex hook installs keep working. |
 
 **Ask** — send and block for the answer in one call
 
@@ -344,6 +426,10 @@ Ten tools, grouped by what you reach for:
 |------|-----------|--------------|
 | `ask` | `ask(to, body, timeout_s?)` | Send `body` to `to`, then block until a reply threaded to it comes back (`reply_to` = the returned `question_id`). Leaves other inbox messages untouched; returns `timed_out: true` if no reply in time — with `no_live_recipient: true` when nobody was registered as `to` at send time, so you can tell a wrong address from a slow reply. |
 
+> **Readiness.** A peer's `ready` flag means its agent called `bootstrap()` (or `charter()`) at the
+> current charter revision. It does not mean the peer agrees to the charter or will follow it.
+> Peers running an older switchboard are listed as `legacy/manual` and are never `ready`.
+>
 > **Durability & addressing.** A message sent to a name that hasn't registered yet simply waits in
 > that mailbox until it's read. Addressing by `role` fans a message out to whichever participant
 > reads with that role first — for reliable one‑to‑one delivery, use unique names.
@@ -391,6 +477,54 @@ Any shared string works; pick one name and use it everywhere those sessions shou
 
 ---
 
+## Connecting: identity, peers, and the charter
+
+A session doesn't need a setup prompt to join a board. When a Codex, Claude Code, or other MCP
+session connects, its switchboard process:
+
+1. **Claims an address.** The session is registered under a unique generated address, or under
+   `SWITCHBOARD_NAME` if set. Call `register(name="lead")` to pick an explicit name. Explicit names
+   are protected: while another live session holds a name, nobody else can take it.
+2. **Discovers peers.** Peers are read from the board's registry, so joining sends no messages.
+   Tool results carry the current peers and charter revision, and `bootstrap()` returns the full
+   picture.
+3. **Delivers the charter.** The charter is the board's shared messaging conventions, such as how
+   to tag a task or a result and when to thread replies. A board starts with the default charter
+   shipped with switchboard, and a board whose charter nobody has edited picks up a newer
+   release's default. Every tool result carries a `context` entry, in both the structured result
+   and a `Switchboard context` text block. It holds the charter revision and the coordinator. The
+   full peer list is included only when it has changed, and the full charter text only the first
+   time and whenever the revision changes. Otherwise the entry is a short summary.
+
+   Each peer entry reports `client`, `protocol_version`, `ready`, `agent_bootstrapped_revision`,
+   and `listen_status`. A peer running an older switchboard appears with `client`
+   `legacy/manual`, a `protocol_version` of `null`, and `ready` false. It never receives the
+   charter, so send it the conventions as an ordinary message if it needs them.
+
+**Who edits the charter.** The first session on a board becomes its **coordinator**, the only
+session that can change the charter with `set_charter()`. If the coordinator exits, or its lease
+lapses (180 seconds without a heartbeat), the oldest live session takes over automatically. A
+coordinator that comes back doesn't reclaim the role. The coordinator owns the charter only: it
+doesn't assign work, and no session is elected to lead or delegate. A human can transfer the role
+from a terminal:
+
+```bash
+switchboard-relay charter                                          # print charter, revision, coordinator, peers (JSON)
+switchboard-relay charter --coordinator lead --expected-revision 3 # hand the charter to "lead"
+switchboard-relay charter --coordinator lead --expected-revision 3 --expected-generation 7
+                                                                   # …only if nobody else changed the coordinator first
+```
+
+**What the charter can't do.** It's text written by a peer agent, not by you. It can set
+conventions, but it never grants one session authority over another, and your own instructions
+to a session always win. A message from a peer is not your authorization either: a session acts on
+peer mail only within the task you've already given it.
+
+Set `SWITCHBOARD_AUTO=0` to turn off automatic identity, discovery, and listening and go back to
+explicit `register()` calls.
+
+---
+
 ## The lead / worker pattern
 
 Within one project this works with **zero board configuration** — every session in the repo shares
@@ -399,20 +533,19 @@ them on a shared board (see [Boards](#boards-one-switchboard-per-project)).
 
 ### The lead (coordinator)
 
-Keep one session open as the long‑running lead. With the Codex plugin hook trusted via `/hooks`,
-paste this and let it run:
+Keep one session open as the long‑running lead. With the Codex or Claude Code plugin's `Stop` hook
+in place (and, in Codex, trusted via `/hooks`), paste this and let it run:
 
 ```
-Register me on switchboard-relay as "lead", call standby(true), and answer every
-message that wakes this task. Reply to its sender using reply_to, then finish
-normally so standby resumes. Keep going until I tell you to disable standby.
+Register me on switchboard-relay as "lead" and answer every message that wakes
+this task. Reply to its sender using reply_to, then finish normally so listening
+resumes. Keep going until I tell you to call standby(false).
 ```
 
-The client will `register(name="lead")`, opt in, and park in the plugin's Stop hook whenever its
-turn finishes. A lead keeps a well-known name so
-workers can address it; anyone who doesn't need a fixed address can omit the name and use the
-returned `session-*` address. Without the Codex plugin hook, ask the task to keep calling `wait()`;
-in Claude Code, keep that polling loop going hands-free with the
+The client renames itself to `lead` and parks in the `Stop` hook whenever its turn finishes;
+listening is already on. A lead keeps a well-known name so workers can address it; anyone who
+doesn't need a fixed address can keep the generated one. Without a `Stop` hook, ask the task to keep
+calling `wait()`; in Claude Code, keep that polling loop going hands-free with the
 [`/loop`](https://code.claude.com/docs/en/slash-commands) skill:
 
 ```
@@ -451,6 +584,7 @@ switchboard-relay participants                   # live participants on this boa
 switchboard-relay tail                           # queued (undelivered) messages on this board
 switchboard-relay tail --follow                  # …and keep watching
 switchboard-relay prune                          # delete old dead-letter messages + expired participants
+switchboard-relay charter                        # the board's charter, revision, and coordinator
 switchboard-relay participants --board team      # …a specific board instead
 ```
 
@@ -474,7 +608,9 @@ All optional. Set as environment variables through `codex mcp add --env KEY=valu
 | `SWITCHBOARD_TTL` | `1800` (30 min) | Seconds without a sign of life before a participant drops out of `participants()` — and stops receiving `broadcast()`. A connected session keeps itself alive automatically, so in practice this is the window for noticing a session whose *process* went away without a clean `unregister()`. |
 | `SWITCHBOARD_MSG_TTL` | `604800` (7 days) | Undelivered messages older than this are pruned automatically during normal operation. Set `0` to disable age‑out. |
 | `SWITCHBOARD_MAX_BODY` | `262144` (256 KiB) | Reject a `send()` whose body exceeds this many UTF‑8 bytes. Set `0` to disable the cap. |
-| `SWITCHBOARD_NAME` | — | Auto‑register this session under this address (skips an explicit `register`; also the fallback when `register()` is called without a name). |
+| `SWITCHBOARD_AUTO` | `1` | Claim an address, discover peers, deliver the charter, and listen between turns automatically when a session connects. Set `0` to require an explicit `register()` and turn listening off. |
+| `SWITCHBOARD_AUTO_LISTEN` | `1` | Start each session with listening between turns on. Set `0` to start with it off; `standby(true)` still turns it on. |
+| `SWITCHBOARD_NAME` | — | Auto‑register this session under this address instead of a generated one (also the fallback when `register()` is called without a name). It's protected like any explicit name: if another live session already holds it, this session doesn't join, and its tool calls report `name_in_use` until you `register()` a different name. |
 | `SWITCHBOARD_ROLE` | — | Role to pair with `SWITCHBOARD_NAME`. |
 | `SWITCHBOARD_PUSH` | `0` | Enable [turn‑injection push](#turn-injection-push) over Channels (CLI reactors) — has the background loop poll the board and nudge this session's own client. Off by default (a small background poll cost); set `1` to enable. The loop itself always runs: with push off it only does the once‑a‑minute liveness keepalive. |
 | `SWITCHBOARD_CCD_INJECT` | `0` | Enable [turn injection on Claude Desktop](#reacting-on-claude-desktop-ccd_session_mgmt): `send()` returns an `inject` hint so the sender's Claude can call `ccd_session_mgmt.send_message`. Off by default (leans on a Desktop tool + a per‑message approval). |
@@ -497,10 +633,18 @@ long-polls that database.
 
 **The one honest limitation:** switchboard **cannot wake a *closed* session or a client that is no
 longer running.** In the baseline poll model a recipient learns about a message by calling
-`inbox()` or `wait()` on its next turn or while parked in a polling loop. The Codex plugin's trusted
-Stop hook can keep an opted-in, open task parked between turns; an open Claude Code session can
-optionally be pushed into a turn with [turn injection](#turn-injection-push). Durable mail remains
-queued when neither listener is active.
+`inbox()` or `wait()` on its next turn or while parked in a polling loop. The Codex and Claude Code
+`Stop` hooks keep an open session parked between turns; an open Claude Code session can also be
+pushed into a turn with [turn injection](#turn-injection-push). Generic MCP clients are
+polling-only. Each session's `listen_status` reports which applies. Durable mail remains queued when
+no listener is active.
+
+Delivery is **at most once**: each message is drained by one reader. If a client gives up on a
+`wait()` that has already drained a message (for example, Claude Code aborting a call that ran past
+its idle limit), that message can be lost. Keep waits under the host's limit.
+
+Boards are SQLite files under your home directory, so "same machine" really means the same OS user
+on one machine. There is no network transport.
 
 ---
 
@@ -516,12 +660,13 @@ runs (the *sender* can be any surface):
 
 | Reactor runs on… | Mechanism | Feel |
 |---|---|---|
-| **Codex (desktop/CLI/IDE)** | Opt-in plugin `Stop` hook, or `wait()` / `inbox()` polling | **automatic while the opted-in task and client remain open** |
+| **Codex (desktop/CLI/IDE)** | Plugin `Stop` hook (on by default once trusted), or `wait()` / `inbox()` polling | **automatic while the task and client remain open** |
+| **Claude Code (any surface)** | Plugin `Stop` hook (on by default) | **automatic while the session remains open**, with about four short re-arm turns an hour when idle |
 | **Claude Code (CLI/terminal)** | [Channels](https://code.claude.com/docs/en/channels) — the recipient self‑injects | **zero‑touch**, fully automatic |
 | **Claude Desktop** | `ccd_session_mgmt.send_message` — the *sender* injects | **one approval click per message** |
 
 The lifecycle and Claude mechanisms are accelerators on top of the durable polling path and preserve
-**drain-once**. Codex standby requires the plugin hook to be reviewed and trusted with `/hooks`.
+**drain-once**. Codex listening requires the plugin hook to be reviewed and trusted with `/hooks`.
 
 ### Reacting on the CLI (Channels) — the three hard constraints
 
@@ -598,10 +743,10 @@ reacts. No session ever discloses its id to another — each records only its ow
   in an **agent/child** context the env id isn't the addressable one, so set
   `SWITCHBOARD_CCD_SESSION_ID=<full id>` to override. Confirm once with the two‑session check below.
 - Best‑effort and **idempotent**: the injected turn is a body‑less nudge (the real message stays in
-  the durable inbox and drains exactly once), so even if a recipient *also* has the CLI watcher, a
+  the durable inbox and is drained by one reader), so even if a recipient *also* has the CLI watcher, a
   double nudge can't double‑deliver.
 
-### What's actually sent (and why it stays exactly‑once)
+### What's actually sent (and why it stays drain‑once)
 
 On the CLI path, switchboard emits a `notifications/claude/channel` notification that Claude Code
 wraps into the recipient's next turn as `<channel source="switchboard-relay" msg_from="…"
@@ -648,12 +793,16 @@ messages, and prints a hint for the two most common failures below — usually e
 in one shot.
 
 **"I sent a message but nothing happened."**
-switchboard cannot wake a closed session. With the Codex plugin installed, review its hook with
-`/hooks`, register the lead, and call `standby(true)` before finishing; use `standby(false)` when it
-should stop. A direct MCP installation still needs a requested `wait()` loop or the `Stop` entry
-from [`hooks/hooks.json`](hooks/hooks.json) merged into the user's hooks. Keep a Claude lead in
-[`/loop`](#the-lead--worker-pattern), so it stays listening.
-(See [How it works](#how-it-works).)
+switchboard cannot wake a closed session. Check the recipient's `listen_status` with `bootstrap()`.
+With the Codex plugin installed, review its hook with `/hooks`; until then the session reports
+`configured`, not `armed`. A session that called `standby(false)` stays off until `standby(true)`. A
+direct MCP installation needs the `Stop` entry shown under [Install](#install), with `server` set to
+the name you installed the server under, or a requested `wait()` loop. Generic MCP clients are
+`polling-only`. (See [How it works](#how-it-works).)
+
+**"My `wait()` failed with 'sent no response or progress for 1800s'."**
+Claude Code aborts an MCP call that stays silent for 30 minutes. Use a `timeout_s` under 1800, or
+raise the limit with the server's `timeout` setting or `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`.
 
 **"The other session can't see me / `participants()` is empty."**
 You're probably on different **boards** — each project gets its own by default. Run
@@ -668,8 +817,8 @@ what you'll see from a peer that's deep in a build or a CI wait; check live addr
 correctly‑named recipient gets it later — and `ask()` can simply be timing out because the peer
 hasn't reached its next turn yet (`idle_seconds` tells you how long it's been away).
 
-**"register() gave me a `session-…` name I didn't choose."**
-No `name` was passed and none could be derived, so one was assigned. That's fine for a worker that
+**"My session has a generated name I didn't choose."**
+Every session gets a unique generated address when it connects. That's fine for a worker that
 only asks questions; for anything others need to address (like a lead), pass an explicit name —
 `register(name="lead")`.
 
@@ -689,13 +838,13 @@ Source layout — each module is small and single‑purpose:
 
 - [`store.py`](src/switchboard_relay/store.py) — the durable SQLite store (registry + mailboxes). Pure and clock‑free.
 - [`board.py`](src/switchboard_relay/board.py) — board resolution: which switchboard a session joins (env / git worktree → DB path). Pure and transport‑free.
-- [`server.py`](src/switchboard_relay/server.py) — the MCP server: identity binding, ten tools, polling/standby loops, and best‑effort push.
+- [`server.py`](src/switchboard_relay/server.py) — the MCP server: identity binding, the tools, polling/standby loops, and best‑effort push.
 
 Tests are split into three tiers:
 
 - `tests/unit/` — the SQLite store and board resolution in isolation.
 - `tests/feature/` — tool behavior through the server layer (identity, push, roles, hygiene bounds, the CLI) with a fake Context.
-- `tests/integration/` — the tools over a real MCP transport, including **two real stdio subprocesses**, plus an **N‑process exactly‑once stress test** that reconciles sent‑vs‑received ids under contention (including shared‑role drains).
+- `tests/integration/` — the tools over a real MCP transport, including **two real stdio subprocesses**, plus an **N‑process drain‑once stress test** that reconciles sent‑vs‑received ids under contention (including shared‑role drains).
 
 The Claude Code plugin/marketplace manifests live in [`.claude-plugin/`](.claude-plugin/); validate
 them with `claude plugin validate .`. Codex packaging lives in

@@ -26,11 +26,10 @@ from mcp.client.stdio import stdio_client
 def _find_switchboard() -> str | None:
     # Prefer PATH, but also look next to the running interpreter so the test
     # runs inside a virtualenv that hasn't been PATH-activated (and in CI).
-    found = shutil.which("switchboard-relay")
-    if found:
-        return found
     candidate = Path(sys.executable).parent / "switchboard-relay"
-    return str(candidate) if candidate.exists() else None
+    if candidate.exists():
+        return str(candidate)
+    return shutil.which("switchboard-relay")
 
 
 SWITCHBOARD_BIN = _find_switchboard()

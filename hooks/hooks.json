@@ -1,17 +1,17 @@
 {
-  "description": "Keep opted-in switchboard participants listening between Codex turns.",
+  "description": "Claude Code: keep switchboard participants listening between turns (standby is on by default; standby(false) or SWITCHBOARD_AUTO=0 opts out).",
   "hooks": {
     "Stop": [
       {
         "hooks": [
           {
             "type": "mcp_tool",
-            "server": "switchboard_relay_default",
-            "tool": "codex_standby",
+            "server": "plugin:switchboard-relay:switchboard-relay",
+            "tool": "host_standby",
             "input": {
-              "timeout_s": 3600
+              "timeout_s": 900
             },
-            "timeout": 3660,
+            "timeout": 960,
             "statusMessage": "Listening for switchboard messages"
           }
         ]
