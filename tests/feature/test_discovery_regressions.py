@@ -1,4 +1,5 @@
 import time
+import weakref
 
 import anyio
 import pytest
@@ -72,3 +73,68 @@ def test_charter_cli_read_is_noncreating_and_transfer(tmp_path, monkeypatch, cap
     assert main(["charter", "--coordinator", "owner", "--expected-revision", "1"]) == 0
     with pytest.raises(SystemExit):
         main(["--ttl", "nan"])
+
+
+def test_token_survives_prune_while_connection_is_open(tmp_path):
+    b = Switchboard(Store(tmp_path / "b.db"))
+    a = FakeCtx(FakeSession())
+    b.register(a, "lead")
+    token = b._conns[b._sid(a)].token
+    b._prune_conns(set())  # participant row lapsed; the connection is still open
+    assert b.register(a, "lead")["you"] == "lead"
+    assert b._conns[b._sid(a)].token == token
+
+
+def test_recycled_connection_id_never_inherits_a_token(tmp_path):
+    b = Switchboard(Store(tmp_path / "b.db"))
+    a = FakeCtx(FakeSession())
+    b.register(a, "lead")
+    b._conns.pop(b._sid(a))
+    b.store.send("lead", "for the old session", sender="peer", now=time.time())
+
+    class Gone:
+        pass
+
+    # Simulate CPython reusing the departed connection's id() for a new one.
+    old = b._tokens[b._sid(a)][1]
+    b._tokens[b._sid(a)] = (weakref.ref(Gone()), old)
+    with pytest.raises(ToolError, match="name_in_use"):
+        b.register(a, "lead")  # a fresh token, so the old session's mail stays put
+    assert b._tokens[b._sid(a)][1] != old
+    assert b.store.has_messages("lead")
+
+
+def test_prune_sweeps_tokens_of_closed_connections(tmp_path):
+    b = Switchboard(Store(tmp_path / "b.db"))
+
+    class Gone:
+        pass
+
+    b._tokens[1] = (weakref.ref(Gone()), "stale")
+    b._prune_conns(set())
+    assert 1 not in b._tokens
+
+
+def test_unregister_drops_the_token(tmp_path):
+    b = Switchboard(Store(tmp_path / "b.db"))
+    a = FakeCtx(FakeSession())
+    b.register(a, "lead")
+    b.unregister(a)
+    assert b._sid(a) not in b._tokens
+
+
+def test_manual_keepalive_refreshes_within_the_lease(tmp_path):
+    b = Switchboard(Store(tmp_path / "b.db"), ttl=0.3)  # lease 0.3s, keepalive 60s
+    a = FakeCtx(FakeSession())
+    b.register(a, "lead")
+    c = FakeCtx(FakeSession())
+
+    async def drive():
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(b._watch_loop)
+            await anyio.sleep(0.8)
+            with pytest.raises(ToolError, match="name_in_use"):
+                b.register(c, "lead")
+            tg.cancel_scope.cancel()
+
+    anyio.run(drive)

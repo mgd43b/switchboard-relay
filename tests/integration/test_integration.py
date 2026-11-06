@@ -11,6 +11,7 @@ inbox -> reply, TTL expiry, wait()).
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 
 import anyio
@@ -186,9 +187,12 @@ async def test_participant_expires_after_ttl(tmp_path):
     # longer than the TTL *between* those two steps, the just-touched caller is
     # wrongly pruned. 1s comfortably clears that jitter while still expiring an
     # idle peer within the ~1.5s sleep below.
+    #
+    # A connected session is kept alive by the server's keepalive, so "ghost"
+    # is a peer whose process has gone: a participant row nothing refreshes.
     mcp = make_board(tmp_path, ttl=1.0)
-    async with sessions(mcp) as (ghost, watcher):
-        data(await ghost.call_tool("register", {"name": "ghost"}))
+    async with connect(mcp) as watcher:
+        Store(tmp_path / "switchboard.db").register("ghost", "", now=time.time())
         data(await watcher.call_tool("register", {"name": "watcher"}))
         # Both live immediately.
         names = {
@@ -196,8 +200,8 @@ async def test_participant_expires_after_ttl(tmp_path):
         }
         assert "ghost" in names
 
-        # ghost stops heartbeating; watcher keeps active. After the TTL passes,
-        # ghost drops out while watcher (which just called a tool) remains.
+        # ghost never heartbeats; watcher stays connected. After the TTL passes,
+        # ghost drops out while watcher remains.
         await asyncio.sleep(1.5)
         parts = data(await watcher.call_tool("participants", {}))
         names = {p["name"] for p in parts["participants"]}

@@ -73,8 +73,26 @@ SQLite's backup API (include any custom `SWITCHBOARD_DB` location). Upgrade all
 participants together and restart them. Existing messages and custom charters
 are retained; legacy processes cannot enforce the new ownership rules.
 
-If rollback is needed, stop every participant before reinstalling 0.2.9. The old
-server ignores the additive `relay_*` tables. Retain the upgraded database to
+Both plugin manifests start the server with an unpinned `uvx switchboard-relay`,
+and `uvx` keeps using the version it has cached. Reinstalling with Homebrew or
+pipx does not change what it resolves. Refresh it before restarting, and check
+the version it now runs:
+
+```bash
+uvx --refresh switchboard-relay --version
+```
+
+If rollback is needed, stop every participant before reinstalling 0.2.9. Pin
+what the plugin servers resolve by installing 0.2.9 as a uv tool, which `uvx`
+uses in preference to its cache, and confirm it before restarting anyone:
+
+```bash
+uv tool install --force switchboard-relay==0.2.9
+uvx switchboard-relay --version            # must print 0.2.9
+```
+
+Run `uv tool uninstall switchboard-relay` to return to unpinned resolution. The
+old server ignores the additive `relay_*` tables. Retain the upgraded database to
 preserve messages received since the upgrade; restoring a backup discards those
 newer messages. Re-register the same current names to reach their mailboxes.
 
