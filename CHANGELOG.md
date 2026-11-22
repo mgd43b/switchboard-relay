@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.11](https://github.com/mgd43b/switchboard-relay/compare/v0.2.10...v0.2.11) (2026-11-22)
+
+
+### Features
+
+* add inbox subscriptions and opt-in offline worker startup ([#54](https://github.com/mgd43b/switchboard-relay/issues/54)) ([0e44f79](https://github.com/mgd43b/switchboard-relay/commit/0e44f795e6575a5e61fd6032410a74659b10f9dc))
+* add non-blocking replies and a durable task queue ([#53](https://github.com/mgd43b/switchboard-relay/issues/53)) ([626f5e4](https://github.com/mgd43b/switchboard-relay/commit/626f5e43fd28b5d4c664649c3b8ec89c26e86af7))
+* lease mailbox delivery and expose message status ([#52](https://github.com/mgd43b/switchboard-relay/issues/52)) ([dd10484](https://github.com/mgd43b/switchboard-relay/commit/dd104842109424db2b67912b4d796981ff9cad9a))
+
+
+### Bug Fixes
+
+* **server:** keep the keepalive cadence from skipping a refresh ([#51](https://github.com/mgd43b/switchboard-relay/issues/51)) ([9251d1b](https://github.com/mgd43b/switchboard-relay/commit/9251d1b16704b39e96db70c7a94d37e1169598a0))
+
+
+### Miscellaneous Chores
+
+* **deps:** bump pre-commit hooks and track them with Dependabot ([#43](https://github.com/mgd43b/switchboard-relay/issues/43)) ([4f3a657](https://github.com/mgd43b/switchboard-relay/commit/4f3a657834f91843507ef1334e4deea95db61ace))
+
 ## [0.2.10](https://github.com/mgd43b/switchboard-relay/compare/v0.2.9...v0.2.10) (2026-11-06)
 
 
