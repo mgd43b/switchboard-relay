@@ -778,8 +778,9 @@ provided name and role. It can call `task_claim()` for queued work, use `task_up
 results, and check `inbox()` for direct mail. The task trigger uses the same eligibility rules
 as `task_claim()`. Each board and role has one
 launch slot for supervisors configured with `--task-role`, including when they wake for direct
-mail. The guard holds that slot until the foreground worker exits. A single worker command can
-claim successive tasks before it exits.
+mail. A detached process holds that slot and the worker's name lock until the foreground worker
+exits, including if the watcher or launcher exits first. A single worker command can claim
+successive tasks before it exits.
 
 ---
 

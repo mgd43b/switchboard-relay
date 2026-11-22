@@ -38,6 +38,22 @@ def _try_lock(path: Path) -> Iterator[Optional[int]]:
         yield lock.fileno()
 
 
+@contextmanager
+def _launch_slots(
+    active_path: Path, role_path: Optional[Path]
+) -> Iterator[Optional[tuple[int, ...]]]:
+    with ExitStack() as locks:
+        descriptors = []
+        for path in (active_path, role_path):
+            if path is not None:
+                fd = locks.enter_context(_try_lock(path))
+                if fd is None:
+                    yield None
+                    return
+                descriptors.append(fd)
+        yield tuple(descriptors)
+
+
 def watch_worker(
     target: Target,
     name: str,
@@ -55,6 +71,7 @@ def watch_worker(
     board_identity = f"{stat.st_dev}:{stat.st_ino}:"
     key = hashlib.sha256((board_identity + name).encode()).hexdigest()
     lock_path = db_path.parent / f".switchboard-worker-{key}.lock"
+    active_path = db_path.parent / f".switchboard-worker-active-{key}.lock"
     label = f"{target.board}/{name}"
     child_env = {
         **os.environ,
@@ -88,23 +105,19 @@ def watch_worker(
         try:
             while True:
                 if child is not None and (code := child.poll()) is not None:
-                    _report(label, f"worker exited with status {code}")
+                    if code < 0:
+                        _report(label, f"launcher exited with signal {-code}")
+                    else:
+                        _report(label, f"worker exited with status {code}")
                     child = None
                     retry_at = time.monotonic() + _RETRY_SECONDS
                 if child is None and time.monotonic() >= retry_at:
                     try:
-                        if ready():
-                            with ExitStack() as locks:
-                                guard_fds = (lock_fd,)
-                                can_launch = True
-                                if role_lock_path is not None:
-                                    role_fd = locks.enter_context(_try_lock(role_lock_path))
-                                    can_launch = role_fd is not None and ready()
-                                    if role_fd is not None:
-                                        guard_fds += (role_fd,)
-                                if can_launch:
+                        if ready() and not protocol.name_is_live(name, time.time()):
+                            with _launch_slots(active_path, role_lock_path) as slots:
+                                if slots is not None and ready():
                                     child = _start_worker(
-                                        protocol, name, label, command, child_env, guard_fds
+                                        protocol, name, label, command, child_env, (lock_fd, *slots)
                                     )
                     except sqlite3.OperationalError as exc:
                         if not _is_locked_error(exc):
@@ -155,8 +168,8 @@ def _report(label: str, message: str) -> None:
 
 
 def _guard_worker(lock_fds: tuple[int, ...], label: str, command: list[str]) -> int:
-    # Keep the name lock and any role slot while the foreground worker runs.
-    # Only the guard holds them across a watcher exit.
+    # Hold the launch locks for exactly the foreground worker's lifetime.
+    # The worker can exec or spawn helpers without inheriting those locks.
     with ExitStack() as locks:
         for lock_fd in lock_fds:
             locks.enter_context(os.fdopen(lock_fd, "rb"))
@@ -180,6 +193,21 @@ def _guard_worker(lock_fds: tuple[int, ...], label: str, command: list[str]) -> 
             protocol.release_startup(name, token)
 
 
+def _run_launcher(lock_fds: tuple[int, ...], label: str, command: list[str]) -> int:
+    # Fork before opening SQLite or spawning the worker. The detached holder
+    # inherits the locks before any foreground process exists, and it can
+    # keep waiting if this launcher or the watcher is killed.
+    holder = os.fork()
+    if holder == 0:
+        os.setsid()
+        return _guard_worker(lock_fds, label, command)
+    for fd in lock_fds:
+        os.close(fd)
+    _, status = os.waitpid(holder, 0)
+    code = os.waitstatus_to_exitcode(status)
+    return code if code >= 0 else 128 - code
+
+
 if __name__ == "__main__":
     fds = tuple(int(value) for value in sys.argv[1].split(","))
-    raise SystemExit(_guard_worker(fds, sys.argv[2], sys.argv[3:]))
+    raise SystemExit(_run_launcher(fds, sys.argv[2], sys.argv[3:]))

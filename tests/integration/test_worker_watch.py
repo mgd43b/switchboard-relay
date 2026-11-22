@@ -77,6 +77,14 @@ def test_real_worker_launch_is_opt_in_scoped_and_exclusive(tmp_path, monkeypatch
         str(relay),
         str(output),
     ]
+    attempted = []
+    reserve_startup = Protocol.reserve_startup
+
+    def record_reservation(self, name, now):
+        attempted.append(name)
+        return reserve_startup(self, name, now)
+
+    monkeypatch.setattr(Protocol, "reserve_startup", record_reservation)
     messages = []
     logs = []
     deadline = time.monotonic() + 30
@@ -97,6 +105,7 @@ def test_real_worker_launch_is_opt_in_scoped_and_exclusive(tmp_path, monkeypatch
                 messages.append(store.send(role_name, body, sender="lead", now=time.time()))
         elif ticks == 2:
             assert "launching worker" not in logs[-1]
+            assert attempted == []
             protocol.leave("existing", time.time())
         if "worker exited with status 0" in logs[-1]:
             raise KeyboardInterrupt
@@ -272,6 +281,37 @@ asyncio.run(run())
 """
 
 
+_WATCH_RUNNER = """
+import sys
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import switchboard_relay.worker_watch as supervisor
+from switchboard_relay.server import main
+
+first_poll = Path(sys.argv[1])
+launcher_pid = Path(sys.argv[2])
+start_worker = supervisor._start_worker
+
+def sleep_after_poll(seconds):
+    first_poll.touch()
+    time.sleep(seconds)
+
+def record_launcher(*args, **kwargs):
+    launcher = start_worker(*args, **kwargs)
+    if launcher is not None:
+        launcher_pid.write_text(str(launcher.pid))
+    return launcher
+
+supervisor.time = SimpleNamespace(
+    time=time.time, monotonic=time.monotonic, sleep=sleep_after_poll,
+)
+supervisor._start_worker = record_launcher
+raise SystemExit(main(sys.argv[3:]))
+"""
+
+
 def _wait_for(check, description):
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -304,6 +344,8 @@ def test_task_role_starts_offline_workers_with_one_slot_per_role(tmp_path):
     protocol.claim("lead", "lead", "", now=time.time())
     profile = tmp_path / "task_worker.py"
     profile.write_text(_TASK_WORKER)
+    runner = tmp_path / "watch_runner.py"
+    runner.write_text(_WATCH_RUNNER)
 
     def submit(role):
         return queue.submit(
@@ -320,9 +362,14 @@ def test_task_role_starts_offline_workers_with_one_slot_per_role(tmp_path):
     def start(stack, name, gate):
         marker = tmp_path / f"{name}.json"
         log = tmp_path / f"{name}.log"
+        first_poll = tmp_path / f"{name}.polled"
+        launcher_pid = tmp_path / f"{name}.launcher"
         process = subprocess.Popen(
             [
-                str(relay),
+                sys.executable,
+                str(runner),
+                str(first_poll),
+                str(launcher_pid),
                 "--db",
                 str(db),
                 "worker-watch",
@@ -342,16 +389,17 @@ def test_task_role_starts_offline_workers_with_one_slot_per_role(tmp_path):
             stderr=stack.enter_context(log.open("wb")),
         )
         stack.callback(_stop_watcher, process)
-        _wait_for(lambda: "watching mail and tasks" in log.read_text(), f"{name} supervisor")
-        return process, marker, log
+        _wait_for(first_poll.exists, f"{name} to finish its first poll")
+        return process, marker, log, launcher_pid
 
     submit("other-role")
     release_one, release_two = tmp_path / "release-one", tmp_path / "release-two"
     release_two.touch()
     with ExitStack() as stack:
         try:
-            first_watch, first_marker, first_log = start(stack, "worker-one", release_one)
-            time.sleep(1.1)
+            first_watch, first_marker, first_log, launcher_pid = start(
+                stack, "worker-one", release_one
+            )
             assert "launching worker" not in first_log.read_text()
             first_id = submit("docs")
             _wait_for(first_marker.exists, "first task claim")
@@ -361,8 +409,13 @@ def test_task_role_starts_offline_workers_with_one_slot_per_role(tmp_path):
                 "id": first_id,
             }
 
-            # Stop the watcher while its worker is still running. The guard
-            # keeps the role slot until that actual foreground worker exits.
+            # The launcher and watcher can go away while a detached holder
+            # still owns the locks for the foreground worker.
+            os.kill(int(launcher_pid.read_text()), signal.SIGKILL)
+            _wait_for(
+                lambda: "launcher exited with signal 9" in first_log.read_text(),
+                "first launcher to exit",
+            )
             _stop_watcher(first_watch)
             [slot] = tmp_path.glob(".switchboard-worker-role-*.lock")
             with (
@@ -372,8 +425,7 @@ def test_task_role_starts_offline_workers_with_one_slot_per_role(tmp_path):
                 fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
             second_id = submit("docs")
-            _, second_marker, second_log = start(stack, "worker-two", release_two)
-            time.sleep(1.1)
+            _, second_marker, second_log, _ = start(stack, "worker-two", release_two)
             assert "launching worker" not in second_log.read_text()
             assert not second_marker.exists()
             assert not any(

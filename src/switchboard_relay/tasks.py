@@ -21,7 +21,7 @@ _TASK_OUTCOMES = {"completed", "failed"}
 _FINISHED_ATTEMPTS = _TASK_OUTCOMES | {"released", "cancelled"}
 _ACTIVE_ATTEMPTS = {"claimed", "blocked"}
 
-_AVAILABLE_TASKS = "FROM tasks WHERE role=? AND available_at IS NOT NULL AND available_at<=?"
+_TASK_IS_AVAILABLE = "role=? AND available_at IS NOT NULL AND available_at<=?"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -141,7 +141,11 @@ class TaskQueue:
     def has_available(self, role: str, *, now: float) -> bool:
         with self.store._connect() as conn:
             return (
-                conn.execute(f"SELECT 1 {_AVAILABLE_TASKS} LIMIT 1", (role, now)).fetchone()
+                conn.execute(
+                    f"SELECT 1 FROM tasks INDEXED BY idx_tasks_due "
+                    f"WHERE {_TASK_IS_AVAILABLE} LIMIT 1",
+                    (role, now),
+                ).fetchone()
                 is not None
             )
 
@@ -150,7 +154,8 @@ class TaskQueue:
     ) -> Optional[dict]:
         with self._write(name, token, clock) as (conn, now):
             task = conn.execute(
-                f"SELECT * {_AVAILABLE_TASKS} ORDER BY id LIMIT 1",
+                f"SELECT * FROM tasks INDEXED BY idx_tasks_available "
+                f"WHERE {_TASK_IS_AVAILABLE} ORDER BY id LIMIT 1",
                 (role, now),
             ).fetchone()
             if task is None:
@@ -519,6 +524,10 @@ def _init_availability(conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tasks_available "
             "ON tasks (role, id) WHERE available_at IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_due "
+            "ON tasks (role, available_at) WHERE available_at IS NOT NULL"
         )
         conn.execute("DROP INDEX IF EXISTS idx_tasks_role")
 
