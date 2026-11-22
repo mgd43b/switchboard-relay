@@ -16,13 +16,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # Ruff comes from uv.lock, the same version the local pre-commit hooks run.
+      # Runs the pre-commit hooks, so CI lints with the same pinned ruff rev as
+      # local commits do.
       - name: Install uv
         uses: astral-sh/setup-uv@v7
-      - name: ruff check
-        run: uv run --frozen --extra dev ruff check --output-format=github
-      - name: ruff format --check
-        run: uv run --frozen --extra dev ruff format --check
+      - name: pre-commit (ruff check, ruff format, file hygiene)
+        run: uvx pre-commit run --all-files --show-diff-on-failure
 
   test:
     name: Test (py${{ matrix.python-version }})
