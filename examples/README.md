@@ -58,14 +58,21 @@ and acknowledge it with ack(reply.id, reply.receipt).
 
 1. Register the submitting session as `lead`. Call `task_submit()` with role `worker`, the
    requested scope, owned paths, acceptance criteria, and the evidence the lead expects.
-   Save the task ID and use `task_status(id)` to see who claimed it and what changed.
+   Run `task_list(submitter="lead")` to see your assignments, even after reconnecting as `lead`.
+   Use `task_status(id)` for the full history and evidence.
 2. Register a separate session as `worker:docs` with role `worker`. Call `task_claim()`, then
    use the task ID and receipt with `task_update()`. Record progress or blockers as you go.
    Renew the lease before the deadline. When done, record `completed` or `failed` with evidence.
 3. If the worker exits, another session in role `worker` can claim the task after its lease
    expires. Read the previous attempt's notes and check the owned paths, diff, and test output
    before making further changes. Use the new claim's receipt for updates. The lead can still
-   inspect each attempt after reconnecting under the same name.
+   inspect each attempt after reconnecting under the same name. A worker that is done with its
+   local changes can instead release the task immediately with a handoff note.
+4. To stop work, call `task_cancel(id)` as the lead. Wait for `cancelled` before handing the same
+   paths to another worker. A worker confirms cancellation after stopping by calling
+   `task_update(action="cancelled", ...)` with its receipt and a note. If the worker session is
+   gone, verify the worker stopped before calling `task_cancel(id, note, confirm_stopped=true)`.
+   To requeue a failed task, call `task_retry(id, attempt)` with its failed attempt number.
 
 ## Checking who's ready
 

@@ -1,6 +1,9 @@
 """Task claim fencing and durable history on a shared SQLite board."""
 
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+
+import pytest
 
 from switchboard_relay.protocol import Protocol
 from switchboard_relay.store import Store
@@ -120,6 +123,8 @@ def test_upgrade_indexes_existing_unfinished_tasks(tmp_path):
                 (2,1,'worker','worker','old-2',1,5,'blocked');
         """)
 
+    page = TaskQueue(store, initialize=False).list_tasks(now=3)
+    assert [task["status"] for task in page["tasks"]] == ["completed", "blocked", "queued"]
     queue = TaskQueue(store)
     assert queue.claim("worker", "worker", "team", clock=lambda: 3)["id"] == 3
     assert queue.claim("worker", "worker", "team", clock=lambda: 4) is None
@@ -127,3 +132,61 @@ def test_upgrade_indexes_existing_unfinished_tasks(tmp_path):
     assert retry["id"] == 2
     assert [attempt["status"] for attempt in retry["attempts"]] == ["expired", "claimed"]
     assert queue.status(1, name="lead", role="", token="lead", now=5)["status"] == "completed"
+
+
+def test_cancellation_stays_pending_after_expiry_until_worker_confirms(tmp_path):
+    store = Store(tmp_path / "board.db")
+    protocol = Protocol(store, lease=10_000)
+    for name, role in (("lead", ""), ("one", "worker"), ("two", "worker")):
+        protocol.claim(name, name, role, now=0)
+    queue = TaskQueue(store)
+    info = {
+        "role": "worker",
+        "scope": "Fix docs",
+        "owned_paths": [],
+        "acceptance_criteria": [],
+        "expected_evidence": "",
+    }
+    queued = queue.submit("lead", "lead", **info, clock=lambda: 1)["id"]
+    assert queue.cancel("lead", "lead", task_id=queued, note="", clock=lambda: 2)["status"] == (
+        "cancelled"
+    )
+    assert queue.claim("one", "one", "worker", clock=lambda: 2) is None
+
+    task_id = queue.submit("lead", "lead", **info, clock=lambda: 3)["id"]
+    claim = queue.claim("one", "one", "worker", clock=lambda: 4)
+
+    def clock():
+        return claim["lease_expires_at"] + 1
+
+    pending = queue.cancel("lead", "lead", task_id=task_id, note="Stop", clock=clock)
+    assert pending["status"] == "cancel_requested"
+    assert pending["owner"] == "one" and pending["cancelled_at"] is None
+    assert queue.claim("two", "two", "worker", clock=clock) is None
+    with store._connect() as conn, pytest.raises(sqlite3.IntegrityError, match="cancellation"):
+        conn.execute("UPDATE task_attempts SET lease_expires_at=lease_expires_at+1")
+    assert (
+        queue.update(
+            "two",
+            "two",
+            task_id=task_id,
+            receipt=claim["receipt"],
+            action="cancelled",
+            note="Wrong worker",
+            clock=clock,
+        )
+        is None
+    )
+    final = queue.update(
+        "one",
+        "one",
+        task_id=task_id,
+        receipt=claim["receipt"],
+        action="cancelled",
+        note="Stopped",
+        clock=clock,
+    )
+    assert final["status"] == "cancelled" and final["cancelled_at"] == clock()
+    assert queue.cancel("lead", "lead", task_id=task_id, note="Again", clock=clock) == final
+    with store._connect() as conn, pytest.raises(sqlite3.IntegrityError, match="cancellation"):
+        conn.execute("UPDATE task_attempts SET lease_expires_at=lease_expires_at+1")

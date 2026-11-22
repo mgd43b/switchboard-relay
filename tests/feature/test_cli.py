@@ -6,6 +6,7 @@ observed rather than actually started, plus the ``$SWITCHBOARD_TTL`` parsing.
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -341,3 +342,94 @@ def test_inspection_commands_do_not_create_missing_db(monkeypatch, tmp_path, cap
     # A read-only peek must not materialize the database or its parent dir.
     assert not missing.exists()
     assert not missing.parent.exists()
+
+
+def test_cli_tasks_can_read_a_board_before_upgrade(tmp_path, capsys):
+    from switchboard_relay.protocol import Protocol
+    from switchboard_relay.tasks import TaskQueue
+
+    path = tmp_path / "board.db"
+    opts = ["--db", str(path), "tasks"]
+    assert main([*opts, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"tasks": [], "next_after_id": None}
+    assert not path.exists()
+
+    store = Store(path)
+    assert main(opts) == 0
+    assert "No matching tasks." in capsys.readouterr().out
+    Protocol(store).claim("owner", "lead", "", now=time.time())
+    queue = TaskQueue(store)
+    for role in ("worker", "reviewer", "worker"):
+        queue.submit(
+            "lead",
+            "owner",
+            role=role,
+            scope="Updated docs",
+            owned_paths=[],
+            acceptance_criteria=[],
+            expected_evidence="",
+            clock=time.time,
+        )
+    with store._connect() as conn:
+        conn.execute("DROP TRIGGER protect_cancelled_task_attempt")
+        conn.execute("DROP TABLE task_cancellations")
+
+    assert main([*opts, "--json", "--role", "worker", "--limit", "1"]) == 0
+    page = json.loads(capsys.readouterr().out)
+    assert [task["id"] for task in page["tasks"]] == [1]
+    assert page["next_after_id"] == 1
+
+    assert main([*opts, "--json", "--role", "worker", "--after-id", "1"]) == 0
+    page = json.loads(capsys.readouterr().out)
+    assert [task["id"] for task in page["tasks"]] == [3]
+    assert page["next_after_id"] is None
+    with store._connect() as conn:
+        assert not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='task_cancellations'"
+        ).fetchone()
+
+
+def test_cli_tasks_escapes_board_authored_terminal_controls(tmp_path, capsys):
+    from switchboard_relay.protocol import Protocol
+    from switchboard_relay.tasks import TaskQueue
+
+    path = tmp_path / "board.db"
+    store = Store(path)
+    protocol = Protocol(store)
+    role = "docs" + chr(10) + "team"
+    owner = "worker" + chr(27) + "[0m"
+    now = time.time()
+    protocol.claim("lead", "lead", "", now=now)
+    protocol.claim("worker", owner, role, now=now)
+    queue = TaskQueue(store)
+    scope = "Scope" + chr(27) + "[2J"
+    task = queue.submit(
+        "lead",
+        "lead",
+        role=role,
+        scope=scope,
+        owned_paths=[],
+        acceptance_criteria=[],
+        expected_evidence="",
+        clock=lambda: now,
+    )
+    claim = queue.claim(owner, "worker", role, clock=lambda: now)
+    key = {"task_id": task["id"], "receipt": claim["receipt"]}
+    args = ["--db", str(path), "tasks"]
+
+    blocker = "Waiting" + chr(13) + "overwrite"
+    queue.update(owner, "worker", **key, action="blocked", note=blocker, clock=lambda: now)
+    assert main(args) == 0
+    text = capsys.readouterr().out
+    assert len(text.splitlines()) == 3
+    for escaped in (r"docs\nteam", r"worker\x1b[0m", r"Scope\x1b[2J", r"Waiting\roverwrite"):
+        assert escaped in text
+    assert chr(27) not in text and chr(13) not in text
+
+    progress = "Progress" + chr(0x9B) + "2J"
+    queue.update(owner, "worker", **key, action="progress", note=progress, clock=lambda: now)
+    assert main(args) == 0
+    assert r"Progress\x9b2J" in capsys.readouterr().out
+    assert main([*args, "--json"]) == 0
+    [summary] = json.loads(capsys.readouterr().out)["tasks"]
+    assert summary["last_update"]["note"] == progress
