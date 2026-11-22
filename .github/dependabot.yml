@@ -31,3 +31,17 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
+
+  # Hook revisions pinned in .pre-commit-config.yaml. Dev-only, so `chore` like
+  # the Actions group; keeps the local ruff hook in step with the locked ruff CI uses.
+  - package-ecosystem: "pre-commit"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      pre-commit:
+        patterns: ["*"]
