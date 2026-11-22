@@ -25,14 +25,19 @@ participants(name PK, role, last_seen, last_active, registered_at)
 messages(id PK, recipient, sender, body, reply_to, created_at)
     A message row is stored with ``recipient`` set to the *literal* ``to``
     address it was sent to. Delivery matching happens at read time: a
-    participant drains messages whose ``recipient`` equals its own ``name`` or
-    its ``role``. This keeps mailboxes durable -- a message sent to a name that
-    is not registered yet simply waits in the table until that name reads it.
+    participant can claim mail addressed to its own name or role. The initial
+    queue uses the original table so existing boards and senders still work.
+
+message_deliveries(id PK, ..., receipt, lease_expires_at, acknowledged_at, expired_at)
+    The first claim moves a message here atomically. An older relay process can
+    still read the initial queue but cannot drain a claimed message. Terminal
+    rows hold only metadata and are retained for a bounded period.
 """
 
 from __future__ import annotations
 
 import os
+import secrets
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -55,6 +60,8 @@ from typing import Optional
 # stale row -- a session that really did leave lingers for one window and then
 # goes, and unregister() drops it immediately on a clean exit.
 DEFAULT_TTL_SECONDS = 1800.0
+DEFAULT_DELIVERY_LEASE_SECONDS = 300.0
+MESSAGE_STATUS_RETENTION_SECONDS = 7 * 86400.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS participants (
@@ -76,6 +83,31 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages (recipient, id);
+CREATE INDEX IF NOT EXISTS idx_messages_created ON messages (created_at);
+
+CREATE TABLE IF NOT EXISTS message_deliveries (
+    id               INTEGER PRIMARY KEY,
+    recipient        TEXT NOT NULL,
+    sender           TEXT NOT NULL,
+    body             TEXT,
+    reply_to         INTEGER,
+    created_at       REAL NOT NULL,
+    claimant         TEXT,
+    owner_token      TEXT,
+    receipt          TEXT,
+    claimed_at       REAL,
+    lease_expires_at REAL,
+    acknowledged_at  REAL,
+    expired_at       REAL
+);
+CREATE INDEX IF NOT EXISTS idx_message_deliveries_available
+    ON message_deliveries (recipient, id) WHERE body IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_message_deliveries_created
+    ON message_deliveries (created_at) WHERE body IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_message_deliveries_acknowledged
+    ON message_deliveries (acknowledged_at) WHERE acknowledged_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_message_deliveries_expired
+    ON message_deliveries (expired_at) WHERE expired_at IS NOT NULL;
 """
 
 
@@ -123,6 +155,8 @@ class Message:
     body: str
     reply_to: Optional[int]
     ts: float
+    receipt: Optional[str] = None
+    lease_expires_at: Optional[float] = None
 
     def to_dict(self) -> dict:
         # "from" is a reserved word in Python but a perfectly good JSON key, and
@@ -134,6 +168,11 @@ class Message:
             "body": self.body,
             "reply_to": self.reply_to,
             "ts": self.ts,
+            **(
+                {"receipt": self.receipt, "lease_expires_at": self.lease_expires_at}
+                if self.receipt is not None
+                else {}
+            ),
         }
 
 
@@ -389,149 +428,275 @@ class Store:
         name: str,
         role: str = "",
         *,
+        now: float,
+        max_age: Optional[float] = None,
         peek: bool = False,
         since: Optional[int] = None,
         owner_token: Optional[str] = None,
+        lease: float = DEFAULT_DELIVERY_LEASE_SECONDS,
     ) -> list[Message]:
-        """Read messages addressed to ``name`` or ``role``.
-
-        Ordered oldest-first by id. When ``peek`` is False (the default) the
-        returned rows are drained (deleted) atomically so each message is
-        delivered once. ``since`` restricts to messages with ``id > since``.
-        """
-        addresses = _addresses(name, role)
-        placeholders = ",".join("?" for _ in addresses)
-        params: list = list(addresses)
-        clause = f"recipient IN ({placeholders})"
-        if since is not None:
-            clause += " AND id > ?"
-            params.append(int(since))
-
-        with self._connect() as conn:
-            if (
-                owner_token
-                and not conn.execute(
-                    "SELECT 1 FROM relay_sessions WHERE token=? AND name=?", (owner_token, name)
-                ).fetchone()
-            ):
-                raise ValueError("session ownership lost")
-            if peek:
-                rows = conn.execute(
-                    f"SELECT id, recipient, sender, body, reply_to, created_at "
-                    f"FROM messages WHERE {clause} ORDER BY id ASC",
-                    params,
-                ).fetchall()
-                return [_row_to_message(r) for r in rows]
-
-            # Drain atomically: lock the database for the read+delete so two
-            # concurrent drainers can never return the same message.
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                if (
-                    owner_token
-                    and not conn.execute(
-                        "SELECT 1 FROM relay_sessions WHERE token=? AND name=?", (owner_token, name)
-                    ).fetchone()
-                ):
-                    raise ValueError("session ownership lost")
-                rows = conn.execute(
-                    f"SELECT id, recipient, sender, body, reply_to, created_at "
-                    f"FROM messages WHERE {clause} ORDER BY id ASC",
-                    params,
-                ).fetchall()
-                if rows:
-                    ids = [r["id"] for r in rows]
-                    id_placeholders = ",".join("?" for _ in ids)
-                    conn.execute(f"DELETE FROM messages WHERE id IN ({id_placeholders})", ids)
-                conn.execute("COMMIT")
-            except Exception:  # pragma: no cover - defensive: roll back a failed drain
-                conn.execute("ROLLBACK")
-                raise
-        return [_row_to_message(r) for r in rows]
+        """Read available mail oldest first. Peeking never claims a message."""
+        where, params = _mailbox_filter(name, role, since)
+        if peek:
+            with self._connect() as conn:
+                _check_owner(conn, name, owner_token, now)
+                rows = _select_available(conn, now, max_age, where, params)
+            return [_row_to_message(row) for row in rows]
+        return self._claim(name, owner_token, now, max_age, lease, where, params)
 
     def take_reply(
-        self, name: str, role: str = "", *, reply_to: int, owner_token: Optional[str] = None
+        self,
+        name: str,
+        role: str = "",
+        *,
+        reply_to: int,
+        now: float,
+        max_age: Optional[float] = None,
+        owner_token: Optional[str] = None,
+        lease: float = DEFAULT_DELIVERY_LEASE_SECONDS,
     ) -> Optional[Message]:
-        """Atomically remove and return the oldest reply addressed to this participant.
+        """Claim only the oldest available reply to the specified question."""
+        where, params = _mailbox_filter(name, role)
+        messages = self._claim(
+            name,
+            owner_token,
+            now,
+            max_age,
+            lease,
+            where + " AND reply_to = ?",
+            [*params, reply_to],
+            limit=1,
+        )
+        return messages[0] if messages else None
 
-        A "reply" is a message to ``name``/``role`` whose ``reply_to`` matches the
-        given id. Unlike :meth:`inbox`, this drains *only* the matching reply and
-        leaves every other message in the mailbox -- it is the primitive behind
-        the server's ``ask()`` (send-a-question-then-wait-for-its-answer) tool.
-        """
-        addresses = _addresses(name, role)
-        placeholders = ",".join("?" for _ in addresses)
-        with self._connect() as conn:
+    def _claim(
+        self,
+        name: str,
+        owner_token: Optional[str],
+        now: float,
+        max_age: Optional[float],
+        lease: float,
+        where: str,
+        params: list,
+        *,
+        limit: int = -1,
+    ) -> list[Message]:
+        with self._connect() as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
-            try:
-                if (
-                    owner_token
-                    and not conn.execute(
-                        "SELECT 1 FROM relay_sessions WHERE token=? AND name=?", (owner_token, name)
-                    ).fetchone()
-                ):
-                    raise ValueError("session ownership lost")
-                row = conn.execute(
-                    f"SELECT id, recipient, sender, body, reply_to, created_at "
-                    f"FROM messages WHERE recipient IN ({placeholders}) AND reply_to = ? "
-                    f"ORDER BY id ASC LIMIT 1",
-                    (*addresses, int(reply_to)),
-                ).fetchone()
-                if row is not None:
+            _check_owner(conn, name, owner_token, now)
+            rows = _select_available(conn, now, max_age, where, params, limit=limit)
+            messages = []
+            for row in rows:
+                receipt = secrets.token_hex(16)
+                lease_expires_at = now + lease
+                if max_age is not None:
+                    lease_expires_at = min(lease_expires_at, row["created_at"] + max_age)
+                conn.execute(
+                    """INSERT INTO message_deliveries (
+                           id, recipient, sender, body, reply_to, created_at,
+                           claimant, owner_token, receipt, claimed_at, lease_expires_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET claimant=excluded.claimant,
+                           owner_token=excluded.owner_token, receipt=excluded.receipt,
+                           claimed_at=excluded.claimed_at,
+                           lease_expires_at=excluded.lease_expires_at
+                    """,
+                    (
+                        row["id"],
+                        row["recipient"],
+                        row["sender"],
+                        row["body"],
+                        row["reply_to"],
+                        row["created_at"],
+                        name,
+                        owner_token,
+                        receipt,
+                        now,
+                        lease_expires_at,
+                    ),
+                )
+                if row["lease_expires_at"] is None:
                     conn.execute("DELETE FROM messages WHERE id = ?", (row["id"],))
-                conn.execute("COMMIT")
-            except Exception:  # pragma: no cover - defensive: roll back a failed take
-                conn.execute("ROLLBACK")
-                raise
-        return _row_to_message(row) if row is not None else None
+                messages.append(
+                    _row_to_message(row, receipt=receipt, lease_expires_at=lease_expires_at)
+                )
+        return messages
 
-    def pending_messages(self, *, since: Optional[int] = None, limit: int = 100) -> list[Message]:
-        """A page of queued (undelivered) messages, oldest first.
+    def ack(
+        self,
+        id: int,
+        receipt: str,
+        *,
+        name: str,
+        owner_token: Optional[str] = None,
+        now: float,
+        max_age: Optional[float] = None,
+    ) -> Optional[float]:
+        """Confirm the current claim or return the timestamp of a repeated ack."""
+        with self._connect() as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            _check_owner(conn, name, owner_token, now)
+            row = conn.execute(
+                """SELECT acknowledged_at, expired_at, lease_expires_at, created_at
+                   FROM message_deliveries
+                   WHERE id=? AND receipt=? AND claimant=? AND owner_token IS ?""",
+                (id, receipt, name, owner_token),
+            ).fetchone()
+            if row is None:
+                return None
+            acknowledged_at = row["acknowledged_at"]
+            if acknowledged_at is not None:
+                return (
+                    acknowledged_at
+                    if acknowledged_at > now - MESSAGE_STATUS_RETENTION_SECONDS
+                    else None
+                )
+            if (
+                row["expired_at"] is not None
+                or row["lease_expires_at"] <= now
+                or row["created_at"] <= _age_cutoff(now, max_age)
+            ):
+                return None
+            conn.execute(
+                "UPDATE message_deliveries SET body=NULL, acknowledged_at=? WHERE id=?",
+                (now, id),
+            )
+        return now
 
-        Returns up to ``limit`` messages with ``id`` greater than ``since`` (or
-        from the beginning when ``since`` is None). Callers page through a large
-        backlog by passing the last returned id as ``since``. For human
-        inspection via the ``switchboard tail`` CLI; not part of the MCP tools.
-        """
-        clause = ""
-        params: list = []
-        if since is not None:
-            clause = "WHERE id > ?"
-            params.append(int(since))
-        params.append(int(limit))
+    def status(
+        self, id: int, *, sender: str, now: float, max_age: Optional[float] = None
+    ) -> Optional[dict]:
+        """Return the delivery state visible to the original sending address."""
         with self._connect() as conn:
-            rows = conn.execute(
-                f"SELECT id, recipient, sender, body, reply_to, created_at "
-                f"FROM messages {clause} ORDER BY id ASC LIMIT ?",
+            row = conn.execute(
+                """SELECT recipient, created_at, NULL AS claimed_at, NULL AS lease_expires_at,
+                          NULL AS acknowledged_at, NULL AS expired_at
+                   FROM messages WHERE id=? AND sender=?
+                   UNION ALL
+                   SELECT recipient, created_at, claimed_at, lease_expires_at,
+                          acknowledged_at, expired_at
+                   FROM message_deliveries WHERE id=? AND sender=?""",
+                (id, sender, id, sender),
+            ).fetchone()
+        if row is None:
+            return None
+
+        status = {"id": id, "to": row["recipient"], "created_at": row["created_at"]}
+        acknowledged_at = row["acknowledged_at"]
+        if acknowledged_at is not None:
+            if acknowledged_at <= now - MESSAGE_STATUS_RETENTION_SECONDS:
+                return None
+            return {**status, "status": "acknowledged", "acknowledged_at": acknowledged_at}
+        expired_at = row["expired_at"]
+        if (
+            expired_at is None
+            and max_age is not None
+            and row["created_at"] <= _age_cutoff(now, max_age)
+        ):
+            expired_at = row["created_at"] + max_age
+        if expired_at is not None:
+            if expired_at <= now - MESSAGE_STATUS_RETENTION_SECONDS:
+                return None
+            return {**status, "status": "expired", "expired_at": expired_at}
+
+        lease_expires_at = row["lease_expires_at"]
+        if lease_expires_at is not None and lease_expires_at > now:
+            return {
+                **status,
+                "status": "leased",
+                "claimed_at": row["claimed_at"],
+                "lease_expires_at": lease_expires_at,
+            }
+        return {**status, "status": "queued"}
+
+    def pending_messages(
+        self,
+        *,
+        now: float,
+        max_age: Optional[float] = None,
+        since: Optional[int] = None,
+        limit: int = 100,
+    ) -> list[Message]:
+        """Page through currently available mail, including expired claims."""
+        with self._connect() as conn:
+            # Read-only CLI commands can inspect a board before its first upgrade.
+            has_deliveries = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='message_deliveries'"
+            ).fetchone()
+            rows = _select_available(
+                conn,
+                now,
+                max_age,
+                "id > ?",
+                [since if since is not None else 0],
+                limit=limit,
+                include_deliveries=has_deliveries is not None,
+            )
+        return [_row_to_message(row) for row in rows]
+
+    def prune_messages(self, *, now: float, max_age: Optional[float]) -> int:
+        """Age out message bodies and purge terminal metadata past its retention."""
+        cutoff = _age_cutoff(now, max_age)
+        retention_cutoff = now - MESSAGE_STATUS_RETENTION_SECONDS
+        with self._connect() as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            expired = 0
+            if max_age is not None:
+                conn.execute(
+                    """INSERT INTO message_deliveries
+                           (id, recipient, sender, created_at, expired_at)
+                       SELECT id, recipient, sender, created_at, created_at + ?
+                       FROM messages WHERE created_at <= ?""",
+                    (max_age, cutoff),
+                )
+                expired = conn.execute(
+                    "DELETE FROM messages WHERE created_at <= ?", (cutoff,)
+                ).rowcount
+                expired += conn.execute(
+                    """UPDATE message_deliveries
+                       SET body=NULL, receipt=NULL, owner_token=NULL, expired_at=created_at + ?
+                       WHERE body IS NOT NULL AND created_at <= ?""",
+                    (max_age, cutoff),
+                ).rowcount
+            conn.execute(
+                "DELETE FROM message_deliveries WHERE acknowledged_at <= ? OR expired_at <= ?",
+                (retention_cutoff, retention_cutoff),
+            )
+        return expired
+
+    def has_messages(
+        self,
+        name: str,
+        role: str = "",
+        *,
+        now: float,
+        max_age: Optional[float] = None,
+        since: Optional[int] = None,
+    ) -> bool:
+        """Check availability without fetching payloads or claiming mail."""
+        where, params = _mailbox_filter(name, role, since)
+        with self._connect() as conn:
+            return bool(_select_available(conn, now, max_age, where, params, limit=1, fields="id"))
+
+    def available_notifications(
+        self,
+        name: str,
+        role: str,
+        *,
+        now: float,
+        max_age: Optional[float],
+    ) -> list[sqlite3.Row]:
+        """Fetch only wake-up metadata for the available delivery attempts."""
+        where, params = _mailbox_filter(name, role)
+        with self._connect() as conn:
+            return _select_available(
+                conn,
+                now,
+                max_age,
+                where,
                 params,
-            ).fetchall()
-        return [_row_to_message(r) for r in rows]
-
-    def prune_messages(self, *, older_than: float) -> int:
-        """Delete messages created before ``older_than`` (epoch seconds).
-
-        Returns the number removed. Delivery only removes a row when a recipient
-        drains it, so a message sent to an address that is never read would sit
-        forever; this is the housekeeping escape hatch (exposed via the
-        ``switchboard prune`` CLI). It never touches messages newer than the
-        cutoff, so it will not race ahead of a recipient that is about to read.
-        """
-        with self._connect() as conn:
-            cur = conn.execute("DELETE FROM messages WHERE created_at < ?", (float(older_than),))
-            return cur.rowcount if cur.rowcount is not None else 0
-
-    def has_messages(self, name: str, role: str = "", *, since: Optional[int] = None) -> bool:
-        """Cheap existence check used by the server's wait() poll loop."""
-        addresses = _addresses(name, role)
-        placeholders = ",".join("?" for _ in addresses)
-        params: list = list(addresses)
-        clause = f"recipient IN ({placeholders})"
-        if since is not None:
-            clause += " AND id > ?"
-            params.append(int(since))
-        with self._connect() as conn:
-            row = conn.execute(f"SELECT 1 FROM messages WHERE {clause} LIMIT 1", params).fetchone()
-        return row is not None
+                fields="id, recipient, sender, reply_to, lease_expires_at",
+            )
 
 
 # -- helpers ----------------------------------------------------------------
@@ -618,7 +783,62 @@ def _addresses(name: str, role: str) -> tuple[str, ...]:
     return (name, role) if role else (name,)
 
 
-def _row_to_message(r: sqlite3.Row) -> Message:
+def _mailbox_filter(name: str, role: str, since: Optional[int] = None) -> tuple[str, list]:
+    addresses = _addresses(name, role)
+    placeholders = ",".join("?" for _ in addresses)
+    clause = f"recipient IN ({placeholders})"
+    if since is not None:
+        return clause + " AND id > ?", [*addresses, since]
+    return clause, list(addresses)
+
+
+def _age_cutoff(now: float, max_age: Optional[float]) -> float:
+    return now - max_age if max_age is not None else float("-inf")
+
+
+def _check_owner(
+    conn: sqlite3.Connection, name: str, owner_token: Optional[str], now: float
+) -> None:
+    if (
+        owner_token
+        and not conn.execute(
+            "SELECT 1 FROM relay_sessions WHERE token=? AND name=? AND expires>?",
+            (owner_token, name, now),
+        ).fetchone()
+    ):
+        raise ValueError("session ownership lost")
+
+
+def _select_available(
+    conn: sqlite3.Connection,
+    now: float,
+    max_age: Optional[float],
+    where: str,
+    params: list,
+    *,
+    limit: int = -1,
+    fields: str = "*",
+    include_deliveries: bool = True,
+) -> list[sqlite3.Row]:
+    cutoff = _age_cutoff(now, max_age)
+    columns = "id, recipient, sender, body, reply_to, created_at"
+    sql = f"""SELECT {columns}, NULL AS lease_expires_at
+              FROM messages WHERE {where} AND created_at > ?"""
+    args = [*params, cutoff]
+    if include_deliveries:
+        sql += f""" UNION ALL SELECT {columns}, lease_expires_at
+                    FROM message_deliveries
+                    WHERE {where} AND created_at > ?
+                      AND body IS NOT NULL AND lease_expires_at <= ?"""
+        args.extend([*params, cutoff, now])
+    return conn.execute(
+        f"SELECT {fields} FROM ({sql}) ORDER BY id LIMIT ?", (*args, limit)
+    ).fetchall()
+
+
+def _row_to_message(
+    r: sqlite3.Row, *, receipt: Optional[str] = None, lease_expires_at: Optional[float] = None
+) -> Message:
     return Message(
         id=r["id"],
         to=r["recipient"],
@@ -626,4 +846,6 @@ def _row_to_message(r: sqlite3.Row) -> Message:
         body=r["body"],
         reply_to=r["reply_to"],
         ts=r["created_at"],
+        receipt=receipt,
+        lease_expires_at=lease_expires_at,
     )

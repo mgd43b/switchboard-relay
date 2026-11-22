@@ -27,7 +27,7 @@ def test_charter_election_rename_failover_and_revisions(tmp_path):
     store.send("alice", "pending", sender="bob", now=2)
     p.claim("a", "renamed", "", now=3)
     assert p.context("a", 3)["coordinator"] == "renamed"
-    assert store.inbox("renamed")[0].body == "pending"
+    assert store.inbox("renamed", now=2)[0].body == "pending"
     assert "alice" not in [x.name for x in store.participants(now=3)]
     p.touch("b", 5, "configured")
     p.leave("a", 6)
@@ -65,7 +65,7 @@ def test_atomic_claims_and_legacy_collision(tmp_path):
         p.claim("x", "legacy", "", now=2)
     assert p.claim("x", "legacy", "", now=2, explicit=False) != "legacy"
     assert p.claim("y", "lead", "", now=300) == "lead"
-    assert store.pending_messages() == []
+    assert store.pending_messages(now=2) == []
 
 
 def test_default_refresh_and_transfer_generation(tmp_path, monkeypatch):
@@ -74,7 +74,7 @@ def test_default_refresh_and_transfer_generation(tmp_path, monkeypatch):
     p.claim("a", "owner", "", now=0)
     with store._connect() as c:
         c.execute("UPDATE relay_charters SET text='older default'")
-    monkeypatch.setattr("switchboard_relay.protocol.DEFAULT_CHARTER_VERSION", 2)
+    monkeypatch.setattr("switchboard_relay.protocol.DEFAULT_CHARTER_VERSION", 3)
     p = Protocol(store)
     assert p.context("", 1)["charter_revision"] == 2
     monkeypatch.setattr("switchboard_relay.protocol.DEFAULT_CHARTER_VERSION", 1)
@@ -84,17 +84,31 @@ def test_default_refresh_and_transfer_generation(tmp_path, monkeypatch):
         p.transfer("owner", 2, 1, expected_generation=-1)
 
 
-def test_stale_owner_cannot_drain_or_take_reply(tmp_path):
+def test_stale_owner_cannot_claim_mail_or_replies(tmp_path):
     store = Store(tmp_path / "b.db")
     p = Protocol(store, lease=1)
     p.claim("a", "lead", "", now=0)
     p.claim("b", "lead", "", now=2)
     store.send("lead", "pending", sender="peer", reply_to=1, now=2)
     with pytest.raises(ValueError, match="ownership lost"):
-        store.inbox("lead", owner_token="a")
+        store.inbox("lead", owner_token="a", now=2)
     with pytest.raises(ValueError, match="ownership lost"):
-        store.take_reply("lead", reply_to=1, owner_token="a")
-    assert store.inbox("lead", owner_token="b")[0].body == "pending"
+        store.take_reply("lead", reply_to=1, owner_token="a", now=2)
+    assert store.inbox("lead", owner_token="b", now=2)[0].body == "pending"
+
+
+def test_renaming_preserves_active_claims_and_redelivery(tmp_path):
+    store = Store(tmp_path / "b.db")
+    protocol = Protocol(store)
+    protocol.claim("owner", "old", "", now=0)
+    first = store.send("old", "handled", sender="peer", now=1)
+    second = store.send("old", "pending", sender="peer", now=1)
+    claimed, _ = store.inbox("old", owner_token="owner", now=2, lease=2)
+
+    protocol.claim("owner", "new", "", now=3)
+    assert store.ack(first, claimed.receipt, name="new", owner_token="owner", now=3) == 3
+    assert store.inbox("old", now=4) == []
+    assert [m.id for m in store.inbox("new", owner_token="owner", now=4)] == [second]
 
 
 def test_simultaneous_schema_initialization(tmp_path):

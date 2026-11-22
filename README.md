@@ -84,13 +84,15 @@ claude mcp add --scope user -- switchboard-relay
 two sessions from one client or one of each. Paste into the first:
 
 ```
-Register me on switchboard-relay as "lead", then wait() for a message and reply to its sender.
+Register me on switchboard-relay as "lead". Use wait() for a message, reply to its sender
+with reply_to set to its ID, then acknowledge it with ack(id, receipt).
 ```
 
 …and into the second:
 
 ```
 Register me on switchboard-relay, then ask() "lead": what should I work on next?
+Acknowledge the reply with ack(reply.id, reply.receipt) after reading it.
 ```
 
 The second session gets its answer back inline — no window‑switching. That's the whole loop. 🎉
@@ -407,13 +409,15 @@ The tools, grouped by what you reach for:
 |------|-----------|--------------|
 | `send` | `send(to, body, reply_to?)` | Append a message to `to`'s durable inbox. `to` matches a participant **name or role**. `reply_to` threads a reply to a message id. Returns the new message `id` — plus `no_live_recipient: true` and a `warning` if nobody is currently registered as `to` (usually a typo; the message is still queued). |
 | `broadcast` | `broadcast(body)` | Send `body` to every currently‑live participant except yourself. Returns the per‑recipient message ids. |
+| `status` | `status(id)` | Look up mail sent from your address. Returns `queued`, `leased`, `acknowledged`, `expired`, or `unknown`, with timestamps for the current state. |
 
 **Receive** — read your mailbox
 
 | Tool | Signature | What it does |
 |------|-----------|--------------|
-| `inbox` | `inbox(peek?, since?)` | Read messages addressed to you. **Drains** by default (each delivered once); `peek=true` reads without removing; `since=<id>` returns only messages newer than that id. |
-| `wait` | `wait(timeout_s?)` | Block up to `timeout_s` seconds (default 30, max 3600) until a message arrives, then drain and return it. Returns `timed_out: true` on timeout. In Claude Code, keep `timeout_s` under 1800: Claude Code aborts an MCP call that sends nothing for 30 minutes. |
+| `inbox` | `inbox(peek?, since?)` | Claim available mail addressed to you. Results include a `receipt` and `lease_expires_at` for each claim. `peek=true` inspects available mail without claiming it. `since=<id>` filters by ID, including on redelivery. |
+| `wait` | `wait(timeout_s?)` | Block up to `timeout_s` seconds (default 30, max 3600) for available mail and claim it like `inbox()`. Returns `timed_out: true` on timeout. In Claude Code, keep silent waits under the host's idle limit. |
+| `ack` | `ack(id, receipt)` | Confirm a claim after handling the message. Repeating a successful ack returns the original `acknowledged_at` during retention. An invalid or expired receipt returns `ok: false`. |
 
 **Context** — what the board expects of this session
 
@@ -428,14 +432,14 @@ The tools, grouped by what you reach for:
 | Tool | Signature | What it does |
 |------|-----------|--------------|
 | `standby` | `standby(enabled?)` | Turn listening on or off for this session. It's on by default (unless `SWITCHBOARD_AUTO_LISTEN=0`), and `standby(false)` stays off for the rest of the session. Listening needs the host's trusted `Stop` hook; without one the session is `polling-only`. |
-| `host_standby` | `host_standby(timeout_s?)` | Internal target of the Codex and Claude Code `Stop` hooks. It peeks for mail without draining it and returns the hook's continuation decision. Agents should call `standby()`, not this. |
+| `host_standby` | `host_standby(timeout_s?)` | Internal target of the Codex and Claude Code `Stop` hooks. It checks availability and returns the hook's continuation decision. Agents should call `standby()`, not this. |
 | `codex_standby` | `codex_standby(timeout_s?)` | Older name for `host_standby`, kept so existing Codex hook installs keep working. |
 
 **Ask** — send and block for the answer in one call
 
 | Tool | Signature | What it does |
 |------|-----------|--------------|
-| `ask` | `ask(to, body, timeout_s?)` | Send `body` to `to`, then block until a reply threaded to it comes back (`reply_to` = the returned `question_id`). Leaves other inbox messages untouched; returns `timed_out: true` if no reply in time — with `no_live_recipient: true` when nobody was registered as `to` at send time, so you can tell a wrong address from a slow reply. |
+| `ask` | `ask(to, body, timeout_s?)` | Send `body` to `to`, then block until a reply threaded to it comes back (`reply_to` = the returned `question_id`). Claims just the matching reply. After handling it, call `ack(reply.id, reply.receipt)`. Returns `timed_out: true` if no reply in time — with `no_live_recipient: true` when nobody was registered as `to` at send time, so you can tell a wrong address from a slow reply. |
 
 > **Readiness.** A peer's `ready` flag means its agent called `bootstrap()` (or `charter()`) at the
 > current charter revision. It does not mean the peer agrees to the charter or will follow it.
@@ -617,7 +621,8 @@ All optional. Set as environment variables through `codex mcp add --env KEY=valu
 | `SWITCHBOARD_DB` | *(the board's file)* | Raw SQLite path override — wins over `SWITCHBOARD_BOARD`. Point several sessions at one exact file to share it. |
 | `SWITCHBOARD_PROJECT_DIR` | *(server launch directory)* | Client-neutral project root used to derive the default board. Wins over the compatibility-only `CLAUDE_PROJECT_DIR`. |
 | `SWITCHBOARD_TTL` | `1800` (30 min) | Seconds without a sign of life before a participant drops out of `participants()` — and stops receiving `broadcast()`. A connected session keeps itself alive automatically, so in practice this is the window for noticing a session whose *process* went away without a clean `unregister()`. |
-| `SWITCHBOARD_MSG_TTL` | `604800` (7 days) | Undelivered messages older than this are pruned automatically during normal operation. Set `0` to disable age‑out. |
+| `SWITCHBOARD_MSG_TTL` | `604800` (7 days) | Maximum age of unacknowledged messages. Set `0` to disable age-out. Use the same setting for processes on a shared board. |
+| `SWITCHBOARD_DELIVERY_LEASE` | `300` (5 minutes) | Seconds a message claim is held for its recipient. Accepts positive finite values. |
 | `SWITCHBOARD_MAX_BODY` | `262144` (256 KiB) | Reject a `send()` whose body exceeds this many UTF‑8 bytes. Set `0` to disable the cap. |
 | `SWITCHBOARD_AUTO` | `1` | Claim an address, discover peers, deliver the charter, and listen between turns automatically when a session connects. Set `0` to require an explicit `register()` and turn listening off. |
 | `SWITCHBOARD_AUTO_LISTEN` | `1` | Start each session with listening between turns on. Set `0` to start with it off; `standby(true)` still turns it on. |
@@ -650,9 +655,26 @@ pushed into a turn with [turn injection](#turn-injection-push). Generic MCP clie
 polling-only. Each session's `listen_status` reports which applies. Durable mail remains queued when
 no listener is active.
 
-Delivery is **at most once**: each message is drained by one reader. If a client gives up on a
-`wait()` that has already drained a message (for example, Claude Code aborting a call that ran past
-its idle limit), that message can be lost. Keep waits under the host's limit.
+### Delivery and acknowledgments
+
+An available message can have **one active claim**. `inbox()`, `wait()`, and the reply returned by
+`ask()` include an attempt-specific `receipt` and `lease_expires_at`. Call `ack(id, receipt)` once
+you have safely handled that message. If the recipient disconnects before acknowledging, the
+message becomes available again when its lease expires, provided it is still within the message TTL.
+
+Delivery is **at least once** within the message lifetime when an eligible recipient keeps reading.
+A retry carries the same message ID and a fresh receipt. Use the ID to recognize work you already
+handled, especially when the original attempt performed an action before it could acknowledge the
+message. Poll without an ID cursor when you want to recover older retries.
+
+The sender can call `status(id)` for messages from its sending address. A lapsed lease returns to
+`queued`. Acknowledgment and message expiry remove the body and leave status metadata for seven
+days from the corresponding event. After that, `status(id)` returns `unknown`.
+
+**Upgrading a shared board.** Update and restart every relay process on the board for at-least-once
+delivery throughout. Existing queued mail carries forward. Older readers still drain unclaimed
+mail from the initial queue, so an ID they remove can become `unknown`. Once an updated process
+claims a message, that message is stored separately and remains recoverable by updated readers.
 
 Boards are SQLite files under your home directory, so "same machine" really means the same OS user
 on one machine. There is no network transport.
@@ -663,7 +685,7 @@ on one machine. There is no network transport.
 
 By default a recipient only learns about a message when *it* next polls (`inbox()`/`wait()`).
 **Turn injection** removes that wait: a `send()` makes the recipient's open session **react on the
-spot** — the message arrives *as a turn*, and the session drains its inbox and acts, with no manual
+spot** — the message arrives *as a turn*, and the session claims its mail and acts, with no manual
 poll. It's the "responsive‑lead" setup — a lead that answers the instant a worker asks.
 
 There are **two mechanisms**, by recipient surface — set up whichever matches where your *reactor*
@@ -676,8 +698,8 @@ runs (the *sender* can be any surface):
 | **Claude Code (CLI/terminal)** | [Channels](https://code.claude.com/docs/en/channels) — the recipient self‑injects | **zero‑touch**, fully automatic |
 | **Claude Desktop** | `ccd_session_mgmt.send_message` — the *sender* injects | **one approval click per message** |
 
-The lifecycle and Claude mechanisms are accelerators on top of the durable polling path and preserve
-**drain-once**. Codex listening requires the plugin hook to be reviewed and trusted with `/hooks`.
+Hooks and push both wake the recipient to claim available mail through the same mailbox. Codex
+listening requires the plugin hook to be reviewed and trusted with `/hooks`.
 
 ### Reacting on the CLI (Channels) — the three hard constraints
 
@@ -695,7 +717,7 @@ falls back to the durable poll — nothing breaks, the message just waits in the
 
 Because MCP stdio is bidirectional, each session's own switchboard process can push a notification to
 *its own* client. With push enabled, that process runs a background watcher that polls the shared
-board and self‑nudges when a message lands — so you get turn injection with **no daemon, no launchd,
+board and self‑nudges when a message becomes available — so you get turn injection with **no daemon, no launchd,
 no reboot story**, and [per‑project boards](#boards-one-switchboard-per-project) keep working.
 
 ```bash
@@ -753,23 +775,18 @@ reacts. No session ever discloses its id to another — each records only its ow
 - **The CCD id derivation** (`local_<CLAUDE_CODE_SESSION_ID>`) holds for a normal top‑level session;
   in an **agent/child** context the env id isn't the addressable one, so set
   `SWITCHBOARD_CCD_SESSION_ID=<full id>` to override. Confirm once with the two‑session check below.
-- Best‑effort and **idempotent**: the injected turn is a body‑less nudge (the real message stays in
-  the durable inbox and is drained by one reader), so even if a recipient *also* has the CLI watcher, a
-  double nudge can't double‑deliver.
+- The injected turn is a body-less nudge. The recipient claims and acknowledges the message
+  through the same mailbox used by the CLI watcher.
 
-### What's actually sent (and why it stays drain‑once)
+### What the notification carries
 
 On the CLI path, switchboard emits a `notifications/claude/channel` notification that Claude Code
 wraps into the recipient's next turn as `<channel source="switchboard-relay" msg_from="…"
-msg_id="…">…</channel>`. Each session's own watcher polls the board for messages addressed to
-*itself* and self‑nudges; the cross‑session hop is the shared SQLite board.
+msg_id="…">…</channel>`. Each session's watcher reads availability from the shared SQLite board.
 
-The notification is a **nudge that says "drain your inbox and handle it"**, *not* the message body.
-The durable SQLite row stays the single source of truth, which is what preserves **drain‑once**: when
-a **role** is addressed, every connected member is nudged, but only the one that wins the atomic
-`inbox()` drain receives the message — the others find an empty inbox (the nudge says so) and do
-nothing. (Inlining the body for a unique‑name/single‑reader target was considered and deliberately
-declined: it would split the source of truth and risk double‑handling.)
+The notification tells the recipient to call `inbox()` and acknowledge each message it handles.
+A role-addressed message can nudge multiple members. One claims it, and peers may find an empty
+inbox. If the claim expires, the watcher can nudge eligible recipients again for the same ID.
 
 Two things stay true no matter what: push **never replaces durable delivery** (disable it and
 everything still works by polling), and it **can't wake a closed session**. Channels is a research
@@ -855,7 +872,7 @@ Tests are split into three tiers:
 
 - `tests/unit/` — the SQLite store and board resolution in isolation.
 - `tests/feature/` — tool behavior through the server layer (identity, push, roles, hygiene bounds, the CLI) with a fake Context.
-- `tests/integration/` — the tools over a real MCP transport, including **two real stdio subprocesses**, plus an **N‑process drain‑once stress test** that reconciles sent‑vs‑received ids under contention (including shared‑role drains).
+- `tests/integration/` — the tools over a real MCP transport, including **two real stdio subprocesses**, plus an **N-process claim and ack stress test** that reconciles sent and acknowledged IDs under shared-role contention.
 
 The Claude Code plugin/marketplace manifests live in [`.claude-plugin/`](.claude-plugin/); validate
 them with `claude plugin validate .`. Codex packaging lives in

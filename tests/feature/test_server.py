@@ -235,20 +235,39 @@ def test_check_body_ignores_non_string(tmp_path):
 # -- hygiene bounds: undelivered-message TTL (#17) --------------------------
 
 
+def test_status_scopes_broadcast_ids_to_the_sending_address(board):
+    lead, one, two = _ctx(), _ctx(), _ctx()
+    board.register(lead, "lead")
+    board.register(one, "one", "worker")
+    board.register(two, "two", "worker")
+
+    ids = {entry["to"]: entry["id"] for entry in _run(board.broadcast, lead, "hello")["delivered"]}
+    assert board.status(lead, ids["one"])["status"] == "queued"
+    assert board.status(lead, ids["two"])["status"] == "queued"
+    assert board.status(one, ids["one"]) == {"id": ids["one"], "status": "unknown"}
+
+    [msg] = board.inbox(one)["messages"]
+    assert board.status(lead, msg["id"])["status"] == "leased"
+    assert board.ack(two, msg["id"], msg["receipt"])["ok"] is False
+    assert board.ack(one, msg["id"], msg["receipt"])["ok"] is True
+    assert board.status(lead, msg["id"])["status"] == "acknowledged"
+    assert board.status(lead, ids["two"])["status"] == "queued"
+
+
 def test_msg_ttl_ages_out_stale_queued_messages(tmp_path):
     sb = _sb(tmp_path, msg_ttl=1.0)
     now = time.time()
     sb.store.send("lead", "ancient", sender="w", now=now - 1000)  # older than msg_ttl
     sb.store.send("lead", "fresh", sender="w", now=now)  # recent
     sb.register(_ctx(), "someone")  # normal op triggers opportunistic prune
-    assert [m.body for m in sb.store.inbox("lead", peek=True)] == ["fresh"]
+    assert [m.body for m in sb.store.inbox("lead", peek=True, now=time.time())] == ["fresh"]
 
 
 def test_msg_ttl_zero_disables_ageout(tmp_path):
     sb = _sb(tmp_path, msg_ttl=0)
     sb.store.send("lead", "ancient", sender="w", now=time.time() - 10**9)
     sb.register(_ctx(), "someone")
-    assert [m.body for m in sb.store.inbox("lead", peek=True)] == ["ancient"]
+    assert [m.body for m in sb.store.inbox("lead", peek=True, now=time.time())] == ["ancient"]
 
 
 # -- connection registry eviction (#18) -------------------------------------
@@ -299,7 +318,7 @@ def test_participants_before_register_returns_empty(board):
 def test_wait_returns_immediately_when_message_present(board):
     ctx = _ctx()
     board.register(ctx, "worker:x", "worker")
-    board.store.send("worker:x", "already here", sender="lead", now=1.0)
+    board.store.send("worker:x", "already here", sender="lead", now=time.time())
     # A non-numeric timeout falls back to the default, but a pending message
     # means wait() returns at once without any real blocking.
     out = _run(board.wait, ctx, "not-a-number")
@@ -344,7 +363,7 @@ def test_codex_standby_wakes_without_draining_durable_mail(board):
     out = _run(board.codex_standby, ctx, 0)
     assert out["decision"] == "block"
     assert "Call inbox()" in out["reason"]
-    assert board.store.has_messages("lead")
+    assert board.store.has_messages("lead", now=time.time())
 
 
 def test_codex_standby_rearms_after_an_empty_window(board):
@@ -367,7 +386,7 @@ def test_ask_times_out_without_reply(board):
     assert out["timed_out"] is True
     assert out["reply"] is None
     # The question is still durably queued for the (absent) recipient.
-    assert board.store.has_messages("lead")
+    assert board.store.has_messages("lead", now=time.time())
 
 
 async def test_ask_returns_reply_when_it_arrives(board):
@@ -379,7 +398,7 @@ async def test_ask_returns_reply_when_it_arrives(board):
 
     async def respond():
         for _ in range(200):
-            pending = board.store.pending_messages()
+            pending = board.store.pending_messages(now=time.time())
             q = next((m for m in pending if m.to == "lead"), None)
             if q is not None:
                 board.send(responder, "worker:x", "the answer is 42", q.id)
@@ -606,14 +625,14 @@ def test_watch_tick_nudges_local_session_and_leaves_message(board):
     # bare identifier or the client silently drops it.
     assert "source" not in meta
     assert all(_META_KEY_RE.match(k) for k in meta)
-    # Reactive, body-less nudge: tells the recipient to drain inbox() and act,
+    # The body-less nudge tells recipients to claim and acknowledge their mail,
     # and never carries the message text (the durable row is the source of truth).
     content = dumped["params"]["content"].lower()
     assert "inbox()" in content
-    assert "react" in content or "act on" in content
+    assert "ack(id, receipt)" in content
     assert "hello" not in dumped["params"]["content"]
-    # Peeked, NOT drained: the durable row is untouched and still deliverable.
-    assert board.store.has_messages("lead")
+    # The watcher leaves the message available to claim.
+    assert board.store.has_messages("lead", now=time.time())
 
 
 def test_watch_tick_role_message_reports_role_as_msg_to(board):
@@ -634,7 +653,7 @@ def test_watch_tick_does_not_renudge_same_message(board):
     board.register(ctx, "lead")
     board.store.send("lead", "one", sender="worker", now=time.time())
     assert _tick(board) == 1
-    assert _tick(board) == 0  # high-water mark: no repeat nudge for the same row
+    assert _tick(board) == 0  # same availability attempt
     assert len(ctx.session.sent) == 1
 
 
@@ -647,6 +666,28 @@ def test_watch_tick_renudges_on_a_new_message(board):
     board.store.send("lead", "two", sender="worker", now=time.time())
     assert _tick(board) == 1  # a genuinely new message earns a fresh nudge
     assert len(ctx.session.sent) == 2
+
+
+def test_watch_tick_nudges_again_when_an_older_lease_expires(board, monkeypatch):
+    initial = time.time()
+    clock = [initial]
+    monkeypatch.setattr("switchboard_relay.server._now", lambda: clock[0])
+    board.delivery_lease = 10
+    lead, worker = _ctx(), _ctx()
+    board.register(lead, "lead")
+    board.register(worker, "worker")
+    old = board.send(worker, "lead", "older")["id"]
+    assert _tick(board) == 1
+    [first] = board.inbox(lead)["messages"]
+    assert first["id"] == old
+
+    new = board.send(worker, "lead", "newer")["id"]
+    assert _tick(board) == 1
+    assert lead.session.sent[-1]["params"]["meta"]["msg_id"] == str(new)
+    clock[0] += 10
+    assert _tick(board) == 1
+    assert lead.session.sent[-1]["params"]["meta"]["msg_id"] == str(old)
+    assert _tick(board) == 0
 
 
 def test_keepalive_keeps_connected_session_live_without_resetting_idle(board):
@@ -676,7 +717,7 @@ def test_keepalive_survives_an_unwritable_row(board, monkeypatch):
 
 def test_watch_tick_best_effort_on_bad_session(board):
     # A recipient whose session errors on push must not raise, and the watcher
-    # must not spin retrying it (the high-water mark still advances).
+    # must not spin retrying it (retry backoff applies).
     board._push_enabled = True
 
     class Boom:
@@ -688,12 +729,11 @@ def test_watch_tick_best_effort_on_bad_session(board):
     board.store.send("lead", "hi", sender="worker", now=time.time())
     assert _tick(board) == 0  # push failed -> not counted, but no raise
     assert _tick(board) == 0  # and no retry storm on the same row
-    assert board.store.has_messages("lead")  # still durable
+    assert board.store.has_messages("lead", now=time.time())  # still durable
 
 
 def test_watch_loop_keeps_alive_but_never_nudges_when_push_off(board, monkeypatch):
-    # With push disabled the loop still runs -- it just does the keepalive and
-    # nothing else. No nudges, no board polling, no _watch_tick at all.
+    # The loop maintains liveness with push disabled.
     import switchboard_relay.server as server_mod
 
     monkeypatch.setattr(server_mod, "_KEEPALIVE_SECONDS", 0.01)  # iterate quickly
@@ -713,7 +753,7 @@ def test_watch_loop_keeps_alive_but_never_nudges_when_push_off(board, monkeypatc
 
     anyio.run(drive)
     assert not ctx.session.sent  # push stayed off: no turn injection
-    assert board.store.has_messages("lead")
+    assert board.store.has_messages("lead", now=time.time())
 
 
 def test_watch_loop_delivers_reticks_then_cancels(board, monkeypatch):
@@ -749,7 +789,7 @@ def test_watch_loop_delivers_reticks_then_cancels(board, monkeypatch):
 
     anyio.run(drive)
     assert ctx.session.sent  # nudged its own client
-    assert board.store.has_messages("lead")  # peeked, not drained
+    assert board.store.has_messages("lead", now=time.time())  # peeked, not drained
 
 
 # -- turn injection on Desktop (ccd_session_mgmt broker) --------------------
@@ -801,7 +841,7 @@ def test_ccd_inject_returns_recipient_target(board):
         {
             "session_id": "local_LEAD",
             "message": f"New switchboard message (id {res['id']}) is waiting for you. "
-            "Call inbox() to read and handle it.",
+            "Call inbox() to claim it. After handling it, call ack(id, receipt).",
         }
     ]
     # Body-less: the real message text is never in the injected turn (keeps the

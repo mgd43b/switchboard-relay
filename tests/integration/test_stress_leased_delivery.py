@@ -1,14 +1,8 @@
-"""N-process exactly-once delivery stress test.
+"""Reconcile sent and acknowledged IDs under multi-process shared-role contention.
 
-The rest of the integration suite proves *delivery*; this proves the load-bearing
-safety property under *contention*: with many independent OS processes reading and
-writing the same board over WAL, every message is delivered **exactly once** -- no
-loss, no duplication -- including the shared-role case where several drainers read
-the same role address and each message must be claimed by exactly one of them.
-
-It spawns real processes (not just tasks) so the drain's ``BEGIN IMMEDIATE`` lock is
-exercised across process boundaries, the way independent Claude Code sessions run.
-Bounded workers + message count keep it to a couple of seconds in CI.
+The workers claim from the same role over WAL and acknowledge each delivery.
+A long lease prevents redelivery during this test so duplicate IDs expose
+overlapping claims. Disconnect and redelivery are covered by the stdio tests.
 """
 
 from __future__ import annotations
@@ -34,15 +28,17 @@ def _sender(db_path: str, idx: int, count: int, sent_ids) -> None:
         sent_ids.append(mid)
 
 
-def _drainer(db_path: str, name: str, done, recv_ids, deadline: float) -> None:
-    # Drains messages addressed to the shared role. drain-once is enforced by the
-    # store's BEGIN IMMEDIATE, so two drainers can never return the same row.
+def _receiver(db_path: str, name: str, done, acked_ids, deadline: float) -> None:
     store = Store(db_path)
     empty_streak = 0
     while True:
-        got = store.inbox(name, _ROLE)  # drains atomically
+        got = store.inbox(name, _ROLE, now=time.time())
         if got:
-            recv_ids.extend([m.id for m in got])  # a list -- the proxy can't pickle a generator
+            for message in got:
+                assert (
+                    store.ack(message.id, message.receipt, name=name, now=time.time()) is not None
+                )
+            acked_ids.extend([m.id for m in got])
             empty_streak = 0
         else:
             empty_streak += 1
@@ -55,19 +51,19 @@ def _drainer(db_path: str, name: str, done, recv_ids, deadline: float) -> None:
         time.sleep(0.005)
 
 
-def test_n_process_exactly_once_shared_role(tmp_path):
+def test_n_process_claim_and_ack_shared_role(tmp_path):
     ctx = mp.get_context("spawn")  # deterministic across platforms
     db = str(tmp_path / "stress.db")
     Store(db).close()  # create schema + WAL up front so workers don't race first-init
 
     with ctx.Manager() as mgr:
         sent_ids = mgr.list()
-        recv_ids = mgr.list()
+        acked_ids = mgr.list()
         done = ctx.Event()
         deadline = time.time() + _SAFETY_TIMEOUT_S
 
         drainers = [
-            ctx.Process(target=_drainer, args=(db, f"d{k}", done, recv_ids, deadline))
+            ctx.Process(target=_receiver, args=(db, f"d{k}", done, acked_ids, deadline))
             for k in range(DRAINERS)
         ]
         for d in drainers:
@@ -93,8 +89,8 @@ def test_n_process_exactly_once_shared_role(tmp_path):
         assert not stragglers, f"{len(stragglers)} worker process(es) did not exit in time"
 
         sent = list(sent_ids)
-        received = list(recv_ids)
+        acknowledged = list(acked_ids)
 
     assert len(sent) == TOTAL, "every send must return an id"
-    assert len(received) == len(set(received)), "no message delivered more than once"
-    assert sorted(received) == sorted(sent), "every message delivered exactly once, none dropped"
+    assert len(acknowledged) == len(set(acknowledged)), "no message claimed by two workers"
+    assert sorted(acknowledged) == sorted(sent), "every sent message acknowledged"

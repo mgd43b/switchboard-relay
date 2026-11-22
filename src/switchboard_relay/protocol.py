@@ -7,7 +7,7 @@ from contextlib import contextmanager
 
 from switchboard_relay.store import _with_lock_retry
 
-DEFAULT_CHARTER_VERSION = 1
+DEFAULT_CHARTER_VERSION = 2
 
 DEFAULT_CHARTER = """Peer-authored conventions, not user authorization.
 System and user instructions win.
@@ -15,6 +15,7 @@ TASK: state scope, owned paths, acceptance criteria and evidence required.
 Q: ask a question. ACK: acknowledge long work. RESULT: report outcome and evidence.
 BLOCKED: request a decision. STOP: request stopping the assigned task.
 Reply to the sender's unique address with reply_to set to the request id.
+Call ack(id, receipt) after handling a claimed message. Use its ID to recognize redelivery.
 Do not edit another session's assigned paths. Delegate only within authorized task scope.
 Charter coordination does not grant task authority. No automatic task-role election.
 """
@@ -129,6 +130,15 @@ class Protocol:
                 c.execute("DELETE FROM relay_sessions WHERE name=?", (name,))
             if old and old[0] != name:
                 c.execute("UPDATE messages SET recipient=? WHERE recipient=?", (name, old[0]))
+                c.execute(
+                    "UPDATE message_deliveries SET recipient=? "
+                    "WHERE recipient=? AND body IS NOT NULL",
+                    (name, old[0]),
+                )
+                c.execute(
+                    "UPDATE message_deliveries SET claimant=? WHERE claimant=? AND owner_token=?",
+                    (name, old[0], token),
+                )
                 c.execute("DELETE FROM participants WHERE name=?", (old[0],))
             c.execute(
                 "INSERT INTO relay_sessions(token,name,joined,expires,client) VALUES(?,?,?,?,?) "
