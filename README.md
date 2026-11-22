@@ -412,7 +412,7 @@ The tools, grouped by what you reach for:
 
 | Tool | Signature | What it does |
 |------|-----------|--------------|
-| `send` | `send(to, body, reply_to?, idempotency_key?, receipt?)` | Append a message to `to`'s durable inbox. `to` matches a participant **name or role**. `reply_to` threads a reply to a message id. Returns the new message `id` — plus `no_live_recipient: true` and a `warning` if nobody is currently registered as `to` (usually a typo; the message is still queued). A live address with only polling readers sets `polling_only_recipient: true` and a warning. |
+| `send` | `send(to, body, reply_to?, idempotency_key?, receipt?)` | Append a message to `to`'s durable inbox. `to` matches a participant **name or role**. `reply_to` threads a reply to a message id. Returns the new message `id` — plus `no_live_recipient: true` and a `warning` if nobody is currently registered as `to` (usually a typo; the message is still queued). A live address whose readers report no configured or armed Stop-hook standby sets `no_stop_hook_listener: true` and a warning. |
 | `broadcast` | `broadcast(body)` | Send `body` to every currently‑live participant except yourself. Returns the per‑recipient message ids. |
 | `status` | `status(id)` | Look up mail sent from your address. Returns `queued`, `leased`, `acknowledged`, `expired`, or `unknown`, with timestamps for the current state. |
 
@@ -420,6 +420,8 @@ When answering a claimed message, use `send(to, body, reply_to=id, receipt=recei
 the reply and acknowledge the original in one transaction. The response includes `acked: true`
 and `acknowledged_at` on success. A stale or invalid receipt still sends the reply and returns
 `acked: false` with `ack_error`. Use `ack(id, receipt)` for handled mail that needs no reply.
+Because `send()` can acknowledge and clear a stored message body, it advertises the destructive
+MCP tool hint for the host's approval UI.
 
 Supply an optional `idempotency_key` to `send()` or `task_submit()` before the first call if you
 may need to retry after a disconnect. Reuse the key with the same payload and registered sender
@@ -654,9 +656,10 @@ switchboard-relay --board team participants      # inspect a specific board
 
 **`doctor`** is the one-shot diagnostic: it prints which board you resolved to (and *how* — `--board`,
 `$SWITCHBOARD_BOARD`, project-derived, …), the relevant env vars, live participants, the queued-message
-count, and a hint when mail waits on an offline address or a live participant using polling.
-Each participant row shows `listen_status` so you can distinguish `polling-only`, `disabled`,
-`configured`, and `armed`.
+count, and a hint for offline addresses or live addresses with no reported Stop-hook listener.
+Each participant row shows the Stop-hook `listen_status` so you can distinguish `polling-only`,
+`disabled`, `configured`, and `armed`. Channels, MCP subscriptions, and Desktop injection
+use their own wake paths.
 
 ---
 
@@ -820,8 +823,8 @@ listening requires the plugin hook to be reviewed and trusted with `/hooks`.
    `send(to="lead", body=...)`, then collect the answer with `replies(question_id)`.
 3. Finish a turn in the lead and check `bootstrap()` from the worker or run
    `switchboard-relay doctor`. An `armed` lead is waiting in the hook. A sender that sees
-   `polling_only_recipient: true` should ask the lead to call `inbox()` or park in a
-   `wait()` loop. The hook waits at most 15 minutes per window. The lead can call
+   `no_stop_hook_listener: true` should check the lead's wake setup, or ask the lead to
+   call `inbox()` or park in a `wait()` loop. The hook waits at most 15 minutes per window. The lead can call
    `standby(false)` to pause automatic listening during hands-on work and `standby(true)` to resume.
 
 The Codex sender uses the shared mailbox. Claude Desktop injection via `ccd_session_mgmt`

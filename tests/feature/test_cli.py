@@ -460,4 +460,4 @@ def test_doctor_reports_listen_status_and_polling_only_pending_mail(tmp_path, ca
     assert "listen_status=armed" in next(
         line for line in out.splitlines() if "listener [worker]" in line
     )
-    assert "1 message(s) are waiting on live recipients" in out
+    assert "1 message(s) are queued to live addresses with no reported Stop-hook listener" in out

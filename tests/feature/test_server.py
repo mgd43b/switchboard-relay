@@ -236,16 +236,17 @@ def test_check_body_ignores_non_string(tmp_path):
 # -- hygiene bounds: undelivered-message TTL (#17) --------------------------
 
 
-def test_send_warns_only_when_all_live_recipients_use_polling(board):
+def test_send_warns_only_when_no_live_reader_reports_stop_hook_standby(board):
     lead, polling, listening = _ctx(), _ctx(), _ctx()
     board.register(lead, "lead")
     board.register(polling, "poller", "worker")
     board.register(listening, "listener", "worker")
     result = board.send(lead, "poller", "Question")
-    assert result["polling_only_recipient"]
-    assert "next inbox() or wait()" in result["warning"]
+    assert result["no_stop_hook_listener"]
+    assert "Stop-hook standby" in result["warning"]
+    assert "wake path" in result["warning"]
     assert "no_live_recipient" not in result
-    assert board.send(lead, "worker", "Before standby")["polling_only_recipient"]
+    assert board.send(lead, "worker", "Before standby")["no_stop_hook_listener"]
     board.standby(listening)
     assert "warning" not in board.send(lead, "listener", "Question")
     assert "warning" not in board.send(lead, "worker", "Shared role")
