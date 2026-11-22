@@ -106,7 +106,7 @@ def test_renaming_preserves_active_claims_and_redelivery(tmp_path):
     claimed, _ = store.inbox("old", owner_token="owner", now=2, lease=2)
 
     protocol.claim("owner", "new", "", now=3)
-    assert store.ack(first, claimed.receipt, name="new", owner_token="owner", now=3) == 3
+    assert store.ack(first, claimed.receipt, name="new", owner_token="owner", clock=lambda: 3) == 3
     assert store.inbox("old", now=4) == []
     assert [m.id for m in store.inbox("new", owner_token="owner", now=4)] == [second]
 

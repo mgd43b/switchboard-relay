@@ -299,15 +299,15 @@ def test_delivery_lease_status_and_acknowledgment(store):
         "lease_expires_at": 5.0,
     }
     assert not store.has_messages("two", "worker", now=3)
-    assert store.ack(mid, first.receipt, name="two", now=3) is None
-    assert store.ack(mid, first.receipt, name="one", now=5) is None
+    assert store.ack(mid, first.receipt, name="two", clock=lambda: 3) is None
+    assert store.ack(mid, first.receipt, name="one", clock=lambda: 5) is None
     assert store.status(mid, sender="lead", now=5)["status"] == "queued"
 
     [second] = store.inbox("one", "worker", now=5, lease=3)
     assert second.id == first.id and second.receipt != first.receipt
-    assert store.ack(mid, first.receipt, name="one", now=6) is None
-    assert store.ack(mid, second.receipt, name="one", now=6) == 6
-    assert store.ack(mid, second.receipt, name="one", now=7) == 6
+    assert store.ack(mid, first.receipt, name="one", clock=lambda: 6) is None
+    assert store.ack(mid, second.receipt, name="one", clock=lambda: 6) == 6
+    assert store.ack(mid, second.receipt, name="one", clock=lambda: 7) == 6
     assert store.inbox("two", "worker", now=9) == []
     assert store.status(mid, sender="lead", now=9) == {
         "id": mid,
@@ -323,10 +323,40 @@ def test_delivery_lease_status_and_acknowledgment(store):
         )
     after_retention = 6 + MESSAGE_STATUS_RETENTION_SECONDS
     assert store.status(mid, sender="lead", now=after_retention) is None
-    assert store.ack(mid, second.receipt, name="one", now=after_retention) is None
+    assert store.ack(mid, second.receipt, name="one", clock=lambda: after_retention) is None
     assert store.prune_messages(now=after_retention, max_age=None) == 0
     with store._connect() as conn:
         assert not conn.execute("SELECT 1 FROM message_deliveries").fetchone()
+
+
+def test_ack_samples_clock_under_the_writer_lock(store):
+    mid = store.send("worker", "job", sender="lead", now=1)
+    [message] = store.inbox("worker", now=2, lease=3)
+
+    def clock():
+        with (
+            contextlib.closing(sqlite3.connect(store.db_path, timeout=0)) as other,
+            pytest.raises(sqlite3.OperationalError, match="locked"),
+        ):
+            other.execute("BEGIN IMMEDIATE")
+        return 5
+
+    assert store.ack(mid, message.receipt, name="worker", clock=clock) is None
+    assert store.status(mid, sender="lead", now=5)["status"] == "queued"
+
+
+def test_incremental_availability_catches_claims_committed_after_a_snapshot(store):
+    from switchboard_relay.store import AvailabilityCursor
+
+    mid = store.send("worker", "job", sender="lead", now=1)
+    rows, cursor = store.newly_available(AvailabilityCursor(), name="worker", now=10, max_age=None)
+    assert [row["id"] for row in rows] == [mid]
+    # A claim with a deadline before the cursor became visible after its snapshot.
+    store.inbox("worker", now=9, lease=0.5)
+    rows, cursor = store.newly_available(cursor, name="worker", now=11, max_age=None)
+    assert [(row["id"], row["retry"]) for row in rows] == [(mid, 1)]
+    rows, _ = store.newly_available(cursor, name="worker", now=12, max_age=None)
+    assert rows == []
 
 
 def test_age_out_covers_queued_messages_and_active_claims(store):
@@ -337,12 +367,12 @@ def test_age_out_covers_queued_messages_and_active_claims(store):
     queued = store.send("worker", "queued", sender="lead", now=2)
     assert store.status(leased, sender="lead", now=6, max_age=5)["expired_at"] == 6
     assert store.status(queued, sender="lead", now=7, max_age=5)["expired_at"] == 7
-    assert store.ack(leased, claim.receipt, name="worker", now=7, max_age=5) is None
+    assert store.ack(leased, claim.receipt, name="worker", clock=lambda: 7, max_age=5) is None
     assert store.inbox("worker", now=7, max_age=5) == []
     assert store.prune_messages(now=7, max_age=5) == 2
     assert store.status(leased, sender="lead", now=7)["status"] == "expired"
     assert store.status(queued, sender="lead", now=7)["expired_at"] == 7
-    assert store.ack(leased, claim.receipt, name="worker", now=7) is None
+    assert store.ack(leased, claim.receipt, name="worker", clock=lambda: 7) is None
     assert store.status(queued, sender="lead", now=7 + MESSAGE_STATUS_RETENTION_SECONDS) is None
 
 
@@ -359,14 +389,19 @@ def test_legacy_queue_can_be_read_and_cannot_remove_new_claims(tmp_path):
             "INSERT INTO messages (recipient,sender,body,created_at) VALUES ('worker','lead','old',1)"
         ).lastrowid
 
-    assert Store(path, init_schema=False).pending_messages(now=2)[0].id == mid
+    from switchboard_relay.store import AvailabilityCursor
+
+    legacy_store = Store(path, init_schema=False)
+    assert legacy_store.pending_messages(now=2)[0].id == mid
+    rows, _ = legacy_store.newly_available(AvailabilityCursor(), now=2, max_age=None)
+    assert [row["id"] for row in rows] == [mid]
     store = Store(path)
     [claim] = store.inbox("worker", now=2, lease=2)
     with contextlib.closing(sqlite3.connect(path)) as legacy, legacy:
         assert legacy.execute("DELETE FROM messages WHERE recipient='worker'").rowcount == 0
     [redelivery] = store.inbox("worker", now=4)
     assert redelivery.id == mid and redelivery.receipt != claim.receipt
-    assert store.ack(mid, redelivery.receipt, name="worker", now=5) == 5
+    assert store.ack(mid, redelivery.receipt, name="worker", clock=lambda: 5) == 5
     assert store.send("worker", "new", sender="lead", now=5) > mid
 
 

@@ -40,7 +40,7 @@ import os
 import secrets
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -176,6 +176,13 @@ class Message:
         }
 
 
+@dataclass(frozen=True)
+class AvailabilityCursor:
+    message_id: int = 0
+    claim_version: int = 0
+    observed_at: float = float("-inf")
+
+
 class Store:
     """Durable participant registry + message mailboxes over SQLite.
 
@@ -256,6 +263,7 @@ class Store:
                 _enable_wal(conn)
             _with_lock_retry(lambda: conn.executescript(_SCHEMA))
             _with_lock_retry(lambda: _migrate_participants(conn))
+            _with_lock_retry(lambda: _migrate_claim_versions(conn))
 
     def close(self) -> None:
         if self._memory_conn is not None:
@@ -485,6 +493,10 @@ class Store:
             conn.execute("BEGIN IMMEDIATE")
             _check_owner(conn, name, owner_token, now)
             rows = _select_available(conn, now, max_age, where, params, limit=limit)
+            if not rows:
+                return []
+            conn.execute("UPDATE relay_claim_version SET version=version+1")
+            version = conn.execute("SELECT version FROM relay_claim_version").fetchone()[0]
             messages = []
             for row in rows:
                 receipt = secrets.token_hex(16)
@@ -494,12 +506,14 @@ class Store:
                 conn.execute(
                     """INSERT INTO message_deliveries (
                            id, recipient, sender, body, reply_to, created_at,
-                           claimant, owner_token, receipt, claimed_at, lease_expires_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           claimant, owner_token, receipt, claimed_at, lease_expires_at,
+                           claim_version
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(id) DO UPDATE SET claimant=excluded.claimant,
                            owner_token=excluded.owner_token, receipt=excluded.receipt,
                            claimed_at=excluded.claimed_at,
-                           lease_expires_at=excluded.lease_expires_at
+                           lease_expires_at=excluded.lease_expires_at,
+                           claim_version=excluded.claim_version
                     """,
                     (
                         row["id"],
@@ -513,6 +527,7 @@ class Store:
                         receipt,
                         now,
                         lease_expires_at,
+                        version,
                     ),
                 )
                 if row["lease_expires_at"] is None:
@@ -529,12 +544,13 @@ class Store:
         *,
         name: str,
         owner_token: Optional[str] = None,
-        now: float,
+        clock: Callable[[], float] = time.time,
         max_age: Optional[float] = None,
     ) -> Optional[float]:
         """Confirm the current claim or return the timestamp of a repeated ack."""
         with self._connect() as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
+            now = clock()
             _check_owner(conn, name, owner_token, now)
             row = conn.execute(
                 """SELECT acknowledged_at, expired_at, lease_expires_at, created_at
@@ -678,25 +694,60 @@ class Store:
         with self._connect() as conn:
             return bool(_select_available(conn, now, max_age, where, params, limit=1, fields="id"))
 
-    def available_notifications(
+    def newly_available(
         self,
-        name: str,
-        role: str,
+        cursor: AvailabilityCursor,
         *,
         now: float,
         max_age: Optional[float],
-    ) -> list[sqlite3.Row]:
-        """Fetch only wake-up metadata for the available delivery attempts."""
-        where, params = _mailbox_filter(name, role)
-        with self._connect() as conn:
-            return _select_available(
-                conn,
-                now,
-                max_age,
-                where,
-                params,
-                fields="id, recipient, sender, reply_to, lease_expires_at",
-            )
+        name: Optional[str] = None,
+        role: str = "",
+        include_body: bool = False,
+    ) -> tuple[list[sqlite3.Row], AvailabilityCursor]:
+        """Read new mail and newly available retries from a single SQLite snapshot."""
+        where, params = _mailbox_filter(name, role) if name is not None else ("1", [])
+        fields = "id, recipient, sender, reply_to" + (", body" if include_body else "")
+        cutoff = _age_cutoff(now, max_age)
+        with self._connect() as conn, conn:
+            conn.execute("BEGIN")
+            # The CLI can follow a board that has not been upgraded yet.
+            has_version = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='relay_claim_version'"
+            ).fetchone()
+            version = 0
+            if has_version:
+                version = conn.execute("SELECT version FROM relay_claim_version").fetchone()[0]
+            sql = f"""SELECT {fields}, 0 AS retry FROM messages
+                      WHERE {where} AND id > ? AND created_at > ?"""
+            args = [*params, cursor.message_id, cutoff]
+            if has_version:
+                # The deadline range picks up claims already seen in earlier snapshots.
+                # The version range also catches claims that committed after the last
+                # snapshot, even if their deadline had already passed by then.
+                retry_filter = f"WHERE {where} AND created_at > ? AND body IS NOT NULL"
+                sql += f""" UNION ALL
+                            SELECT {fields}, 1 AS retry FROM message_deliveries
+                            INDEXED BY idx_message_deliveries_deadline
+                            {retry_filter} AND lease_expires_at > ? AND lease_expires_at <= ?
+                            UNION ALL
+                            SELECT {fields}, 1 AS retry FROM message_deliveries
+                            INDEXED BY idx_message_deliveries_version
+                            {retry_filter} AND claim_version > ? AND lease_expires_at <= ?"""
+                args.extend(
+                    [
+                        *params,
+                        cutoff,
+                        cursor.observed_at,
+                        now,
+                        *params,
+                        cutoff,
+                        cursor.claim_version,
+                        min(cursor.observed_at, now),
+                    ]
+                )
+            rows = conn.execute(sql + " ORDER BY id", args).fetchall()
+        message_id = max((row["id"] for row in rows if not row["retry"]), default=cursor.message_id)
+        return rows, AvailabilityCursor(message_id, version, now)
 
 
 # -- helpers ----------------------------------------------------------------
@@ -744,6 +795,29 @@ def _migrate_participants(conn: sqlite3.Connection) -> None:
         # them as idle since the epoch.
         conn.execute("ALTER TABLE participants ADD COLUMN last_active REAL NOT NULL DEFAULT 0")
         conn.execute("UPDATE participants SET last_active = last_seen")
+
+
+def _migrate_claim_versions(conn: sqlite3.Connection) -> None:
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(message_deliveries)")}
+        if "claim_version" not in columns:
+            conn.execute(
+                "ALTER TABLE message_deliveries ADD COLUMN claim_version INTEGER NOT NULL DEFAULT 0"
+            )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS relay_claim_version "
+            "(singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL)"
+        )
+        conn.execute("INSERT OR IGNORE INTO relay_claim_version VALUES (1, 0)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_message_deliveries_deadline "
+            "ON message_deliveries (lease_expires_at) WHERE body IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_message_deliveries_version "
+            "ON message_deliveries (claim_version) WHERE body IS NOT NULL"
+        )
 
 
 def _enable_wal(conn: sqlite3.Connection) -> None:

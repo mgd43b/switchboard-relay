@@ -47,7 +47,12 @@ from mcp.types import ToolAnnotations
 
 from switchboard_relay.board import boards_dir, describe_target, legacy_db_path
 from switchboard_relay.protocol import Protocol
-from switchboard_relay.store import DEFAULT_DELIVERY_LEASE_SECONDS, DEFAULT_TTL_SECONDS, Store
+from switchboard_relay.store import (
+    DEFAULT_DELIVERY_LEASE_SECONDS,
+    DEFAULT_TTL_SECONDS,
+    AvailabilityCursor,
+    Store,
+)
 
 # How often wait() checks the mailbox, and how often it heartbeats the caller's
 # liveness while parked. Poll is a balance between latency and DB churn.
@@ -305,7 +310,7 @@ class Switchboard:
         self._push_enabled = _resolve_push()
         # Each available attempt is announced once, including older IDs that
         # become available again after their lease expires.
-        self._watch_notified: dict[int, set[tuple[int, Optional[float]]]] = {}
+        self._watch_cursors: dict[int, AvailabilityCursor] = {}
         # Turn injection on Desktop (opt-in): capture this session's CCD id so a
         # peer can inject a turn into us via ccd_session_mgmt.send_message, and
         # have send() hand the sender ready-to-use injection payloads. See
@@ -380,7 +385,7 @@ class Switchboard:
             token=self._token(ctx),
         )
         if previous is None or (previous.name, previous.role) != (name, role):
-            self._watch_notified.pop(sid, None)
+            self._watch_cursors.pop(sid, None)
             self._watch_failures.pop(sid, None)
         self._conns[sid] = conn
         return conn
@@ -602,30 +607,25 @@ class Switchboard:
 
     async def _watch_tick(self) -> int:
         """Nudge each connected session once per available delivery attempt."""
-        for sid in self._watch_notified.keys() - self._conns.keys():
-            del self._watch_notified[sid]
+        for sid in self._watch_cursors.keys() - self._conns.keys():
+            del self._watch_cursors[sid]
             self._watch_failures.pop(sid, None)
         nudged = 0
         for sid, conn in list(self._conns.items()):
             failures, retry_at = self._watch_failures.get(sid, (0, 0))
             if time.monotonic() < retry_at:
                 continue
+            cursor = self._watch_cursors.setdefault(sid, AvailabilityCursor())
             try:
-                available = self.store.available_notifications(
-                    conn.name, conn.role, now=_now(), max_age=self.msg_ttl
+                available, next_cursor = self.store.newly_available(
+                    cursor, name=conn.name, role=conn.role, now=_now(), max_age=self.msg_ttl
                 )
             except sqlite3.Error:  # pragma: no cover - best-effort watcher
                 continue
-            attempts = {(row["id"], row["lease_expires_at"]) for row in available}
-            notified = self._watch_notified.get(sid, set()) & attempts
-            self._watch_notified[sid] = notified
-            if attempts == notified:
+            if not available:
+                self._watch_cursors[sid] = next_cursor
                 continue
-            latest = next(
-                row
-                for row in reversed(available)
-                if (row["id"], row["lease_expires_at"]) not in notified
-            )
+            latest = available[-1]
             sent = await self._nudge(
                 conn,
                 sender=latest["sender"],
@@ -636,7 +636,7 @@ class Switchboard:
             if self._conns.get(sid) is not conn:
                 continue
             if sent:
-                self._watch_notified[sid] = attempts
+                self._watch_cursors[sid] = next_cursor
                 self._watch_failures.pop(sid, None)
                 nudged += 1
             else:
@@ -931,7 +931,7 @@ class Switchboard:
             receipt,
             name=conn.name,
             owner_token=conn.token,
-            now=now,
+            clock=_now,
             max_age=self.msg_ttl,
         )
         if acknowledged_at is None:
@@ -1491,7 +1491,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     sub.add_parser("boards", help="List local switchboards (boards) and their live participants.")
     sub.add_parser("participants", help="Print live participants and exit.")
     tail = sub.add_parser("tail", help="Print queued (undelivered) messages and exit.")
-    tail.add_argument("-f", "--follow", action="store_true", help="Keep polling for new messages.")
+    tail.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="Keep polling for new messages and redeliveries.",
+    )
     tail.add_argument(
         "--interval", type=float, default=1.0, help="Follow poll interval in seconds (default 1)."
     )
@@ -1663,29 +1668,25 @@ def _cli_participants(db_path, ttl: float) -> int:
     return 0
 
 
-def _print_pending(store: Store, since: int) -> int:
-    """Print all queued messages with id > ``since``; return the new high-water id."""
-    last = since
-    now = _now()
-    max_age = _resolve_msg_ttl() or None
-    while True:
-        batch = store.pending_messages(since=last, now=now, max_age=max_age)
-        if not batch:
-            return last
-        for m in batch:
-            reply = f" (reply_to #{m.reply_to})" if m.reply_to is not None else ""
-            print(f"#{m.id} {m.sender} -> {m.to}: {m.body}{reply}")
-        last = batch[-1].id
+def _print_pending(store: Store, cursor: AvailabilityCursor) -> AvailabilityCursor:
+    rows, next_cursor = store.newly_available(
+        cursor, now=_now(), max_age=_resolve_msg_ttl() or None, include_body=True
+    )
+    for row in rows:
+        reply_to = row["reply_to"]
+        reply = f" (reply_to #{reply_to})" if reply_to is not None else ""
+        print(f"#{row['id']} {row['sender']} -> {row['recipient']}: {row['body']}{reply}")
+    return next_cursor
 
 
 def _cli_tail(db_path, *, follow: bool = False, interval: float = 1.0) -> int:
     store = _open_store_ro(db_path)
     if store is None:
         return 0
-    last_id = _print_pending(store, 0)
+    cursor = _print_pending(store, AvailabilityCursor())
     while follow:  # pragma: no cover - interactive follow loop (Ctrl-C to exit)
         time.sleep(max(0.1, interval))
-        last_id = _print_pending(store, last_id)
+        cursor = _print_pending(store, cursor)
     return 0
 
 

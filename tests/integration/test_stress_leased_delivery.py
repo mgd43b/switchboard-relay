@@ -36,7 +36,7 @@ def _receiver(db_path: str, name: str, done, acked_ids, deadline: float) -> None
         if got:
             for message in got:
                 assert (
-                    store.ack(message.id, message.receipt, name=name, now=time.time()) is not None
+                    store.ack(message.id, message.receipt, name=name, clock=time.time) is not None
                 )
             acked_ids.extend([m.id for m in got])
             empty_streak = 0
