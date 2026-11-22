@@ -230,6 +230,11 @@ def _resolve_ccd_session_id() -> str:
     return f"local_{sid}" if sid else ""
 
 
+def _validate_id(value: int, field: str) -> None:
+    if not 1 <= value <= 2**63 - 1:
+        raise ToolError(f"`{field}` must be a positive signed 64-bit integer.")
+
+
 def _clamp_timeout(value: Any, *, default: float = 30.0, cap: float = 3600.0) -> float:
     """Coerce a caller-supplied timeout to a sane [0, cap] range."""
     try:
@@ -962,6 +967,7 @@ class Switchboard:
     def task_update(
         self, ctx: Context, id: int, receipt: str, action: TaskAction, note: str
     ) -> dict:
+        _validate_id(id, "id")
         conn = self._resolve(ctx)
         if action != "renew" and not note.strip():
             raise ToolError("Provide a progress note, blocker, or outcome evidence.")
@@ -981,6 +987,7 @@ class Switchboard:
         return {"ok": True, "task": task}
 
     def task_status(self, ctx: Context, id: int) -> dict:
+        _validate_id(id, "id")
         conn = self._resolve(ctx)
         now = _now()
         self.store.touch(conn.name, now=now)
@@ -988,6 +995,7 @@ class Switchboard:
         return task if task is not None else {"id": id, "status": "unknown"}
 
     def replies(self, ctx: Context, question_id: int) -> dict:
+        _validate_id(question_id, "question_id")
         conn = self._resolve(ctx)
         now = _now()
         self.store.touch(conn.name, now=now)
@@ -1493,9 +1501,9 @@ def build_server(
         """Claim replies to a question you sent and return immediately.
 
         Send the question with send() and keep its id. With that question_id,
-        this returns available messages threaded to it and sent to your unique
-        name. If none are available, replies is empty. Call ack(id, receipt)
-        after handling each reply.
+        this claims up to 10 available replies threaded to it and sent to your
+        unique name. Call again to collect another batch. If none are available,
+        replies is empty. Call ack(id, receipt) after handling each reply.
         """
         return sb.replies(ctx, question_id)
 
@@ -1549,6 +1557,7 @@ def build_server(
         """Renew a task lease or record progress, a blocker, or a final outcome.
 
         Use the receipt from task_claim(). Renew before the lease deadline.
+        Renewal returns the task ID, current status, and new deadline.
         Progress resumes a blocked task. Include evidence in a completed or failed update.
         """
         return sb.task_update(ctx, id, receipt, action, note)

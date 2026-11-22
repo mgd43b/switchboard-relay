@@ -25,9 +25,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     acceptance        TEXT NOT NULL,
     expected_evidence TEXT NOT NULL,
     created_at        REAL NOT NULL,
-    attempt           INTEGER NOT NULL DEFAULT 0
+    attempt           INTEGER NOT NULL DEFAULT 0,
+    available_at      REAL
 );
-CREATE INDEX IF NOT EXISTS idx_tasks_role ON tasks (role, id);
 CREATE TABLE IF NOT EXISTS task_attempts (
     task_id          INTEGER NOT NULL,
     number           INTEGER NOT NULL,
@@ -56,6 +56,7 @@ class TaskQueue:
         self.store = store
         with store._connect() as conn:
             _with_lock_retry(lambda: conn.executescript(_SCHEMA))
+            _with_lock_retry(lambda: _init_availability(conn))
 
     @contextmanager
     def _write(
@@ -82,8 +83,9 @@ class TaskQueue:
         with self._write(name, token, clock) as (conn, now):
             result = conn.execute(
                 """INSERT INTO tasks
-                   (role, submitter, scope, owned_paths, acceptance, expected_evidence, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (role, submitter, scope, owned_paths, acceptance, expected_evidence,
+                    created_at, available_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     role,
                     name,
@@ -91,6 +93,7 @@ class TaskQueue:
                     json.dumps(owned_paths),
                     json.dumps(acceptance_criteria),
                     expected_evidence,
+                    now,
                     now,
                 ),
             )
@@ -101,27 +104,27 @@ class TaskQueue:
     ) -> Optional[dict]:
         with self._write(name, token, clock) as (conn, now):
             task = conn.execute(
-                """SELECT tasks.* FROM tasks
-                   LEFT JOIN task_attempts AS current
-                     ON current.task_id=tasks.id AND current.number=tasks.attempt
-                   WHERE tasks.role=?
-                     AND (current.number IS NULL OR
-                          (current.state IN ('claimed','blocked') AND current.lease_expires_at<=?))
-                   ORDER BY tasks.id LIMIT 1""",
+                """SELECT * FROM tasks
+                   WHERE role=? AND available_at IS NOT NULL AND available_at<=?
+                   ORDER BY id LIMIT 1""",
                 (role, now),
             ).fetchone()
             if task is None:
                 return None
             task_id, number = task["id"], task["attempt"] + 1
             receipt = secrets.token_hex(16)
+            deadline = now + TASK_LEASE_SECONDS
             conn.execute(
                 """INSERT INTO task_attempts
                    (task_id, number, worker, owner_token, receipt,
                     started_at, lease_expires_at, state)
                    VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed')""",
-                (task_id, number, name, token, receipt, now, now + TASK_LEASE_SECONDS),
+                (task_id, number, name, token, receipt, now, deadline),
             )
-            conn.execute("UPDATE tasks SET attempt=? WHERE id=?", (number, task_id))
+            conn.execute(
+                "UPDATE tasks SET attempt=?, available_at=? WHERE id=?",
+                (number, deadline, task_id),
+            )
             return {**_describe(conn, task, now), "receipt": receipt}
 
     def update(
@@ -153,21 +156,25 @@ class TaskQueue:
                 return None
 
             if action == "renew":
+                deadline = now + TASK_LEASE_SECONDS
                 conn.execute(
                     "UPDATE task_attempts SET lease_expires_at=? WHERE task_id=? AND number=?",
-                    (now + TASK_LEASE_SECONDS, *key),
+                    (deadline, *key),
                 )
-            else:
-                state = "claimed" if action == "progress" else action
-                conn.execute(
-                    "UPDATE task_attempts SET state=? WHERE task_id=? AND number=?",
-                    (state, *key),
-                )
-                conn.execute(
-                    "INSERT INTO task_updates (task_id, attempt, kind, note, at) "
-                    "VALUES (?,?,?,?,?)",
-                    (*key, action, note, now),
-                )
+                conn.execute("UPDATE tasks SET available_at=? WHERE id=?", (deadline, task_id))
+                return {"id": task_id, "status": attempt["state"], "lease_expires_at": deadline}
+
+            state = "claimed" if action == "progress" else action
+            conn.execute(
+                "UPDATE task_attempts SET state=? WHERE task_id=? AND number=?",
+                (state, *key),
+            )
+            if state in _TERMINAL:
+                conn.execute("UPDATE tasks SET available_at=NULL WHERE id=?", (task_id,))
+            conn.execute(
+                "INSERT INTO task_updates (task_id, attempt, kind, note, at) VALUES (?,?,?,?,?)",
+                (*key, action, note, now),
+            )
             return _describe(conn, task, now)
 
     def status(
@@ -184,6 +191,27 @@ class TaskQueue:
                 (task_id, name, role, token),
             ).fetchone()
             return _describe(conn, task, now) if task is not None else None
+
+
+def _init_availability(conn: sqlite3.Connection) -> None:
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        if "available_at" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN available_at REAL")
+            conn.execute(
+                """UPDATE tasks SET available_at=CASE WHEN attempt=0 THEN created_at
+                   ELSE (SELECT lease_expires_at FROM task_attempts
+                         WHERE task_id=tasks.id AND number=tasks.attempt
+                           AND state IN ('claimed','blocked')) END"""
+            )
+        # Each row stays indexed while queued or leased. A terminal outcome
+        # removes it from the claim index while retaining its history.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_available "
+            "ON tasks (role, id) WHERE available_at IS NOT NULL"
+        )
+        conn.execute("DROP INDEX IF EXISTS idx_tasks_role")
 
 
 def _describe(conn: sqlite3.Connection, task: sqlite3.Row, now: float) -> dict:

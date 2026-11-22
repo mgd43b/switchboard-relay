@@ -447,7 +447,7 @@ for a reply. Ask the recipient to respond to your unique name with `reply_to` se
 
 | Tool | Signature | What it does |
 |------|-----------|--------------|
-| `replies` | `replies(question_id)` | Immediately claim available replies addressed to your unique name and threaded to the question. An empty list means you can check again later. Call `ack(id, receipt)` after handling each reply. |
+| `replies` | `replies(question_id)` | Immediately claim up to 10 available replies addressed to your unique name and threaded to the question. Call again for another batch. An empty list means you can check again later. Call `ack(id, receipt)` after handling each reply. |
 
 **Task queue** — hand durable work to a worker role
 
@@ -455,7 +455,7 @@ for a reply. Ask the recipient to respond to your unique name with `reply_to` se
 |------|--------------|
 | `task_submit(role, scope, owned_paths, acceptance_criteria, expected_evidence)` | Queue work for a role and return a task ID. |
 | `task_claim()` | Claim the oldest available task for your registered role. Returns the task, lease deadline, attempt history, and receipt. An empty queue returns `task: null`. |
-| `task_update(id, receipt, action, note?)` | Use `renew` to extend the 15-minute lease, `progress` to record progress or resume blocked work, `blocked` to record what you need, and `completed` or `failed` to report an outcome with evidence. |
+| `task_update(id, receipt, action, note?)` | Use `renew` to extend the 15-minute lease and return the new deadline, `progress` to record progress or resume blocked work, `blocked` to record what you need, and `completed` or `failed` to report an outcome with evidence. |
 | `task_status(id)` | Get the current owner, status, deadline, and attempt history. The submitting address and workers for the role can read it. |
 
 A task is available to another worker when its work lease expires. The new claim includes earlier

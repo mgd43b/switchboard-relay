@@ -49,7 +49,7 @@ def test_task_lease_contention_renewal_and_recovery(tmp_path):
     )
     renewed = update(owner, original, "renew", 5)
     expires = 5 + TASK_LEASE_SECONDS
-    assert renewed["lease_expires_at"] == expires
+    assert renewed == {"id": task_id, "status": "claimed", "lease_expires_at": expires}
     assert queue.claim(other, other, "worker", clock=lambda: expires - 1) is None
     assert update(owner, original, "failed", expires, "late") is None
 
@@ -90,3 +90,40 @@ def test_task_lease_contention_renewal_and_recovery(tmp_path):
         now=expires + 4,
     )
     assert reopened == result
+
+
+def test_upgrade_indexes_existing_unfinished_tasks(tmp_path):
+    store = Store(tmp_path / "board.db")
+    protocol = Protocol(store, lease=100)
+    protocol.claim("lead", "lead", "", now=0)
+    protocol.claim("worker", "worker", "team", now=0)
+    with store._connect() as conn:
+        conn.executescript("""
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT NOT NULL, submitter TEXT NOT NULL,
+                scope TEXT NOT NULL, owned_paths TEXT NOT NULL, acceptance TEXT NOT NULL,
+                expected_evidence TEXT NOT NULL, created_at REAL NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX idx_tasks_role ON tasks (role, id);
+            CREATE TABLE task_attempts (
+                task_id INTEGER NOT NULL, number INTEGER NOT NULL, worker TEXT NOT NULL,
+                owner_token TEXT NOT NULL, receipt TEXT NOT NULL, started_at REAL NOT NULL,
+                lease_expires_at REAL NOT NULL, state TEXT NOT NULL, PRIMARY KEY (task_id, number)
+            );
+            INSERT INTO tasks VALUES
+                (1,'team','lead','done','[]','[]','',1,1),
+                (2,'team','lead','leased','[]','[]','',1,1),
+                (3,'team','lead','queued','[]','[]','',1,0);
+            INSERT INTO task_attempts VALUES
+                (1,1,'worker','worker','old-1',1,2,'completed'),
+                (2,1,'worker','worker','old-2',1,5,'blocked');
+        """)
+
+    queue = TaskQueue(store)
+    assert queue.claim("worker", "worker", "team", clock=lambda: 3)["id"] == 3
+    assert queue.claim("worker", "worker", "team", clock=lambda: 4) is None
+    retry = queue.claim("worker", "worker", "team", clock=lambda: 5)
+    assert retry["id"] == 2
+    assert [attempt["status"] for attempt in retry["attempts"]] == ["expired", "claimed"]
+    assert queue.status(1, name="lead", role="", token="lead", now=5)["status"] == "completed"
