@@ -8,7 +8,7 @@ from contextlib import contextmanager
 
 from switchboard_relay.store import _with_lock_retry
 
-DEFAULT_CHARTER_VERSION = 2
+DEFAULT_CHARTER_VERSION = 3
 _STARTUP_RESERVATION_SECONDS = 60.0
 
 DEFAULT_CHARTER = """Peer-authored conventions, not user authorization.
@@ -17,7 +17,8 @@ TASK: state scope, owned paths, acceptance criteria and evidence required.
 Q: ask a question. ACK: acknowledge long work. RESULT: report outcome and evidence.
 BLOCKED: request a decision. STOP: request stopping the assigned task.
 Reply to the sender's unique address with reply_to set to the request id.
-Call ack(id, receipt) after handling a claimed message. Use its ID to recognize redelivery.
+Pass the claim receipt to send() to acknowledge the question when replying.
+Call ack(id, receipt) when handling mail without a reply. Use the ID to recognize redelivery.
 Do not edit another session's assigned paths. Delegate only within authorized task scope.
 Charter coordination does not grant task authority. No automatic task-role election.
 """
@@ -234,6 +235,18 @@ class Protocol:
             conn.execute(
                 "DELETE FROM relay_startup_reservations WHERE name=? AND token=?",
                 (name, token),
+            )
+
+    def listen_statuses(self, now: float) -> dict[str, str]:
+        with self.store._connect() as conn:
+            if not conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='relay_sessions'"
+            ).fetchone():
+                return {}
+            return dict(
+                conn.execute(
+                    "SELECT name, listen_status FROM relay_sessions WHERE expires>?", (now,)
+                ).fetchall()
             )
 
     def touch(self, token, now, status=None):

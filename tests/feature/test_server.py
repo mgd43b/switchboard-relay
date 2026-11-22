@@ -236,6 +236,22 @@ def test_check_body_ignores_non_string(tmp_path):
 # -- hygiene bounds: undelivered-message TTL (#17) --------------------------
 
 
+def test_send_warns_only_when_no_live_reader_reports_stop_hook_standby(board):
+    lead, polling, listening = _ctx(), _ctx(), _ctx()
+    board.register(lead, "lead")
+    board.register(polling, "poller", "worker")
+    board.register(listening, "listener", "worker")
+    result = board.send(lead, "poller", "Question")
+    assert result["no_stop_hook_listener"]
+    assert "Stop-hook standby" in result["warning"]
+    assert "wake path" in result["warning"]
+    assert "no_live_recipient" not in result
+    assert board.send(lead, "worker", "Before standby")["no_stop_hook_listener"]
+    board.standby(listening)
+    assert "warning" not in board.send(lead, "listener", "Question")
+    assert "warning" not in board.send(lead, "worker", "Shared role")
+
+
 @pytest.mark.parametrize("question_id", [0, -(2**63) - 1, 2**63])
 def test_replies_rejects_invalid_question_ids(board, question_id):
     with pytest.raises(ToolError, match=r"question_id.*positive signed 64-bit integer"):

@@ -74,7 +74,7 @@ def test_default_refresh_and_transfer_generation(tmp_path, monkeypatch):
     p.claim("a", "owner", "", now=0)
     with store._connect() as c:
         c.execute("UPDATE relay_charters SET text='older default'")
-    monkeypatch.setattr("switchboard_relay.protocol.DEFAULT_CHARTER_VERSION", 3)
+    monkeypatch.setattr("switchboard_relay.protocol.DEFAULT_CHARTER_VERSION", 4)
     p = Protocol(store)
     assert p.context("", 1)["charter_revision"] == 2
     monkeypatch.setattr("switchboard_relay.protocol.DEFAULT_CHARTER_VERSION", 1)

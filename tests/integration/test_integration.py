@@ -129,7 +129,7 @@ async def test_tools_advertise_codex_approval_hints(tmp_path):
         assert tools["standby"].annotations.idempotent_hint is True
         assert tools["codex_standby"].annotations.read_only_hint is False
         assert tools["codex_standby"].annotations.destructive_hint is False
-        assert tools["send"].annotations.destructive_hint is False
+        assert tools["send"].annotations.destructive_hint is True
         assert tools["inbox"].annotations.destructive_hint is True
         assert tools["wait"].annotations.destructive_hint is True
         assert tools["ask"].annotations.destructive_hint is True

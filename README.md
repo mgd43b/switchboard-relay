@@ -89,7 +89,7 @@ two sessions from one client or one of each. Paste into the first:
 
 ```
 Register me on switchboard-relay as "lead". Use wait() for a message, reply to its sender
-with reply_to set to its ID, then acknowledge it with ack(id, receipt).
+by passing its ID as reply_to and its claim receipt as receipt in the same send() call.
 ```
 
 …and into the second:
@@ -412,9 +412,16 @@ The tools, grouped by what you reach for:
 
 | Tool | Signature | What it does |
 |------|-----------|--------------|
-| `send` | `send(to, body, reply_to?, idempotency_key?)` | Append a message to `to`'s durable inbox. `to` matches a participant **name or role**. `reply_to` threads a reply to a message id. Returns the new message `id` — plus `no_live_recipient: true` and a `warning` if nobody is currently registered as `to` (usually a typo; the message is still queued). |
+| `send` | `send(to, body, reply_to?, idempotency_key?, receipt?)` | Append a message to `to`'s durable inbox. `to` matches a participant **name or role**. `reply_to` threads a reply to a message id. Returns the new message `id` — plus `no_live_recipient: true` and a `warning` if nobody is currently registered as `to` (usually a typo; the message is still queued). A live address whose readers report no configured or armed Stop-hook standby sets `no_stop_hook_listener: true` and a warning. |
 | `broadcast` | `broadcast(body)` | Send `body` to every currently‑live participant except yourself. Returns the per‑recipient message ids. |
 | `status` | `status(id)` | Look up mail sent from your address. Returns `queued`, `leased`, `acknowledged`, `expired`, or `unknown`, with timestamps for the current state. |
+
+When answering a claimed message, use `send(to, body, reply_to=id, receipt=receipt)` to send
+the reply and acknowledge the original in one transaction. The response includes `acked: true`
+and `acknowledged_at` on success. A stale or invalid receipt still sends the reply and returns
+`acked: false` with `ack_error`. Use `ack(id, receipt)` for handled mail that needs no reply.
+Because `send()` can acknowledge and clear a stored message body, it advertises the destructive
+MCP tool hint for the host's approval UI.
 
 Supply an optional `idempotency_key` to `send()` or `task_submit()` before the first call if you
 may need to retry after a disconnect. Reuse the key with the same payload and registered sender
@@ -649,8 +656,10 @@ switchboard-relay --board team participants      # inspect a specific board
 
 **`doctor`** is the one-shot diagnostic: it prints which board you resolved to (and *how* — `--board`,
 `$SWITCHBOARD_BOARD`, project-derived, …), the relevant env vars, live participants, the queued-message
-count, and a plain-English hint when something looks off (you're alone on a board, or messages are
-piling up against a name nobody reads).
+count, and a hint for offline addresses or live addresses with no reported Stop-hook listener.
+Each participant row shows the Stop-hook `listen_status` so you can distinguish `polling-only`,
+`disabled`, `configured`, and `armed`. Channels, MCP subscriptions, and Desktop injection
+use their own wake paths.
 
 ---
 
@@ -791,18 +800,41 @@ By default a recipient only learns about a message when *it* next polls (`inbox(
 spot** — the message arrives *as a turn*, and the session claims its mail and acts, with no manual
 poll. It's the "responsive‑lead" setup — a lead that answers the instant a worker asks.
 
-There are **two mechanisms**, by recipient surface — set up whichever matches where your *reactor*
-runs (the *sender* can be any surface):
+Choose the wake path for the recipient's application. The Desktop injection path also
+depends on which application the sender uses.
 
 | Reactor runs on… | Mechanism | Feel |
 |---|---|---|
 | **Codex (desktop/CLI/IDE)** | Plugin `Stop` hook (on by default once trusted), or `wait()` / `inbox()` polling | **automatic while the task and client remain open** |
-| **Claude Code (any surface)** | Plugin `Stop` hook (on by default) | **automatic while the session remains open**, with about four short re-arm turns an hour when idle |
+| **Claude Code terminal** | Plugin `Stop` hook (on by default) | **automatic while the session remains open**, re-armed after each 15-minute window |
+| **Claude Desktop Code tab (local)** | Claude Code plugin `Stop` hook, or a `wait()` loop | Check for `armed` before relying on the hook. The Code-tab wake and concurrent-input smoke test is tracked in [#58](https://github.com/mgd43b/switchboard-relay/issues/58). |
 | **Claude Code (CLI/terminal)** | [Channels](https://code.claude.com/docs/en/channels) — the recipient self‑injects | **zero‑touch**, fully automatic |
 | **Claude Desktop** | `ccd_session_mgmt.send_message` — the *sender* injects | **one approval click per message** |
 
 Hooks and push both wake the recipient to claim available mail through the same mailbox. Codex
 listening requires the plugin hook to be reviewed and trusted with `/hooks`.
+
+### Codex worker to Claude Desktop lead
+
+1. Install the [Claude Code plugin](#claude-code-plugin-recommended) on the lead's machine.
+   In Claude Desktop, select **Code**, choose a local folder, and register the lead as `lead`.
+2. Join the same board from Codex. Use the same project folder or set `SWITCHBOARD_BOARD` to
+   the same name on both MCP server entries. Send a question from the Codex worker with
+   `send(to="lead", body=...)`, then collect the answer with `replies(question_id)`.
+3. Finish a turn in the lead and check `bootstrap()` from the worker or run
+   `switchboard-relay doctor`. An `armed` lead is waiting in the hook. A sender that sees
+   `no_stop_hook_listener: true` should check the lead's wake setup, or ask the lead to
+   call `inbox()` or park in a `wait()` loop. The hook waits at most 15 minutes per window. The lead can call
+   `standby(false)` to pause automatic listening during hands-on work and `standby(true)` to resume.
+
+The Codex sender uses the shared mailbox. Claude Desktop injection via `ccd_session_mgmt`
+requires a Desktop sender, and Channels use a Claude Code terminal session. Anthropic documents
+MCP tool hooks on `Stop` and shared local settings for Desktop Code and the terminal.
+The remaining Code-tab smoke test is to send from Codex while the lead reports `armed`,
+then enter a follow-up in the Desktop composer during a second listening window and verify
+how that host queues or interrupts the wait.
+[Claude Code hooks reference](https://code.claude.com/docs/en/hooks) ·
+[Claude Code settings](https://code.claude.com/docs/en/settings) · [Tracking issue #58](https://github.com/mgd43b/switchboard-relay/issues/58)
 
 ### Reacting on the CLI (Channels) — the three hard constraints
 
@@ -911,7 +943,7 @@ The research‑preview reaction can't be unit‑tested, so confirm it by hand on
    `register(name="worker")`, then `send(to="lead", body="ping — what's 2+2?")`.
 4. **Watch B react with no manual poll:** within ~a second a `<channel source="switchboard-relay" …>`
    turn appears in B, and B calls `inbox()` on its own, reads *"ping — what's 2+2?"*, and handles it
-   (e.g. replies with `send(to="worker", body="4", reply_to=<id>)` and then calls `ack(id, receipt)`).
+   (e.g. replies with `send(to="worker", body="4", reply_to=<id>, receipt=<receipt>)`).
    If B stays idle, re-check the three constraints — most often push wasn't enabled (`SWITCHBOARD_PUSH=1`), B wasn't
    launched with `--dangerously-load-development-channels`, or an org policy has `channelsEnabled` off.
 

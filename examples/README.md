@@ -22,8 +22,9 @@ plugin's `Stop` hook in place (trusted via `/hooks` in Codex) the lead only need
 
 ```
 Register me on switchboard-relay as "lead" and answer every message that wakes this
-task. Reply to each sender with reply_to set, acknowledge the message with
-ack(id, receipt), then finish normally so listening resumes. Keep going until I tell you to call standby(false).
+task. Reply to each sender with send(), including reply_to and the claim receipt
+to acknowledge the question in one call. Then finish normally so listening resumes.
+Keep going until I tell you to call standby(false).
 ```
 
 Without that hook, paste this polling recipe and let it run:
@@ -32,7 +33,7 @@ Without that hook, paste this polling recipe and let it run:
 Register me on switchboard-relay as "lead". Then loop: call wait()
 with a 30s timeout; when a message arrives, treat its body as a question, work out
 the answer, and send() the answer back to the message's `from` with `reply_to` set to
-the message id. Acknowledge it with ack(id, receipt). If wait() times out, wait again.
+the message id and receipt set to the claim receipt. If wait() times out, wait again.
 Keep going until I stop you.
 ```
 
@@ -40,7 +41,7 @@ In Claude Code, you can also run it hands-free with the
 [`/loop`](https://code.claude.com/docs/en/slash-commands) skill:
 
 ```
-/loop wait for a switchboard-relay message, reply with reply_to set, then call ack(id, receipt)
+/loop wait for a switchboard-relay message, then reply with reply_to and receipt set
 ```
 
 ## A worker session
