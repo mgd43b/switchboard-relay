@@ -691,13 +691,18 @@ def test_watch_tick_renudges_on_a_new_message(board):
     assert len(ctx.session.sent) == 2
 
 
-def test_inbox_resource_publishes_only_new_availability(tmp_path):
+def test_inbox_resource_publishes_only_new_availability(tmp_path, monkeypatch):
     from mcp.server.subscriptions import InMemorySubscriptionBus, ResourceUpdated
 
     bus = InMemorySubscriptionBus()
     sb = Switchboard(Store(tmp_path / "sb.db"), stdio=True, inbox_updates=bus)
     ctx = _ctx()
     sb.register(ctx, "lead", "coordinator")
+
+    def reject_backlog_read(*args, **kwargs):
+        pytest.fail("The resource publisher should use a scalar query")
+
+    monkeypatch.setattr(sb.store, "newly_available", reject_backlog_read)
     seen = []
     unsubscribe = bus.subscribe(seen.append)
     try:

@@ -316,6 +316,7 @@ class Switchboard:
         # sessions can be launched pre-addressed (SWITCHBOARD_NAME/ROLE) without
         # an explicit register() call.
         self._default_name = (os.environ.get("SWITCHBOARD_NAME") or "").strip()
+        self._startup_token = os.environ.get("SWITCHBOARD_STARTUP_TOKEN") or None
         self._default_role = (os.environ.get("SWITCHBOARD_ROLE") or "").strip()
         # Whether to run the stdio self-watch loop (CLI turn injection). Off by
         # default (a background poll cost that only pays off for a channel-
@@ -476,6 +477,7 @@ class Switchboard:
         if previous and previous.name != name and self._active_receivers:
             raise ToolError("session_busy: finish outstanding receives before renaming")
         token = self._token(ctx)
+        startup_token = self._startup_token if name == self._default_name else None
         try:
             name = self.protocol.claim(
                 token,
@@ -484,9 +486,12 @@ class Switchboard:
                 now=_now(),
                 client=self._clients.get(self._sid(ctx), ""),
                 explicit=explicit_name or bool(self._default_name),
+                startup_token=startup_token,
             )
         except ValueError as exc:
             raise ToolError(str(exc)) from exc
+        if startup_token is not None:
+            self._startup_token = None
         p = self.store.register(name, role, now=_now(), ccd_session_id=self._ccd_id())
         self._bind(ctx, p.name, p.role)
         payload = self._participants_payload()
@@ -667,10 +672,10 @@ class Switchboard:
         conn = self._conns.get(0)
         if conn is None or not self.protocol.owns(conn.token, conn.name):
             return
-        rows, cursor = self.store.newly_available(
+        changed, cursor = self.store.availability_changed(
             self._inbox_cursor, name=conn.name, role=conn.role, now=_now(), max_age=self.msg_ttl
         )
-        if rows:
+        if changed:
             await bus.publish(ResourceUpdated(uri=_INBOX_RESOURCE))
             if self._conns.get(0) is not conn:
                 return

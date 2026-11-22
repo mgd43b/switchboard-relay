@@ -118,17 +118,19 @@ def test_real_worker_launch_is_opt_in_scoped_and_exclusive(tmp_path, monkeypatch
     assert "startup disabled" in capsys.readouterr().err
 
 
-def test_launch_failure_leaves_mail_queued(tmp_path, monkeypatch, capsys):
+def test_launch_failure_leaves_mail_queued(tmp_path, monkeypatch, capfd):
     db = tmp_path / "board.db"
     store = Store(db)
     mid = store.send("worker", "keep me", sender="lead", now=time.time())
-    ticks = 0
+    logs = []
+    deadline = time.monotonic() + 10
 
     def step(_seconds):
-        nonlocal ticks
-        ticks += 1
-        if ticks == 2:
+        logs.append(capfd.readouterr().err)
+        if "worker exited with status 1" in logs[-1]:
             raise KeyboardInterrupt
+        assert time.monotonic() < deadline, "".join(logs)
+        time.sleep(0.02)
 
     monkeypatch.setattr(
         supervisor, "time", SimpleNamespace(time=time.time, monotonic=time.monotonic, sleep=step)
@@ -147,10 +149,80 @@ def test_launch_failure_leaves_mail_queued(tmp_path, monkeypatch, capsys):
         )
         == 0
     )
-    log = capsys.readouterr().err
+    log = "".join(logs)
     assert log.count("launching worker") == 1
     assert "launch failed" in log
     assert store.status(mid, sender="lead", now=time.time())["status"] == "queued"
+    assert Protocol(store).reserve_startup("worker", time.time()) is not None
+
+
+def test_worker_helper_cannot_keep_the_watch_lock(tmp_path, monkeypatch):
+    import fcntl
+
+    db = tmp_path / "board.db"
+    protocol = Protocol(Store(db))
+    token = protocol.reserve_startup("worker", time.time())
+    assert token is not None
+    monkeypatch.setenv("SWITCHBOARD_DB", str(db))
+    monkeypatch.setenv("SWITCHBOARD_NAME", "worker")
+    monkeypatch.setenv("SWITCHBOARD_STARTUP_TOKEN", token)
+
+    helper = tmp_path / "helper.py"
+    helper.write_text("""
+import sys
+import time
+from pathlib import Path
+
+Path(sys.argv[1]).touch()
+deadline = time.monotonic() + 10
+while not Path(sys.argv[2]).exists() and time.monotonic() < deadline:
+    time.sleep(0.02)
+Path(sys.argv[3]).touch()
+""")
+    ready, stop, done = (tmp_path / flag for flag in ("ready", "stop", "done"))
+    command = [
+        sys.executable,
+        "-c",
+        "import subprocess, sys\nsubprocess.Popen(sys.argv[1:], close_fds=False)",
+        sys.executable,
+        str(helper),
+        str(ready),
+        str(stop),
+        str(done),
+    ]
+    lock_path = tmp_path / "worker.lock"
+    try:
+        with lock_path.open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            assert supervisor._guard_worker(os.dup(lock.fileno()), "board/worker", command) == 0
+
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready.exists() and not done.exists()
+        with lock_path.open("a+b") as probe:
+            fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        stop.touch()
+
+
+def test_guard_rejects_expired_reservation_before_spawn(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "board.db"
+    protocol = Protocol(Store(db))
+    token = protocol.reserve_startup("worker", time.time() - 61)
+    assert token is not None
+    monkeypatch.setenv("SWITCHBOARD_DB", str(db))
+    monkeypatch.setenv("SWITCHBOARD_NAME", "worker")
+    monkeypatch.setenv("SWITCHBOARD_STARTUP_TOKEN", token)
+    assert protocol.claim("manual", "worker", "", now=time.time()) == "worker"
+
+    def unexpected_spawn(*args, **kwargs):
+        pytest.fail("An expired reservation must not launch the worker")
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", unexpected_spawn)
+    with (tmp_path / "worker.lock").open("a+b") as lock:
+        assert supervisor._guard_worker(os.dup(lock.fileno()), "board/worker", ["worker"]) == 1
+    assert "startup reservation expired" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("options", [[], ["--db", ":memory:"]])

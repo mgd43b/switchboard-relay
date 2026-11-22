@@ -736,10 +736,11 @@ switchboard-relay --board team worker-watch --name worker:docs -- ./run-docs-wor
 ```
 
 Use `--db /path/to/board.db` for a file-backed board selected by path. The supervisor passes
-`SWITCHBOARD_DB`, `SWITCHBOARD_BOARD`, `SWITCHBOARD_NAME`, and `SWITCHBOARD_TTL` to the command.
-Have the worker pass those variables through to its MCP server, register the configured name, and
-claim and acknowledge its mail. The program should run in the foreground for the worker's
-lifetime. The integration test uses a Python MCP client as that worker.
+the board, name, liveness settings, and a one-time startup token in the command's environment.
+Have the worker pass its environment through to its MCP server and register the configured name
+within 60 seconds, then claim and acknowledge its mail. Run the program in the foreground for
+the worker's lifetime. Use the current relay version across the board so each session honors
+startup reservations. The integration test uses a Python MCP client as the worker.
 
 The supervisor observes available mail for the exact name and launches while the name is
 offline. A board-and-name lock limits it to one supervised foreground worker at a time. It

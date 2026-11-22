@@ -61,26 +61,34 @@ def watch_worker(
                 if child is None and time.monotonic() >= retry_at:
                     now = time.time()
                     try:
-                        ready = store.has_messages(
-                            name, now=now, max_age=max_age
-                        ) and not protocol.name_is_live(name, now)
+                        startup_token = (
+                            protocol.reserve_startup(name, time.time())
+                            if store.has_messages(name, now=now, max_age=max_age)
+                            else None
+                        )
                     except sqlite3.OperationalError as exc:
                         if not _is_locked_error(exc):
                             raise
-                        ready = False
-                    if ready:
+                        startup_token = None
+                    if startup_token is not None:
                         _report(label, "launching worker")
                         try:
-                            # The foreground child shares the lock across exec.
-                            # It can finish its turn if the watcher is stopped.
                             child = subprocess.Popen(
-                                command,
-                                env=child_env,
+                                [
+                                    sys.executable,
+                                    "-m",
+                                    "switchboard_relay.worker_watch",
+                                    str(lock.fileno()),
+                                    label,
+                                    *command,
+                                ],
+                                env={**child_env, "SWITCHBOARD_STARTUP_TOKEN": startup_token},
                                 stdin=subprocess.DEVNULL,
                                 start_new_session=True,
                                 pass_fds=(lock.fileno(),),
                             )
                         except OSError as exc:
+                            protocol.release_startup(name, startup_token)
                             _report(label, f"launch failed: {exc}")
                             retry_at = time.monotonic() + _RETRY_SECONDS
                 time.sleep(_POLL_SECONDS)
@@ -91,3 +99,32 @@ def watch_worker(
 
 def _report(label: str, message: str) -> None:
     print(f"worker-watch {label}: {message}", file=sys.stderr, flush=True)
+
+
+def _guard_worker(lock_fd: int, label: str, command: list[str]) -> int:
+    # Keep the lock while waiting for the foreground command, including when
+    # the watcher exits. Close it in exec so the worker and its helpers never
+    # inherit the descriptor.
+    with os.fdopen(lock_fd, "rb"):
+        os.set_inheritable(lock_fd, False)
+        store = Store(os.environ["SWITCHBOARD_DB"], init_schema=False)
+        protocol = Protocol(store, initialize=False)
+        name = os.environ["SWITCHBOARD_NAME"]
+        token = os.environ["SWITCHBOARD_STARTUP_TOKEN"]
+        try:
+            with protocol.startup_launch_window(name, token, time.time) as reserved:
+                if not reserved:
+                    _report(label, "launch failed: startup reservation expired")
+                    return 1
+                worker = subprocess.Popen(command, stdin=subprocess.DEVNULL, close_fds=True)
+            returncode = worker.wait()
+            return returncode if returncode >= 0 else 128 - returncode
+        except OSError as exc:
+            _report(label, f"launch failed: {exc}")
+            return 1
+        finally:
+            protocol.release_startup(name, token)
+
+
+if __name__ == "__main__":
+    raise SystemExit(_guard_worker(int(sys.argv[1]), sys.argv[2], sys.argv[3:]))
