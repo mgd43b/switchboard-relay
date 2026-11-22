@@ -124,7 +124,9 @@ def test_unregister_drops_the_token(tmp_path):
 
 
 def test_manual_keepalive_refreshes_within_the_lease(tmp_path):
-    b = Switchboard(Store(tmp_path / "b.db"), ttl=0.3)  # lease 0.3s, keepalive 60s
+    # Lease 0.6s, so the loop refreshes every 0.2s: outlasting the lease twice
+    # over proves the keepalive, with headroom for a slow CI runner.
+    b = Switchboard(Store(tmp_path / "b.db"), ttl=0.6)
     a = FakeCtx(FakeSession())
     b.register(a, "lead")
     c = FakeCtx(FakeSession())
@@ -132,7 +134,7 @@ def test_manual_keepalive_refreshes_within_the_lease(tmp_path):
     async def drive():
         async with anyio.create_task_group() as tg:
             tg.start_soon(b._watch_loop)
-            await anyio.sleep(0.8)
+            await anyio.sleep(1.5)
             with pytest.raises(ToolError, match="name_in_use"):
                 b.register(c, "lead")
             tg.cancel_scope.cancel()

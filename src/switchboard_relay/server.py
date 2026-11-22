@@ -686,12 +686,15 @@ class Switchboard:
             _WATCH_POLL_SECONDS if self._push_enabled else _KEEPALIVE_SECONDS,
             self.protocol.lease / 3,
         )
-        last_keepalive = 0.0
+        # Refresh within a third of the lease in every mode: an idle session's
+        # lease must never lapse while its process still holds it. Timed on the
+        # monotonic clock anyio sleeps on, with half a poll of slack, so a tick
+        # that wakes a hair early can't skip a refresh and double the gap.
+        refresh_every = min(_KEEPALIVE_SECONDS, self.protocol.lease / 3)
+        last_keepalive = float("-inf")
         while True:
-            now = _now()
-            # Refresh within a third of the lease in every mode: an idle
-            # session's lease must never lapse while its process still holds it.
-            if now - last_keepalive >= min(_KEEPALIVE_SECONDS, self.protocol.lease / 3):
+            now = time.monotonic()
+            if now - last_keepalive >= refresh_every - poll / 2:
                 last_keepalive = now
                 self._keepalive_conns()
             if self._push_enabled:
