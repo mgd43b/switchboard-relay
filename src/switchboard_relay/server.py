@@ -582,24 +582,46 @@ class Switchboard:
                 }
             await anyio.sleep(min(_WAIT_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 
-    def send(self, ctx: Context, to: str, body: str, reply_to: Optional[int] = None) -> dict:
+    def send(
+        self,
+        ctx: Context,
+        to: str,
+        body: str,
+        reply_to: Optional[int] = None,
+        *,
+        idempotency_key: Optional[str] = None,
+    ) -> dict:
         conn = self._resolve(ctx)
         to = (to or "").strip()
         if not to:
             raise ToolError("`to` must be a non-empty address (a participant name or role).")
         self._check_body(body)
         now = _now()
-        mid = self.store.send(to, body, sender=conn.name, reply_to=reply_to, now=now)
+        try:
+            mid = self.store.send(
+                to,
+                body,
+                sender=conn.name,
+                reply_to=reply_to,
+                now=now,
+                idempotency_key=idempotency_key,
+            )
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
         self.store.touch(conn.name, now=now)
         out = {"id": mid, "to": to, "from": conn.name, "reply_to": reply_to}
         if not self._has_live_recipient(to):
             # Delivery is still durable -- this is a soft nudge that nobody is
             # currently reading `to`, which most often means a typo'd name/role.
             out["no_live_recipient"] = True
+            next_step = (
+                "Use status(id) to check this message."
+                if idempotency_key is not None
+                else "The message is queued and will be delivered when an eligible reader checks."
+            )
             out["warning"] = (
-                f"No session is currently registered as '{to}'. The message is queued "
-                "and will be delivered whenever one reads it, but if you expected an "
-                "immediate reader, double-check the name/role with participants()."
+                f"No session is currently registered as '{to}'. {next_step} "
+                "Double-check the name or role with participants() if you expected a live reader."
             )
         return out
 
@@ -826,9 +848,21 @@ class Switchboard:
         }
 
     async def send_async(
-        self, ctx: Context, to: str, body: str, reply_to: Optional[int] = None
+        self,
+        ctx: Context,
+        to: str,
+        body: str,
+        reply_to: Optional[int] = None,
+        *,
+        idempotency_key: Optional[str] = None,
     ) -> dict:
-        result = self.send(ctx, to, body, reply_to)
+        result = self.send(ctx, to, body, reply_to, idempotency_key=idempotency_key)
+        if self._ccd_inject and idempotency_key is not None:
+            delivery = self.store.status(
+                result["id"], sender=result["from"], now=_now(), max_age=self.msg_ttl
+            )
+            if delivery is None or delivery["status"] != "queued":
+                return result
         hint = self._inject_hint(
             self._ccd_targets(result["to"], sender=result["from"], mid=result["id"])
         )
@@ -981,6 +1015,7 @@ class Switchboard:
         owned_paths: list[str],
         acceptance_criteria: list[str],
         expected_evidence: str,
+        idempotency_key: Optional[str] = None,
     ) -> dict:
         conn = self._resolve(ctx)
         role, scope = role.strip(), scope.strip()
@@ -990,16 +1025,20 @@ class Switchboard:
             json.dumps([role, scope, owned_paths, acceptance_criteria, expected_evidence])
         )
         self.store.touch(conn.name, now=_now())
-        return self.tasks.submit(
-            conn.name,
-            conn.token,
-            role=role,
-            scope=scope,
-            owned_paths=owned_paths,
-            acceptance_criteria=acceptance_criteria,
-            expected_evidence=expected_evidence,
-            clock=_now,
-        )
+        try:
+            return self.tasks.submit(
+                conn.name,
+                conn.token,
+                role=role,
+                scope=scope,
+                owned_paths=owned_paths,
+                acceptance_criteria=acceptance_criteria,
+                expected_evidence=expected_evidence,
+                clock=_now,
+                idempotency_key=idempotency_key,
+            )
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
 
     def task_claim(self, ctx: Context) -> dict:
         conn = self._resolve(ctx)
@@ -1566,12 +1605,17 @@ def build_server(
 
     @mcp.tool(annotations=_LOCAL_WRITE)
     async def send(  # type: ignore[assignment]
-        to: str, body: str, reply_to: Optional[int] = None, ctx: Context = None
+        to: str,
+        body: str,
+        reply_to: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
+        ctx: Context = None,
     ) -> dict[str, Any]:
         """Send a message to another participant's durable inbox.
 
         `to` is an address: a participant name or a role. `body` is the message
         text. Pass `reply_to` with a message id you received to thread a reply.
+        Supply an idempotency_key and reuse it with the same payload to retry a send.
         Delivery is durable -- the message waits even if `to` is offline or has
         not registered yet. Returns the new message `id`; if no live participant
         currently reads `to`, the result also carries `no_live_recipient` and a
@@ -1580,7 +1624,7 @@ def build_server(
         `instructions` to make the recipient react immediately -- it is optional
         and best-effort on top of durable delivery.
         """
-        return await sb.send_async(ctx, to, body, reply_to)
+        return await sb.send_async(ctx, to, body, reply_to, idempotency_key=idempotency_key)
 
     @mcp.tool(annotations=_LOCAL_DESTRUCTIVE)
     def inbox(  # type: ignore[assignment]
@@ -1663,10 +1707,22 @@ def build_server(
         owned_paths: list[str],
         acceptance_criteria: list[str],
         expected_evidence: str,
+        idempotency_key: Optional[str] = None,
         ctx: Context = None,
     ) -> dict[str, Any]:
-        """Queue a task for a worker role and return its durable ID."""
-        return sb.task_submit(ctx, role, scope, owned_paths, acceptance_criteria, expected_evidence)
+        """Queue a task for a worker role and return its durable ID.
+
+        Reuse an idempotency_key with the same payload to retrieve the original ID.
+        """
+        return sb.task_submit(
+            ctx,
+            role,
+            scope,
+            owned_paths,
+            acceptance_criteria,
+            expected_evidence,
+            idempotency_key,
+        )
 
     @mcp.tool(annotations=_LOCAL_DESTRUCTIVE)
     def task_claim(ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
@@ -1843,6 +1899,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Run an opt-in foreground supervisor for one offline worker.",
     )
     wake.add_argument("--name", required=True, help="Exact participant name to wake.")
+    wake.add_argument("--task-role", help="Also wake for available tasks in this role.")
     wake.add_argument(
         "command", nargs=argparse.REMAINDER, help="Fixed worker command and arguments."
     )
@@ -2129,7 +2186,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         command = args.command[1:] if args.command[:1] == ["--"] else args.command
         if not name or not command or not command[0].strip():
             parser.error("worker-watch requires a name and a command")
-        return watch_worker(target, name, command, ttl=ttl, max_age=_resolve_msg_ttl() or None)
+        task_role = args.task_role.strip() if args.task_role is not None else None
+        if task_role == "":
+            parser.error("--task-role must be a non-blank role")
+        return watch_worker(
+            target,
+            name,
+            command,
+            ttl=ttl,
+            max_age=_resolve_msg_ttl() or None,
+            task_role=task_role,
+        )
 
     # Human-facing inspection commands read the DB directly -- no server, and no
     # side effect of creating the DB if it does not exist yet.

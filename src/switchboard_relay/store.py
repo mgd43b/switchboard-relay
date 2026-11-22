@@ -36,6 +36,8 @@ message_deliveries(id PK, ..., receipt, lease_expires_at, acknowledged_at, expir
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import secrets
 import sqlite3
@@ -65,6 +67,16 @@ REPLY_BATCH_SIZE = 10
 MESSAGE_STATUS_RETENTION_SECONDS = 7 * 86400.0
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS relay_submissions (
+    operation    TEXT NOT NULL,
+    sender       TEXT NOT NULL,
+    request_key  TEXT NOT NULL,
+    fingerprint  BLOB NOT NULL,
+    result_id    INTEGER NOT NULL,
+    created_at   REAL NOT NULL,
+    PRIMARY KEY (operation, sender, request_key)
+);
+
 CREATE TABLE IF NOT EXISTS participants (
     name            TEXT PRIMARY KEY,
     role            TEXT NOT NULL DEFAULT '',
@@ -422,18 +434,35 @@ class Store:
         sender: str,
         reply_to: Optional[int] = None,
         now: float,
+        idempotency_key: Optional[str] = None,
     ) -> int:
-        """Append a message to ``to``'s durable inbox. Returns the message id."""
+        """Append mail or return the original ID for an identical keyed submission."""
         to = _require_name(to, field="to")
         if not isinstance(body, str):
             raise ValueError("body must be a string")
-        with self._connect() as conn:
-            cur = conn.execute(
-                "INSERT INTO messages (recipient, sender, body, reply_to, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (to, sender, body, reply_to, now),
+        with self._connect() as conn, conn:
+            if idempotency_key is not None:
+                conn.execute("BEGIN IMMEDIATE")
+
+            def insert() -> int:
+                return int(
+                    conn.execute(
+                        "INSERT INTO messages (recipient, sender, body, reply_to, created_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (to, sender, body, reply_to, now),
+                    ).lastrowid
+                )
+
+            message_id, _ = _submit_once(
+                conn,
+                operation="send",
+                sender=sender,
+                key=idempotency_key,
+                payload=(to, body, reply_to),
+                now=now,
+                insert=insert,
             )
-            return int(cur.lastrowid)
+        return message_id
 
     def inbox(
         self,
@@ -816,6 +845,44 @@ class Store:
 
 
 # -- helpers ----------------------------------------------------------------
+
+
+def _submit_once(
+    conn: sqlite3.Connection,
+    *,
+    operation: str,
+    sender: str,
+    key: Optional[str],
+    payload: tuple,
+    now: float,
+    insert: Callable[[], int],
+) -> tuple[int, float]:
+    """Run a keyed insert and record its result in the caller's write transaction."""
+    if key is None:
+        return insert(), now
+    if not key.strip() or len(key.encode("utf-8")) > 128:
+        raise ValueError("idempotency_key must be non-blank and at most 128 UTF-8 bytes.")
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    fingerprint = hashlib.sha256(encoded).digest()
+    identity = (operation, sender, key)
+    saved = conn.execute(
+        """SELECT fingerprint, result_id, created_at FROM relay_submissions
+           WHERE operation=? AND sender=? AND request_key=?""",
+        identity,
+    ).fetchone()
+    if saved is not None:
+        if saved["fingerprint"] != fingerprint:
+            raise ValueError("idempotency_key was already used with a different payload.")
+        return saved["result_id"], saved["created_at"]
+
+    result_id = insert()
+    conn.execute(
+        """INSERT INTO relay_submissions
+           (operation, sender, request_key, fingerprint, result_id, created_at)
+           VALUES (?,?,?,?,?,?)""",
+        (*identity, fingerprint, result_id, now),
+    )
+    return result_id, now
 
 
 def _is_locked_error(exc: sqlite3.OperationalError) -> bool:

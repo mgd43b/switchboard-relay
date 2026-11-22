@@ -188,17 +188,26 @@ class Protocol:
                 is not None
             )
 
+    def name_is_live(self, name: str, now: float) -> bool:
+        """Check name liveness without taking a SQLite write lock."""
+        with self.store._connect() as conn:
+            return self._name_is_live(conn, name, now)
+
+    def _name_is_live(self, conn, name: str, now: float) -> bool:
+        return bool(
+            conn.execute(
+                """SELECT COALESCE(
+                (SELECT expires>? FROM relay_sessions WHERE name=?),
+                (SELECT last_seen>? FROM participants WHERE name=?), 0
+            )""",
+                (now, name, now - self.lease, name),
+            ).fetchone()[0]
+        )
+
     def reserve_startup(self, name: str, now: float) -> str | None:
         """Reserve an offline name while a configured process starts."""
         with self.transaction() as conn:
-            occupied = conn.execute(
-                """SELECT COALESCE(
-                    (SELECT expires>? FROM relay_sessions WHERE name=?),
-                    (SELECT last_seen>? FROM participants WHERE name=?), 0
-                )""",
-                (now, name, now - self.lease, name),
-            ).fetchone()[0]
-            if occupied:
+            if self._name_is_live(conn, name, now):
                 return None
             conn.execute("DELETE FROM relay_startup_reservations WHERE expires<=?", (now,))
             token = secrets.token_hex(16)

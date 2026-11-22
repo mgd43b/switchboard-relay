@@ -618,3 +618,62 @@ async def test_submitter_can_confirm_cancel_after_owning_session_disconnects(tmp
             assert data(await reconnected.call_tool("task_claim", {}))["task"] is None
 
         assert data(await lead.call_tool("task_cancel", override))["task"] == result
+
+
+async def test_keyed_submissions_survive_sender_reconnect_and_consumer_completion(tmp_path):
+    send_args = {"to": "worker", "body": "Check the docs", "idempotency_key": "request-a"}
+    task_args = {
+        "role": "docs",
+        "scope": "Review the examples",
+        "owned_paths": ["README.md"],
+        "acceptance_criteria": ["Examples pass"],
+        "expected_evidence": "Test output",
+        "idempotency_key": "request-a",
+    }
+    async with connect(make_board(tmp_path)) as lead:
+        data(await lead.call_tool("register", {"name": "lead"}))
+        first_mail = data(await lead.call_tool("send", send_args))
+        first_task = data(await lead.call_tool("task_submit", task_args))
+
+    async with sessions(make_board(tmp_path)) as (lead, worker):
+        data(await lead.call_tool("register", {"name": "lead"}))
+        data(await worker.call_tool("register", {"name": "worker", "role": "docs"}))
+        [message] = data(await worker.call_tool("inbox", {}))["messages"]
+        assert data(
+            await worker.call_tool(
+                "ack",
+                {
+                    "id": message["id"],
+                    "receipt": message["receipt"],
+                },
+            )
+        )["ok"]
+        task = data(await worker.call_tool("task_claim", {}))["task"]
+        assert task["id"] == first_task["id"]
+        assert data(
+            await worker.call_tool(
+                "task_update",
+                {
+                    "id": task["id"],
+                    "receipt": task["receipt"],
+                    "action": "completed",
+                    "note": "Passed",
+                },
+            )
+        )["ok"]
+
+        assert data(await lead.call_tool("send", send_args))["id"] == first_mail["id"]
+        assert data(await lead.call_tool("task_submit", task_args)) == first_task
+        assert data(await worker.call_tool("inbox", {}))["messages"] == []
+        assert data(await worker.call_tool("task_claim", {}))["task"] is None
+        for tool, args in (
+            ("send", {**send_args, "body": "Different message"}),
+            ("task_submit", {**task_args, "owned_paths": ["different.md"]}),
+        ):
+            conflict = await lead.call_tool(tool, args)
+            assert conflict.is_error and "different payload" in _text(conflict)
+        invalid = await lead.call_tool("send", {**send_args, "idempotency_key": "é" * 65})
+        assert invalid.is_error and "128 UTF-8 bytes" in _text(invalid)
+
+        other = data(await worker.call_tool("send", send_args))
+        assert other["id"] != first_mail["id"]
