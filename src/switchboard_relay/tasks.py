@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Literal, Optional, get_args
 
-from switchboard_relay.store import Store, _check_owner, _with_lock_retry
+from switchboard_relay.store import Store, _check_owner, _submit_once, _with_lock_retry
 
 TASK_LEASE_SECONDS = 900.0
 TaskAction = Literal["renew", "progress", "blocked", "completed", "failed", "release", "cancelled"]
@@ -20,6 +20,8 @@ TASK_STATES = get_args(TaskState)
 _TASK_OUTCOMES = {"completed", "failed"}
 _FINISHED_ATTEMPTS = _TASK_OUTCOMES | {"released", "cancelled"}
 _ACTIVE_ATTEMPTS = {"claimed", "blocked"}
+
+_AVAILABLE_TASKS = "FROM tasks WHERE role=? AND available_at IS NOT NULL AND available_at<=?"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -101,34 +103,54 @@ class TaskQueue:
         acceptance_criteria: list[str],
         expected_evidence: str,
         clock: Callable[[], float],
+        idempotency_key: Optional[str] = None,
     ) -> dict:
         with self._write(name, token, clock) as (conn, now):
-            result = conn.execute(
-                """INSERT INTO tasks
-                   (role, submitter, scope, owned_paths, acceptance, expected_evidence,
-                    created_at, available_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    role,
-                    name,
-                    scope,
-                    json.dumps(owned_paths),
-                    json.dumps(acceptance_criteria),
-                    expected_evidence,
-                    now,
-                    now,
-                ),
+
+            def insert() -> int:
+                return int(
+                    conn.execute(
+                        """INSERT INTO tasks
+                       (role, submitter, scope, owned_paths, acceptance, expected_evidence,
+                        created_at, available_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            role,
+                            name,
+                            scope,
+                            json.dumps(owned_paths),
+                            json.dumps(acceptance_criteria),
+                            expected_evidence,
+                            now,
+                            now,
+                        ),
+                    ).lastrowid
+                )
+
+            task_id, created_at = _submit_once(
+                conn,
+                operation="task_submit",
+                sender=name,
+                key=idempotency_key,
+                payload=(role, scope, owned_paths, acceptance_criteria, expected_evidence),
+                now=now,
+                insert=insert,
             )
-            return {"id": result.lastrowid, "role": role, "status": "queued", "created_at": now}
+            return {"id": task_id, "role": role, "status": "queued", "created_at": created_at}
+
+    def has_available(self, role: str, *, now: float) -> bool:
+        with self.store._connect() as conn:
+            return (
+                conn.execute(f"SELECT 1 {_AVAILABLE_TASKS} LIMIT 1", (role, now)).fetchone()
+                is not None
+            )
 
     def claim(
         self, name: str, token: str, role: str, *, clock: Callable[[], float]
     ) -> Optional[dict]:
         with self._write(name, token, clock) as (conn, now):
             task = conn.execute(
-                """SELECT * FROM tasks
-                   WHERE role=? AND available_at IS NOT NULL AND available_at<=?
-                   ORDER BY id LIMIT 1""",
+                f"SELECT * {_AVAILABLE_TASKS} ORDER BY id LIMIT 1",
                 (role, now),
             ).fetchone()
             if task is None:

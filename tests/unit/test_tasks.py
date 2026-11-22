@@ -190,3 +190,47 @@ def test_cancellation_stays_pending_after_expiry_until_worker_confirms(tmp_path)
     assert queue.cancel("lead", "lead", task_id=task_id, note="Again", clock=clock) == final
     with store._connect() as conn, pytest.raises(sqlite3.IntegrityError, match="cancellation"):
         conn.execute("UPDATE task_attempts SET lease_expires_at=lease_expires_at+1")
+
+
+def test_simultaneous_keyed_submissions_create_one_record_per_operation(tmp_path):
+    path = tmp_path / "board.db"
+    store = Store(path)
+    Protocol(store).claim("lead-token", "lead", "", now=0)
+    queue = TaskQueue(store)
+
+    def submit(index):
+        local = Store(path, init_schema=False)
+        mail_id = local.send("worker", "question", sender="lead", now=index, idempotency_key="one")
+        task = TaskQueue(local, initialize=False).submit(
+            "lead",
+            "lead-token",
+            role="docs",
+            scope="Review the docs",
+            owned_paths=[],
+            acceptance_criteria=[],
+            expected_evidence="",
+            clock=lambda: index,
+            idempotency_key="one",
+        )
+        return mail_id, task["id"], task["created_at"]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(submit, range(1, 9)))
+    assert len(set(results)) == 1
+    assert [message.id for message in store.inbox("worker", now=10)] == [results[0][0]]
+    assert [task["id"] for task in queue.list_tasks(now=10)["tasks"]] == [results[0][1]]
+
+
+def test_failed_key_record_rolls_back_submission(tmp_path):
+    store = Store(tmp_path / "board.db")
+    with store._connect() as conn:
+        conn.execute("""
+            CREATE TRIGGER reject_key BEFORE INSERT ON relay_submissions
+            BEGIN SELECT RAISE(ABORT, 'test failure'); END
+        """)
+    with pytest.raises(sqlite3.IntegrityError, match="test failure"):
+        store.send("worker", "question", sender="lead", now=1, idempotency_key="retry")
+    assert store.inbox("worker", now=2, peek=True) == []
+    with store._connect() as conn:
+        conn.execute("DROP TRIGGER reject_key")
+    assert store.send("worker", "question", sender="lead", now=3, idempotency_key="retry") > 0

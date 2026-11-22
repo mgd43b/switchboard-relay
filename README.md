@@ -412,9 +412,16 @@ The tools, grouped by what you reach for:
 
 | Tool | Signature | What it does |
 |------|-----------|--------------|
-| `send` | `send(to, body, reply_to?)` | Append a message to `to`'s durable inbox. `to` matches a participant **name or role**. `reply_to` threads a reply to a message id. Returns the new message `id` — plus `no_live_recipient: true` and a `warning` if nobody is currently registered as `to` (usually a typo; the message is still queued). |
+| `send` | `send(to, body, reply_to?, idempotency_key?)` | Append a message to `to`'s durable inbox. `to` matches a participant **name or role**. `reply_to` threads a reply to a message id. Returns the new message `id` — plus `no_live_recipient: true` and a `warning` if nobody is currently registered as `to` (usually a typo; the message is still queued). |
 | `broadcast` | `broadcast(body)` | Send `body` to every currently‑live participant except yourself. Returns the per‑recipient message ids. |
 | `status` | `status(id)` | Look up mail sent from your address. Returns `queued`, `leased`, `acknowledged`, `expired`, or `unknown`, with timestamps for the current state. |
+
+Supply an optional `idempotency_key` to `send()` or `task_submit()` before the first call if you
+may need to retry after a disconnect. Reuse the key with the same payload and registered sender
+name. The relay returns the original ID, including after a message is acknowledged or a task
+finishes. A key can be up to 128 UTF-8 bytes, must contain non-blank text, and is scoped to the
+board, sender, and tool. Reusing it for a different payload returns a tool error. The board keeps
+the key and original result ID as a durable record.
 
 **Receive** — read your mailbox
 
@@ -458,7 +465,7 @@ for a reply. Ask the recipient to respond to your unique name with `reply_to` se
 
 | Tool | What it does |
 |------|--------------|
-| `task_submit(role, scope, owned_paths, acceptance_criteria, expected_evidence)` | Queue work for a role and return a task ID. |
+| `task_submit(role, scope, owned_paths, acceptance_criteria, expected_evidence, idempotency_key?)` | Queue work for a role and return a task ID. |
 | `task_claim()` | Claim the oldest available task for your registered role. Returns the task, lease deadline, attempt history, and receipt. An empty queue returns `task: null`. |
 | `task_update(id, receipt, action, note?)` | Use `renew` to extend the 15-minute lease, `progress` or `blocked` to record progress, and `completed` or `failed` to report an outcome. Use `release` with a handoff note to requeue the task or `cancelled` to confirm you stopped. |
 | `task_list(role?, submitter?, state?, after_id?, limit?)` | Recover visible tasks by role, submitter, or state. Each summary shows the owner, deadline, and a preview of the latest note or blocker. Use `next_after_id` to continue and `task_status(id)` for full notes and history. |
@@ -760,9 +767,19 @@ delivery on launch failure, and attempts are spaced by a 30-second cooldown afte
 worker exit. Stop the supervisor with Ctrl+C to disable startup. An existing foreground worker
 can finish its work.
 
-Role-based tasks use a shared queue, while startup selects a specific configured worker. To
-wake a particular worker for queued work, submit the task to its role and send a direct message
-to that worker with the task ID.
+Add `--task-role` to start a configured worker for available work in a role queue.
+
+```bash
+switchboard-relay --board team worker-watch --name worker:docs --task-role docs -- ./run-docs-worker
+```
+
+The supervisor sets `SWITCHBOARD_ROLE` for that command. Have the worker register using the
+provided name and role. It can call `task_claim()` for queued work, use `task_update()` to report
+results, and check `inbox()` for direct mail. The task trigger uses the same eligibility rules
+as `task_claim()`. Each board and role has one
+launch slot for supervisors configured with `--task-role`, including when they wake for direct
+mail. The guard holds that slot until the foreground worker exits. A single worker command can
+claim successive tasks before it exits.
 
 ---
 

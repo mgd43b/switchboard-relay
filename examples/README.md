@@ -74,6 +74,11 @@ and acknowledge it with ack(reply.id, reply.receipt).
    gone, verify the worker stopped before calling `task_cancel(id, note, confirm_stopped=true)`.
    To requeue a failed task, call `task_retry(id, attempt)` with its failed attempt number.
 
+For an offline worker, start its supervisor with `--task-role worker` and a command that registers
+using the supplied environment, then claims and completes work. Queue a task while the worker is
+offline. The supervisor starts the worker when the task becomes available. See
+[offline worker setup](../README.md#starting-an-offline-worker).
+
 ## Checking who's ready
 
 To see which peers are on the board and whether their agents have read the current charter:

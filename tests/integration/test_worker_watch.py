@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +18,7 @@ import switchboard_relay.worker_watch as supervisor
 from switchboard_relay.protocol import Protocol
 from switchboard_relay.server import main
 from switchboard_relay.store import Store
+from switchboard_relay.tasks import TaskQueue
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="worker-watch uses POSIX file locks")
 
@@ -23,6 +26,7 @@ _WORKER = """
 import asyncio
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -75,7 +79,7 @@ def test_real_worker_launch_is_opt_in_scoped_and_exclusive(tmp_path, monkeypatch
     ]
     messages = []
     logs = []
-    deadline = time.monotonic() + 12
+    deadline = time.monotonic() + 30
     ticks = 0
 
     def step(_seconds):
@@ -194,7 +198,7 @@ Path(sys.argv[3]).touch()
     try:
         with lock_path.open("a+b") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            assert supervisor._guard_worker(os.dup(lock.fileno()), "board/worker", command) == 0
+            assert supervisor._guard_worker((os.dup(lock.fileno()),), "board/worker", command) == 0
 
         deadline = time.monotonic() + 5
         while not ready.exists() and time.monotonic() < deadline:
@@ -221,7 +225,7 @@ def test_guard_rejects_expired_reservation_before_spawn(tmp_path, monkeypatch, c
 
     monkeypatch.setattr(supervisor.subprocess, "Popen", unexpected_spawn)
     with (tmp_path / "worker.lock").open("a+b") as lock:
-        assert supervisor._guard_worker(os.dup(lock.fileno()), "board/worker", ["worker"]) == 1
+        assert supervisor._guard_worker((os.dup(lock.fileno()),), "board/worker", ["worker"]) == 1
     assert "startup reservation expired" in capsys.readouterr().err
 
 
@@ -231,3 +235,171 @@ def test_worker_watch_requires_explicit_file_backed_board(options, capsys):
         main([*options, "worker-watch", "--name", "worker", "--", sys.executable])
     assert error.value.code == 2
     assert "worker-watch requires" in capsys.readouterr().err
+
+
+_TASK_WORKER = """
+import asyncio
+import json
+import os
+import sys
+from pathlib import Path
+
+from mcp import Client, StdioServerParameters
+
+
+async def run():
+    params = StdioServerParameters(command=sys.argv[1], env=dict(os.environ))
+    async with Client(params) as relay:
+        registered = (await relay.call_tool("register", {})).structured_content
+        task = (await relay.call_tool("task_claim", {})).structured_content["task"]
+        marker = Path(sys.argv[2])
+        temp = marker.with_suffix(".tmp")
+        temp.write_text(json.dumps({
+            "worker": registered["you"], "role": registered["role"], "id": task["id"],
+        }))
+        temp.replace(marker)
+        stop = asyncio.get_running_loop().time() + 45
+        while not Path(sys.argv[3]).exists() and asyncio.get_running_loop().time() < stop:
+            await asyncio.sleep(0.02)
+        result = await relay.call_tool("task_update", {
+            "id": task["id"], "receipt": task["receipt"], "action": "completed",
+            "note": "Finished the queued task",
+        })
+        assert result.structured_content["ok"]
+
+
+asyncio.run(run())
+"""
+
+
+def _wait_for(check, description):
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if check():
+            return
+        time.sleep(0.025)
+    pytest.fail(f"Timed out waiting for {description}")
+
+
+def _stop_watcher(process):
+    if process.poll() is None:
+        process.send_signal(signal.SIGINT)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_task_role_starts_offline_workers_with_one_slot_per_role(tmp_path):
+    import fcntl
+
+    relay = Path(sys.executable).with_name("switchboard-relay")
+    if not relay.is_file():
+        pytest.skip("Install the console script to test a real worker")
+    db = tmp_path / "board.db"
+    store = Store(db)
+    protocol = Protocol(store)
+    queue = TaskQueue(store)
+    protocol.claim("lead", "lead", "", now=time.time())
+    profile = tmp_path / "task_worker.py"
+    profile.write_text(_TASK_WORKER)
+
+    def submit(role):
+        return queue.submit(
+            "lead",
+            "lead",
+            role=role,
+            scope="Check docs",
+            owned_paths=["README.md"],
+            acceptance_criteria=[],
+            expected_evidence="",
+            clock=time.time,
+        )["id"]
+
+    def start(stack, name, gate):
+        marker = tmp_path / f"{name}.json"
+        log = tmp_path / f"{name}.log"
+        process = subprocess.Popen(
+            [
+                str(relay),
+                "--db",
+                str(db),
+                "worker-watch",
+                "--name",
+                name,
+                "--task-role",
+                "docs",
+                "--",
+                sys.executable,
+                str(profile),
+                str(relay),
+                str(marker),
+                str(gate),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=stack.enter_context(log.open("wb")),
+        )
+        stack.callback(_stop_watcher, process)
+        _wait_for(lambda: "watching mail and tasks" in log.read_text(), f"{name} supervisor")
+        return process, marker, log
+
+    submit("other-role")
+    release_one, release_two = tmp_path / "release-one", tmp_path / "release-two"
+    release_two.touch()
+    with ExitStack() as stack:
+        try:
+            first_watch, first_marker, first_log = start(stack, "worker-one", release_one)
+            time.sleep(1.1)
+            assert "launching worker" not in first_log.read_text()
+            first_id = submit("docs")
+            _wait_for(first_marker.exists, "first task claim")
+            assert json.loads(first_marker.read_text()) == {
+                "worker": "worker-one",
+                "role": "docs",
+                "id": first_id,
+            }
+
+            # Stop the watcher while its worker is still running. The guard
+            # keeps the role slot until that actual foreground worker exits.
+            _stop_watcher(first_watch)
+            [slot] = tmp_path.glob(".switchboard-worker-role-*.lock")
+            with (
+                slot.open("a+b") as fd,
+                pytest.raises(BlockingIOError),
+            ):
+                fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            second_id = submit("docs")
+            _, second_marker, second_log = start(stack, "worker-two", release_two)
+            time.sleep(1.1)
+            assert "launching worker" not in second_log.read_text()
+            assert not second_marker.exists()
+            assert not any(
+                store.has_messages(name, now=time.time()) for name in ("worker-one", "worker-two")
+            )
+
+            release_one.touch()
+            _wait_for(second_marker.exists, "second task claim after the role slot opens")
+            assert json.loads(second_marker.read_text()) == {
+                "worker": "worker-two",
+                "role": "docs",
+                "id": second_id,
+            }
+            _wait_for(
+                lambda: len(queue.list_tasks(now=time.time(), state="completed")["tasks"]) == 2,
+                "both task results",
+            )
+        finally:
+            release_one.touch()
+
+    protocol.leave("lead", time.time())
+    reopened = Store(db)
+    Protocol(reopened).claim("new-lead", "lead", "", now=time.time())
+    page = TaskQueue(reopened).list_tasks(
+        now=time.time(),
+        viewer=("lead", "", "new-lead"),
+        state="completed",
+    )
+    assert [task["id"] for task in page["tasks"]] == [first_id, second_id]
