@@ -207,17 +207,39 @@ async def test_role_task_tools_and_history_survive_lead_restart(tmp_path):
                 "task_update",
                 {
                     **change,
-                    "action": "completed",
-                    "note": "Examples passed",
+                    "action": "blocked",
+                    "note": "Waiting for test output",
                 },
             )
         )["ok"]
-        assert _data(await worker.call_tool("task_claim", {}))["task"] is None
 
-    async with _participant(db, "lead") as lead:
-        status = _data(await lead.call_tool("task_status", {"id": task["id"]}))
-        assert status["status"] == "completed"
-        assert status["attempts"][0]["updates"][0]["note"] == "Examples passed"
+        async with _participant(db, "lead") as lead:
+            [known] = _data(
+                await lead.call_tool(
+                    "task_list",
+                    {
+                        "submitter": "lead",
+                        "state": "blocked",
+                    },
+                )
+            )["tasks"]
+            assert known["owner"] == "worker:one"
+            assert known["blocker"] == "Waiting for test output"
+            assert _data(
+                await worker.call_tool(
+                    "task_update",
+                    {
+                        **change,
+                        "action": "completed",
+                        "note": "Examples passed",
+                    },
+                )
+            )["ok"]
+            status = _data(await lead.call_tool("task_status", {"id": known["id"]}))
+            assert status["status"] == "completed"
+            assert status["attempts"][0]["updates"][-1]["note"] == "Examples passed"
+
+        assert _data(await worker.call_tool("task_claim", {}))["task"] is None
 
 
 async def test_stdio_inbox_subscription_is_scoped_and_notifies_on_redelivery(tmp_path):

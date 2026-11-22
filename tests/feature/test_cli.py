@@ -6,6 +6,7 @@ observed rather than actually started, plus the ``$SWITCHBOARD_TTL`` parsing.
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -341,3 +342,48 @@ def test_inspection_commands_do_not_create_missing_db(monkeypatch, tmp_path, cap
     # A read-only peek must not materialize the database or its parent dir.
     assert not missing.exists()
     assert not missing.parent.exists()
+
+
+def test_cli_tasks_can_read_a_board_before_upgrade(tmp_path, capsys):
+    from switchboard_relay.protocol import Protocol
+    from switchboard_relay.tasks import TaskQueue
+
+    path = tmp_path / "board.db"
+    opts = ["--db", str(path), "tasks"]
+    assert main([*opts, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"tasks": [], "next_after_id": None}
+    assert not path.exists()
+
+    store = Store(path)
+    assert main(opts) == 0
+    assert "No matching tasks." in capsys.readouterr().out
+    Protocol(store).claim("owner", "lead", "", now=time.time())
+    queue = TaskQueue(store)
+    for role in ("worker", "reviewer", "worker"):
+        queue.submit(
+            "lead",
+            "owner",
+            role=role,
+            scope="Updated docs",
+            owned_paths=[],
+            acceptance_criteria=[],
+            expected_evidence="",
+            clock=time.time,
+        )
+    with store._connect() as conn:
+        conn.execute("DROP TRIGGER protect_cancelled_task_attempt")
+        conn.execute("DROP TABLE task_cancellations")
+
+    assert main([*opts, "--json", "--role", "worker", "--limit", "1"]) == 0
+    page = json.loads(capsys.readouterr().out)
+    assert [task["id"] for task in page["tasks"]] == [1]
+    assert page["next_after_id"] == 1
+
+    assert main([*opts, "--json", "--role", "worker", "--after-id", "1"]) == 0
+    page = json.loads(capsys.readouterr().out)
+    assert [task["id"] for task in page["tasks"]] == [3]
+    assert page["next_after_id"] is None
+    with store._connect() as conn:
+        assert not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='task_cancellations'"
+        ).fetchone()

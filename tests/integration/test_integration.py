@@ -440,3 +440,125 @@ async def test_messages_persist_across_server_restart(tmp_path):
         data(await a.call_tool("register", {"name": "lead"}))
         got = data(await a.call_tool("inbox", {}))
         assert [m["body"] for m in got["messages"]] == ["still here after restart"]
+
+
+async def test_task_handoff_retry_and_cooperative_cancellation(tmp_path):
+    async with sessions(make_board(tmp_path), n=3) as (lead, first, second):
+        for client, name, role in (
+            (lead, "lead", ""),
+            (first, "one", "worker"),
+            (second, "two", "worker"),
+        ):
+            data(await client.call_tool("register", {"name": name, "role": role}))
+
+        task = data(
+            await lead.call_tool(
+                "task_submit",
+                {
+                    "role": "worker",
+                    "scope": "Fix the broken test",
+                    "owned_paths": ["test.py"],
+                    "acceptance_criteria": ["Pass"],
+                    "expected_evidence": "Test output",
+                },
+            )
+        )
+        task_id = task["id"]
+        assert (await lead.call_tool("task_list", {"limit": 0})).is_error
+        one = data(await first.call_tool("task_claim", {}))["task"]
+        previous = {"id": task_id, "receipt": one["receipt"]}
+        data(
+            await first.call_tool(
+                "task_update",
+                {
+                    **previous,
+                    "action": "blocked",
+                    "note": "Waiting for a fixture",
+                },
+            )
+        )
+        [blocked] = data(
+            await lead.call_tool(
+                "task_list",
+                {
+                    "state": "blocked",
+                    "submitter": "lead",
+                    "role": "worker",
+                },
+            )
+        )["tasks"]
+        assert blocked["owner"] == "one" and blocked["blocker"] == "Waiting for a fixture"
+        assert "receipt" not in blocked and "attempts" not in blocked
+
+        released = data(
+            await first.call_tool(
+                "task_update",
+                {
+                    **previous,
+                    "action": "release",
+                    "note": "Fixture available on disk",
+                },
+            )
+        )["task"]
+        assert released["status"] == "queued"
+        two = data(await second.call_tool("task_claim", {}))["task"]
+        assert two["id"] == task_id
+        assert two["attempts"][0]["status"] == "released"
+        assert two["attempts"][0]["updates"][-1]["note"] == "Fixture available on disk"
+        assert not data(
+            await first.call_tool(
+                "task_update",
+                {
+                    **previous,
+                    "action": "completed",
+                    "note": "stale",
+                },
+            )
+        )["ok"]
+        current = {"id": task_id, "receipt": two["receipt"]}
+        failed = data(
+            await second.call_tool(
+                "task_update",
+                {
+                    **current,
+                    "action": "failed",
+                    "note": "The fixture was wrong",
+                },
+            )
+        )["task"]
+        retry = {"id": task_id, "attempt": failed["attempt"], "note": "Use the new fixture"}
+        assert not data(await first.call_tool("task_retry", retry))["ok"]
+        for _ in range(2):
+            assert data(await lead.call_tool("task_retry", retry))["task"]["status"] == "queued"
+
+        three = data(await first.call_tool("task_claim", {}))["task"]
+        assert len(three["attempts"]) == 3
+        assert not data(await lead.call_tool("task_retry", retry))["ok"]
+        assert not data(await second.call_tool("task_cancel", {"id": task_id}))["ok"]
+        cancelled = data(
+            await lead.call_tool(
+                "task_cancel",
+                {
+                    "id": task_id,
+                    "note": "The fix is no longer needed",
+                },
+            )
+        )["task"]
+        assert cancelled["status"] == "cancel_requested" and cancelled["owner"] == "one"
+        owner = {"id": task_id, "receipt": three["receipt"]}
+        pending = data(await first.call_tool("task_update", {**owner, "action": "renew"}))
+        assert not pending["ok"] and pending["error"] == "task_cancel_requested"
+        assert data(await second.call_tool("task_claim", {}))["task"] is None
+
+        finished = data(
+            await first.call_tool(
+                "task_update",
+                {
+                    **owner,
+                    "action": "cancelled",
+                    "note": "Stopped work and released the paths",
+                },
+            )
+        )["task"]
+        assert finished["status"] == "cancelled"
+        assert data(await lead.call_tool("task_status", {"id": task_id})) == finished

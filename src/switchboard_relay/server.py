@@ -55,7 +55,7 @@ from switchboard_relay.store import (
     AvailabilityCursor,
     Store,
 )
-from switchboard_relay.tasks import TaskAction, TaskQueue
+from switchboard_relay.tasks import TASK_STATES, TaskAction, TaskQueue, TaskState
 from switchboard_relay.worker_watch import watch_worker
 
 # How often wait() checks the mailbox, and how often it heartbeats the caller's
@@ -1014,7 +1014,7 @@ class Switchboard:
         _validate_id(id, "id")
         conn = self._resolve(ctx)
         if action != "renew" and not note.strip():
-            raise ToolError("Provide a progress note, blocker, or outcome evidence.")
+            raise ToolError("Provide a note for the task update.")
         self._check_body(note)
         self.store.touch(conn.name, now=_now())
         task = self.tasks.update(
@@ -1028,7 +1028,63 @@ class Switchboard:
         )
         if task is None:
             return {"id": id, "ok": False, "error": "invalid_or_expired_task_claim"}
+        if task["status"] == "cancel_requested":
+            return {"ok": False, "error": "task_cancel_requested", "task": task}
         return {"ok": True, "task": task}
+
+    def task_cancel(self, ctx: Context, id: int, note: str) -> dict:
+        _validate_id(id, "id")
+        self._check_body(note)
+        conn = self._resolve(ctx)
+        self.store.touch(conn.name, now=_now())
+        task = self.tasks.cancel(conn.name, conn.token, task_id=id, note=note, clock=_now)
+        if task is None:
+            return {"id": id, "ok": False, "error": "task_not_cancellable"}
+        return {"ok": True, "task": task}
+
+    def task_retry(self, ctx: Context, id: int, attempt: int, note: str) -> dict:
+        _validate_id(id, "id")
+        _validate_id(attempt, "attempt")
+        self._check_body(note)
+        conn = self._resolve(ctx)
+        self.store.touch(conn.name, now=_now())
+        task = self.tasks.retry(
+            conn.name,
+            conn.token,
+            task_id=id,
+            attempt=attempt,
+            note=note,
+            clock=_now,
+        )
+        if task is None:
+            return {"id": id, "ok": False, "error": "task_not_retryable"}
+        return {"ok": True, "task": task}
+
+    def task_list(
+        self,
+        ctx: Context,
+        *,
+        role: Optional[str],
+        submitter: Optional[str],
+        state: Optional[TaskState],
+        after_id: int,
+        limit: int,
+    ) -> dict:
+        conn = self._resolve(ctx)
+        now = _now()
+        self.store.touch(conn.name, now=now)
+        try:
+            return self.tasks.list_tasks(
+                now=now,
+                role=role,
+                submitter=submitter,
+                state=state,
+                after_id=after_id,
+                limit=limit,
+                viewer=(conn.name, conn.role, conn.token),
+            )
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
 
     def task_status(self, ctx: Context, id: int) -> dict:
         _validate_id(id, "id")
@@ -1370,7 +1426,7 @@ def build_server(
             "is enabled by default where installed host hooks work; hook trust is required. "
             "Generic MCP hosts poll unless they supply a wake mechanism. Call standby(false) "
             "to stop listening; standby(true) to re-arm. "
-            "Use task_submit(), task_claim(), task_update(), and task_status() for durable work. "
+            "Use task_submit(), task_claim(), task_update(), and task_list() for durable work. "
             "Charter coordination grants no task authority."
         ),
         lifespan=_lifespan,
@@ -1623,7 +1679,9 @@ def build_server(
 
         Use the receipt from task_claim(). Renew before the lease deadline.
         Renewal returns the task ID, current status, and new deadline.
-        Progress resumes a blocked task. Include evidence in a completed or failed update.
+        Progress resumes a blocked task. Use release with a handoff note to
+        requeue it, or cancelled to confirm a requested stop. Include evidence
+        in a completed or failed update.
         """
         return sb.task_update(ctx, id, receipt, action, note)
 
@@ -1631,6 +1689,48 @@ def build_server(
     def task_status(id: int, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
         """Read a task's status and attempt history as its submitter or a role worker."""
         return sb.task_status(ctx, id)
+
+    @mcp.tool(annotations=_LOCAL_IDEMPOTENT_WRITE)
+    def task_list(  # type: ignore[assignment]
+        role: Optional[str] = None,
+        submitter: Optional[str] = None,
+        state: Optional[TaskState] = None,
+        after_id: int = 0,
+        limit: int = 50,
+        ctx: Context = None,
+    ) -> dict[str, Any]:
+        """Page through visible tasks with owner, deadline, blocker, and last update.
+
+        Filter by role, submitter, or state. Use next_after_id to fetch another
+        page and task_status(id) for the full scope, notes, and history.
+        """
+        return sb.task_list(
+            ctx,
+            role=role,
+            submitter=submitter,
+            state=state,
+            after_id=after_id,
+            limit=limit,
+        )
+
+    @mcp.tool(annotations=_LOCAL_IDEMPOTENT_WRITE)
+    def task_cancel(id: int, note: str = "", ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Cancel a task you submitted or request cancellation from its current worker.
+
+        A pending request blocks new claims. The worker confirms it has stopped
+        with task_update(id, receipt, action="cancelled", note=...).
+        """
+        return sb.task_cancel(ctx, id, note)
+
+    @mcp.tool(annotations=_LOCAL_IDEMPOTENT_WRITE)
+    def task_retry(  # type: ignore[assignment]
+        id: int,
+        attempt: int,
+        note: str = "",
+        ctx: Context = None,
+    ) -> dict[str, Any]:
+        """Requeue a failed task you submitted, using its latest attempt number."""
+        return sb.task_retry(ctx, id, attempt, note)
 
     @mcp.tool(annotations=_LOCAL_WRITE)
     async def broadcast(body: str, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
@@ -1729,6 +1829,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     wake.add_argument(
         "command", nargs=argparse.REMAINDER, help="Fixed worker command and arguments."
     )
+    tasks = sub.add_parser("tasks", help="List task summaries on the selected board.")
+    tasks.add_argument("--role")
+    tasks.add_argument("--submitter")
+    tasks.add_argument("--state", choices=TASK_STATES)
+    tasks.add_argument("--after-id", type=int, default=0)
+    tasks.add_argument("--limit", type=int, default=50)
+    tasks.add_argument("--json", action="store_true", help="Print a JSON page of task summaries.")
     return parser
 
 
@@ -1900,6 +2007,40 @@ def _print_pending(store: Store, cursor: AvailabilityCursor) -> AvailabilityCurs
     return next_cursor
 
 
+def _cli_tasks(db_path, args: argparse.Namespace) -> int:
+    store = _open_store_ro(db_path)
+    page = (
+        TaskQueue(store, initialize=False).list_tasks(
+            now=_now(),
+            role=args.role,
+            submitter=args.submitter,
+            state=args.state,
+            after_id=args.after_id,
+            limit=args.limit,
+        )
+        if store is not None
+        else {"tasks": [], "next_after_id": None}
+    )
+    if args.json:
+        print(json.dumps(page))
+        return 0
+    for task in page["tasks"]:
+        owner = f" ({task['owner']})" if task["owner"] else ""
+        print(f"#{task['id']} [{task['status']}] {task['role']}{owner} — {task['scope']}")
+        if task["lease_expires_at"] is not None:
+            deadline = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(task["lease_expires_at"]))
+            print(f"  Lease expires {deadline}")
+        if task["blocker"]:
+            print(f"  Blocked: {task['blocker']}")
+        elif update := task["last_update"]:
+            print(f"  {update['kind']}: {update['note']}")
+    if not page["tasks"]:
+        print("No matching tasks.")
+    if page["next_after_id"] is not None:
+        print(f"Next page: --after-id {page['next_after_id']}")
+    return 0
+
+
 def _cli_tail(db_path, *, follow: bool = False, interval: float = 1.0) -> int:
     store = _open_store_ro(db_path)
     if store is None:
@@ -1945,6 +2086,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     # $SWITCHBOARD_DB > $SWITCHBOARD_BOARD > the current project.
     target = describe_target(db_arg=args.db, board_arg=args.board)
     db_path = target.db_path
+
+    if args.cmd == "tasks":
+        if not 0 <= args.after_id <= 2**63 - 1 or not 1 <= args.limit <= 100:
+            parser.error("tasks requires --after-id from 0 to 2^63-1 and --limit from 1 to 100")
+        return _cli_tasks(db_path, args)
 
     if args.cmd == "worker-watch":
         if not args.board and not args.db:
