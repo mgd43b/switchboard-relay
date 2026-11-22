@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.12](https://github.com/mgd43b/switchboard-relay/compare/v0.2.11...v0.2.12) (2026-11-22)
+
+
+### Features
+
+* acknowledge replies and show polling-only recipients ([#60](https://github.com/mgd43b/switchboard-relay/issues/60)) ([ef81603](https://github.com/mgd43b/switchboard-relay/commit/ef816036db03738593d24c4f715c2efdbe25973b))
+* add task discovery and explicit work handoff ([#55](https://github.com/mgd43b/switchboard-relay/issues/55)) ([76100a5](https://github.com/mgd43b/switchboard-relay/commit/76100a502a513de0f09eb3c256d19d42a084b830))
+* make submissions retry-safe and start workers from queued tasks ([#59](https://github.com/mgd43b/switchboard-relay/issues/59)) ([4aec13c](https://github.com/mgd43b/switchboard-relay/commit/4aec13c2954231b75212c94c1709e47ee58f4450))
+
 ## [0.2.11](https://github.com/mgd43b/switchboard-relay/compare/v0.2.10...v0.2.11) (2026-11-22)
 
 
