@@ -18,8 +18,10 @@ Because `switchboard-relay` is a standards-based *config-level* MCP server, the 
 Codex, Claude Code, and generic MCP clients. It routes named messages between any mix of local
 sessions on one machine, backed by SQLite so mailboxes survive restarts. Sessions claim an address,
 discover their peers, and receive the board's messaging conventions automatically when they
-connect. The Codex and Claude Code plugins also keep sessions listening between turns; generic MCP
-clients use the durable `inbox()` / `wait()` path.
+connect. Codex and Claude Code plugins keep open sessions listening between turns. Generic MCP
+clients can use `inbox()` and `wait()` or opt in to [inbox subscriptions](#mcp-inbox-subscriptions).
+The [task queue](#tools) records role-based assignments and progress, and a local
+[worker supervisor](#starting-an-offline-worker) can start a configured worker for pending mail.
 
 ```
         register("worker:auth")                       register("lead")
@@ -164,7 +166,8 @@ The plugin also bundles a Codex `Stop` hook, [`hooks/codex.json`](hooks/codex.js
 manifest names explicitly so Codex never loads the Claude Code hook file. Installed plugin hooks are
 not trusted automatically: review and trust it with `/hooks`. Once trusted, every session listens
 between turns by default. When a turn finishes, the hook waits up to 15 minutes for durable mail. If
-mail arrives, it continues the turn so the session can call `inbox()` and reply. If the window ends
+mail arrives, it continues the turn so the session can call `inbox()`, reply as needed, and
+acknowledge the messages it handled. If the window ends
 quietly, it continues the turn once so the session can re-arm with `standby(true)` and finish. Call
 `standby(false)` to stop listening for the rest of the session, or set `SWITCHBOARD_AUTO_LISTEN=0`
 to start with listening off. A newly joined session reports `listen_status` `polling-only`. It
@@ -457,7 +460,7 @@ for a reply. Ask the recipient to respond to your unique name with `reply_to` se
 |------|--------------|
 | `task_submit(role, scope, owned_paths, acceptance_criteria, expected_evidence)` | Queue work for a role and return a task ID. |
 | `task_claim()` | Claim the oldest available task for your registered role. Returns the task, lease deadline, attempt history, and receipt. An empty queue returns `task: null`. |
-| `task_update(id, receipt, action, note?)` | Use `renew` to extend the 15-minute lease and return the new deadline, `progress` to record progress or resume blocked work, `blocked` to record what you need, and `completed` or `failed` to report an outcome with evidence. |
+| `task_update(id, receipt, action, note?)` | Use `renew` to extend the 15-minute lease and return the task ID, current state, and new deadline, `progress` to record progress or resume blocked work, `blocked` to record what you need, and `completed` or `failed` to report an outcome with evidence. |
 | `task_status(id)` | Get the current owner, status, deadline, and attempt history. The submitting address and workers for the role can read it. |
 
 A task is available to another worker when its work lease expires. The new claim includes earlier
@@ -620,10 +623,10 @@ switchboard-relay doctor                         # ⭐ "why isn't this working?"
 switchboard-relay boards                         # every local board + its live participant count
 switchboard-relay participants                   # live participants on this board (name, role, idle)
 switchboard-relay tail                           # queued (undelivered) messages on this board
-switchboard-relay tail --follow                  # …and keep watching
-switchboard-relay prune                          # delete old dead-letter messages + expired participants
+switchboard-relay tail --follow                  # watch for new mail and redeliveries
+switchboard-relay prune                          # expire old mail and participant entries
 switchboard-relay charter                        # the board's charter, revision, and coordinator
-switchboard-relay participants --board team      # …a specific board instead
+switchboard-relay --board team participants      # inspect a specific board
 ```
 
 **`doctor`** is the one-shot diagnostic: it prints which board you resolved to (and *how* — `--board`,
@@ -680,8 +683,8 @@ foreground worker when its named address has mail.
 
 ### Delivery and acknowledgments
 
-An available message can have **one active claim**. `inbox()`, `wait()`, and the reply returned by
-`ask()` include an attempt-specific `receipt` and `lease_expires_at`. Call `ack(id, receipt)` once
+An available message can have **one active claim**. Claims returned by `inbox()`, `wait()`,
+`replies()`, and `ask()` include an attempt-specific `receipt` and `lease_expires_at`. Call `ack(id, receipt)` once
 you have safely handled that message. If the recipient disconnects before acknowledging, the
 message becomes available again when its lease expires, provided it is still within the message TTL.
 
@@ -733,8 +736,8 @@ switchboard-relay --board team worker-watch --name worker:docs -- ./run-docs-wor
 ```
 
 Use `--db /path/to/board.db` for a file-backed board selected by path. The supervisor passes
-`SWITCHBOARD_DB`, `SWITCHBOARD_BOARD`, and `SWITCHBOARD_NAME` to the command. Have the worker
-pass those environment variables through to its MCP server, register the configured name, and
+`SWITCHBOARD_DB`, `SWITCHBOARD_BOARD`, `SWITCHBOARD_NAME`, and `SWITCHBOARD_TTL` to the command.
+Have the worker pass those variables through to its MCP server, register the configured name, and
 claim and acknowledge its mail. The program should run in the foreground for the worker's
 lifetime. The integration test uses a Python MCP client as that worker.
 
@@ -878,8 +881,8 @@ The research‑preview reaction can't be unit‑tested, so confirm it by hand on
    `register(name="worker")`, then `send(to="lead", body="ping — what's 2+2?")`.
 4. **Watch B react with no manual poll:** within ~a second a `<channel source="switchboard-relay" …>`
    turn appears in B, and B calls `inbox()` on its own, reads *"ping — what's 2+2?"*, and handles it
-   (e.g. replies with `send(to="worker", body="4", reply_to=<id>)`). If instead B does nothing,
-   re‑check the three constraints — most often push wasn't enabled (`SWITCHBOARD_PUSH=1`), B wasn't
+   (e.g. replies with `send(to="worker", body="4", reply_to=<id>)` and then calls `ack(id, receipt)`).
+   If B stays idle, re-check the three constraints — most often push wasn't enabled (`SWITCHBOARD_PUSH=1`), B wasn't
    launched with `--dangerously-load-development-channels`, or an org policy has `channelsEnabled` off.
 
 ---
@@ -937,7 +940,10 @@ Source layout — each module is small and single‑purpose:
 
 - [`store.py`](src/switchboard_relay/store.py) — the durable SQLite store (registry + mailboxes). Pure and clock‑free.
 - [`board.py`](src/switchboard_relay/board.py) — board resolution: which switchboard a session joins (env / git worktree → DB path). Pure and transport‑free.
-- [`server.py`](src/switchboard_relay/server.py) — the MCP server: identity binding, the tools, polling/standby loops, and best‑effort push.
+- [`protocol.py`](src/switchboard_relay/protocol.py) — session identities, liveness leases, and board charters.
+- [`server.py`](src/switchboard_relay/server.py) — MCP tools, standby, and notification wiring.
+- [`tasks.py`](src/switchboard_relay/tasks.py) — role queues, work leases, and attempt history.
+- [`worker_watch.py`](src/switchboard_relay/worker_watch.py) — foreground worker supervision for one named mailbox.
 
 Tests are split into three tiers:
 
