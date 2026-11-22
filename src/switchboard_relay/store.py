@@ -61,6 +61,7 @@ from typing import Optional
 # goes, and unregister() drops it immediately on a clean exit.
 DEFAULT_TTL_SECONDS = 1800.0
 DEFAULT_DELIVERY_LEASE_SECONDS = 300.0
+REPLY_BATCH_SIZE = 10
 MESSAGE_STATUS_RETENTION_SECONDS = 7 * 86400.0
 
 _SCHEMA = """
@@ -84,6 +85,7 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages (recipient, id);
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages (created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages (recipient, reply_to, id);
 
 CREATE TABLE IF NOT EXISTS message_deliveries (
     id               INTEGER PRIMARY KEY,
@@ -102,6 +104,8 @@ CREATE TABLE IF NOT EXISTS message_deliveries (
 );
 CREATE INDEX IF NOT EXISTS idx_message_deliveries_available
     ON message_deliveries (recipient, id) WHERE body IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_message_deliveries_reply
+    ON message_deliveries (recipient, reply_to, id) WHERE body IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_message_deliveries_created
     ON message_deliveries (created_at) WHERE body IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_message_deliveries_acknowledged
@@ -464,8 +468,33 @@ class Store:
         lease: float = DEFAULT_DELIVERY_LEASE_SECONDS,
     ) -> Optional[Message]:
         """Claim only the oldest available reply to the specified question."""
+        messages = self.claim_replies(
+            name,
+            role,
+            reply_to=reply_to,
+            now=now,
+            max_age=max_age,
+            owner_token=owner_token,
+            lease=lease,
+            limit=1,
+        )
+        return messages[0] if messages else None
+
+    def claim_replies(
+        self,
+        name: str,
+        role: str = "",
+        *,
+        reply_to: int,
+        now: float,
+        max_age: Optional[float] = None,
+        owner_token: Optional[str] = None,
+        lease: float = DEFAULT_DELIVERY_LEASE_SECONDS,
+        limit: int = REPLY_BATCH_SIZE,
+    ) -> list[Message]:
+        """Claim available matching replies, oldest first."""
         where, params = _mailbox_filter(name, role)
-        messages = self._claim(
+        return self._claim(
             name,
             owner_token,
             now,
@@ -473,9 +502,8 @@ class Store:
             lease,
             where + " AND reply_to = ?",
             [*params, reply_to],
-            limit=1,
+            limit=limit,
         )
-        return messages[0] if messages else None
 
     def _claim(
         self,
@@ -905,9 +933,9 @@ def _select_available(
                     WHERE {where} AND created_at > ?
                       AND body IS NOT NULL AND lease_expires_at <= ?"""
         args.extend([*params, cutoff, now])
-    return conn.execute(
-        f"SELECT {fields} FROM ({sql}) ORDER BY id LIMIT ?", (*args, limit)
-    ).fetchall()
+    if fields != "*":
+        sql = f"SELECT {fields} FROM ({sql})"
+    return conn.execute(sql + " ORDER BY id LIMIT ?", (*args, limit)).fetchall()
 
 
 def _row_to_message(

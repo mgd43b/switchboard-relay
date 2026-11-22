@@ -235,6 +235,28 @@ def test_check_body_ignores_non_string(tmp_path):
 # -- hygiene bounds: undelivered-message TTL (#17) --------------------------
 
 
+@pytest.mark.parametrize("question_id", [0, -(2**63) - 1, 2**63])
+def test_replies_rejects_invalid_question_ids(board, question_id):
+    with pytest.raises(ToolError, match=r"question_id.*positive signed 64-bit integer"):
+        board.replies(_ctx(), question_id)
+
+
+def test_replies_collects_bounded_batches_in_id_order(board):
+    lead, worker = _ctx(), _ctx()
+    board.register(lead, "lead")
+    board.register(worker, "worker")
+    ticket = board.send(worker, "lead", "How is the build?")["id"]
+    assert board.replies(worker, 2**63 - 1)["replies"] == []
+    ids = [board.send(lead, "worker", f"part {i}", reply_to=ticket)["id"] for i in range(12)]
+
+    first = board.replies(worker, ticket)
+    second = board.replies(worker, ticket)
+    assert first["count"] == 10
+    assert [message["id"] for message in first["replies"]] == ids[:10]
+    assert [message["id"] for message in second["replies"]] == ids[10:]
+    assert board.replies(worker, ticket)["replies"] == []
+
+
 def test_status_scopes_broadcast_ids_to_the_sending_address(board):
     lead, one, two = _ctx(), _ctx(), _ctx()
     board.register(lead, "lead")
