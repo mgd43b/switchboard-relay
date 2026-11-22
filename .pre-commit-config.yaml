@@ -1,15 +1,17 @@
 # Run `pre-commit install` once to enable these on every commit.
 # Update hook versions with `pre-commit autoupdate`.
 repos:
+  # This rev is the single ruff pin: CI's lint job runs these hooks too, and
+  # Dependabot's pre-commit group bumps it.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.1
+    rev: v0.17.6
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
       - id: ruff-format
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
