@@ -562,3 +562,59 @@ async def test_task_handoff_retry_and_cooperative_cancellation(tmp_path):
         )["task"]
         assert finished["status"] == "cancelled"
         assert data(await lead.call_tool("task_status", {"id": task_id})) == finished
+
+
+async def test_submitter_can_confirm_cancel_after_owning_session_disconnects(tmp_path):
+    mcp = make_board(tmp_path)
+    async with sessions(mcp) as (lead, worker):
+        data(await lead.call_tool("register", {"name": "lead"}))
+        data(await worker.call_tool("register", {"name": "worker", "role": "docs"}))
+        task = data(
+            await lead.call_tool(
+                "task_submit",
+                {
+                    "role": "docs",
+                    "scope": "Edit the guide",
+                    "owned_paths": ["README.md"],
+                    "acceptance_criteria": [],
+                    "expected_evidence": "",
+                },
+            )
+        )
+        task_id = task["id"]
+        claim = data(await worker.call_tool("task_claim", {}))["task"]
+        override = {
+            "id": task_id,
+            "confirm_stopped": True,
+            "note": "Verified the worker process stopped",
+        }
+        assert not data(await lead.call_tool("task_cancel", override))["ok"]
+        assert data(await lead.call_tool("task_cancel", {"id": task_id}))["task"]["status"] == (
+            "cancel_requested"
+        )
+        assert not data(await lead.call_tool("task_cancel", override))["ok"]
+        assert (await lead.call_tool("task_cancel", {**override, "note": " "})).is_error
+
+        data(await worker.call_tool("unregister", {}))
+        async with connect(make_board(tmp_path)) as reconnected:
+            data(await reconnected.call_tool("register", {"name": "worker", "role": "docs"}))
+            assert not data(
+                await reconnected.call_tool(
+                    "task_update",
+                    {
+                        "id": task_id,
+                        "receipt": claim["receipt"],
+                        "action": "cancelled",
+                        "note": "Stopped",
+                    },
+                )
+            )["ok"]
+            assert not data(await reconnected.call_tool("task_cancel", override))["ok"]
+            result = data(await lead.call_tool("task_cancel", override))["task"]
+            assert result["status"] == "cancelled"
+            assert result["last_update"]["kind"] == "cancel_confirmed_by_submitter"
+            assert result["attempts"][0]["updates"][-1]["note"] == override["note"]
+            assert result["owner"] is None and result["cancelled_at"] is not None
+            assert data(await reconnected.call_tool("task_claim", {}))["task"] is None
+
+        assert data(await lead.call_tool("task_cancel", override))["task"] == result

@@ -462,7 +462,7 @@ for a reply. Ask the recipient to respond to your unique name with `reply_to` se
 | `task_claim()` | Claim the oldest available task for your registered role. Returns the task, lease deadline, attempt history, and receipt. An empty queue returns `task: null`. |
 | `task_update(id, receipt, action, note?)` | Use `renew` to extend the 15-minute lease, `progress` or `blocked` to record progress, and `completed` or `failed` to report an outcome. Use `release` with a handoff note to requeue the task or `cancelled` to confirm you stopped. |
 | `task_list(role?, submitter?, state?, after_id?, limit?)` | Recover visible tasks by role, submitter, or state. Each summary shows the owner, deadline, and a preview of the latest note or blocker. Use `next_after_id` to continue and `task_status(id)` for full notes and history. |
-| `task_cancel(id, note?)` | Request cancellation as the submitting lead. Queue-only tasks cancel immediately. An unfinished attempt remains `cancel_requested` until its worker confirms it has stopped. |
+| `task_cancel(id, note?, confirm_stopped?)` | Request cancellation as the submitting lead. Queue-only tasks cancel immediately. For a pending request whose worker session is gone, set `confirm_stopped=true` and record how you verified work stopped. |
 | `task_retry(id, attempt, note?)` | Requeue a failed task as its submitter. Pass the failed attempt number so repeating the call leaves later attempts alone. |
 | `task_status(id)` | Get the current owner, status, deadline, and attempt history. The submitting address and workers for the role can read it. |
 
@@ -471,7 +471,9 @@ notes and a fresh receipt. A worker can also use `release` to hand work off imme
 Keep the submitting name when reconnecting, then use `task_list(submitter="lead")` to recover
 tasks without saving IDs. A cancellation request removes the task from the claim queue even
 if its lease expires. The worker can see the request in task status or an update response,
-and confirms it has stopped with `task_update(action="cancelled", ...)`.
+and confirms it has stopped with `task_update(action="cancelled", ...)`. If the owning session
+disconnects, the lead can confirm after verifying the worker stopped and recording how. That
+confirmation is recorded separately in the attempt history.
 Update the relay in each worker session to see cancellation requests through its tools.
 See [the lead and worker walkthrough](examples/README.md#working-from-the-task-queue).
 

@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     attempt           INTEGER NOT NULL DEFAULT 0,
     available_at      REAL
 );
+CREATE INDEX IF NOT EXISTS idx_tasks_submitter ON tasks (submitter, id);
 CREATE TABLE IF NOT EXISTS task_attempts (
     task_id          INTEGER NOT NULL,
     number           INTEGER NOT NULL,
@@ -180,13 +181,11 @@ class TaskQueue:
             if cancellation is not None:
                 if action != "cancelled":
                     return {"id": task_id, "status": "cancel_requested"}
-                # The receipt still identifies the last worker even after its
-                # lease expired. A cancellation request keeps the task unclaimable.
-                conn.execute(
-                    "UPDATE task_cancellations SET confirmed_at=? WHERE task_id=?",
-                    (now, task_id),
-                )
-            elif action == "cancelled" or attempt["lease_expires_at"] <= now:
+                # A cancellation request keeps this attempt current even if
+                # the worker needs to acknowledge it after the lease expires.
+                _confirm_cancellation(conn, *key, "cancelled", note, now)
+                return _describe(conn, task_id, now)
+            if action == "cancelled" or attempt["lease_expires_at"] <= now:
                 return None
 
             if action == "renew":
@@ -211,13 +210,37 @@ class TaskQueue:
             return _describe(conn, task_id, now)
 
     def cancel(
-        self, name: str, token: str, *, task_id: int, note: str, clock: Callable[[], float]
+        self,
+        name: str,
+        token: str,
+        *,
+        task_id: int,
+        note: str,
+        clock: Callable[[], float],
+        confirm_stopped: bool = False,
     ) -> Optional[dict]:
+        if confirm_stopped and not note.strip():
+            raise ValueError("Provide a note explaining how you confirmed the worker stopped.")
         with self._write(name, token, clock) as (conn, now):
             task = _submitted_task(conn, task_id, name)
             if task is None:
                 return None
-            if _cancellation(conn, task_id) is not None:
+            cancellation = _cancellation(conn, task_id)
+            if confirm_stopped:
+                if cancellation is None:
+                    return None
+                if cancellation["confirmed_at"] is None:
+                    worker_online = conn.execute(
+                        "SELECT 1 FROM relay_sessions WHERE token=? AND expires>?",
+                        (task["attempt_owner_token"], now),
+                    ).fetchone()
+                    if worker_online:
+                        return None
+                    _confirm_cancellation(
+                        conn, task_id, task["attempt"], "cancel_confirmed_by_submitter", note, now
+                    )
+                return _describe(conn, task_id, now)
+            if cancellation is not None:
                 return _describe(conn, task_id, now)
             if task["available_at"] is None:
                 return None
@@ -312,7 +335,9 @@ class TaskQueue:
 
 def _submitted_task(conn: sqlite3.Connection, task_id: int, name: str) -> Optional[sqlite3.Row]:
     return conn.execute(
-        """SELECT task.*, attempt.state AS attempt_state FROM tasks AS task
+        """SELECT task.*, attempt.state AS attempt_state,
+                  attempt.owner_token AS attempt_owner_token
+           FROM tasks AS task
            LEFT JOIN task_attempts AS attempt
              ON attempt.task_id=task.id AND attempt.number=task.attempt
            WHERE task.id=? AND task.submitter=?""",
@@ -324,6 +349,17 @@ def _cancellation(conn: sqlite3.Connection, task_id: int) -> Optional[sqlite3.Ro
     return conn.execute(
         "SELECT requested_at, confirmed_at FROM task_cancellations WHERE task_id=?", (task_id,)
     ).fetchone()
+
+
+def _confirm_cancellation(
+    conn: sqlite3.Connection, task_id: int, attempt: int, kind: str, note: str, now: float
+) -> None:
+    conn.execute("UPDATE task_cancellations SET confirmed_at=? WHERE task_id=?", (now, task_id))
+    conn.execute(
+        "UPDATE task_attempts SET state='cancelled' WHERE task_id=? AND number=?",
+        (task_id, attempt),
+    )
+    _record_update(conn, task_id, attempt, kind, note, now)
 
 
 def _record_update(

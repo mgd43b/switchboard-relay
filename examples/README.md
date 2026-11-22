@@ -70,8 +70,9 @@ and acknowledge it with ack(reply.id, reply.receipt).
    local changes can instead release the task immediately with a handoff note.
 4. To stop work, call `task_cancel(id)` as the lead. Wait for `cancelled` before handing the same
    paths to another worker. A worker confirms cancellation after stopping by calling
-   `task_update(action="cancelled", ...)` with its receipt and a note. To requeue a failed task,
-   call `task_retry(id, attempt)` with its failed attempt number.
+   `task_update(action="cancelled", ...)` with its receipt and a note. If the worker session is
+   gone, verify the worker stopped before calling `task_cancel(id, note, confirm_stopped=true)`.
+   To requeue a failed task, call `task_retry(id, attempt)` with its failed attempt number.
 
 ## Checking who's ready
 

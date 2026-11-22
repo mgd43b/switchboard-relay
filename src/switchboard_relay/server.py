@@ -1032,12 +1032,22 @@ class Switchboard:
             return {"ok": False, "error": "task_cancel_requested", "task": task}
         return {"ok": True, "task": task}
 
-    def task_cancel(self, ctx: Context, id: int, note: str) -> dict:
+    def task_cancel(self, ctx: Context, id: int, note: str, confirm_stopped: bool = False) -> dict:
         _validate_id(id, "id")
         self._check_body(note)
         conn = self._resolve(ctx)
         self.store.touch(conn.name, now=_now())
-        task = self.tasks.cancel(conn.name, conn.token, task_id=id, note=note, clock=_now)
+        try:
+            task = self.tasks.cancel(
+                conn.name,
+                conn.token,
+                task_id=id,
+                note=note,
+                clock=_now,
+                confirm_stopped=confirm_stopped,
+            )
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
         if task is None:
             return {"id": id, "ok": False, "error": "task_not_cancellable"}
         return {"ok": True, "task": task}
@@ -1714,13 +1724,20 @@ def build_server(
         )
 
     @mcp.tool(annotations=_LOCAL_IDEMPOTENT_WRITE)
-    def task_cancel(id: int, note: str = "", ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """Cancel a task you submitted or request cancellation from its current worker.
+    def task_cancel(  # type: ignore[assignment]
+        id: int,
+        note: str = "",
+        confirm_stopped: bool = False,
+        ctx: Context = None,
+    ) -> dict[str, Any]:
+        """Cancel submitted work or request that its current worker stop.
 
-        A pending request blocks new claims. The worker confirms it has stopped
-        with task_update(id, receipt, action="cancelled", note=...).
+        A pending request blocks new claims. The worker confirms with
+        task_update(id, receipt, action="cancelled", note=...).
+        If the owning session is gone and you have verified work stopped,
+        set confirm_stopped=True and record how you verified it in the note.
         """
-        return sb.task_cancel(ctx, id, note)
+        return sb.task_cancel(ctx, id, note, confirm_stopped=confirm_stopped)
 
     @mcp.tool(annotations=_LOCAL_IDEMPOTENT_WRITE)
     def task_retry(  # type: ignore[assignment]
@@ -2007,6 +2024,11 @@ def _print_pending(store: Store, cursor: AvailabilityCursor) -> AvailabilityCurs
     return next_cursor
 
 
+def _terminal_safe(text: str) -> str:
+    """Make terminal controls visible in board-authored text."""
+    return "".join(char if char.isprintable() else repr(char)[1:-1] for char in text)
+
+
 def _cli_tasks(db_path, args: argparse.Namespace) -> int:
     store = _open_store_ro(db_path)
     page = (
@@ -2026,14 +2048,18 @@ def _cli_tasks(db_path, args: argparse.Namespace) -> int:
         return 0
     for task in page["tasks"]:
         owner = f" ({task['owner']})" if task["owner"] else ""
-        print(f"#{task['id']} [{task['status']}] {task['role']}{owner} — {task['scope']}")
+        print(
+            _terminal_safe(
+                f"#{task['id']} [{task['status']}] {task['role']}{owner} — {task['scope']}"
+            )
+        )
         if task["lease_expires_at"] is not None:
             deadline = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(task["lease_expires_at"]))
             print(f"  Lease expires {deadline}")
         if task["blocker"]:
-            print(f"  Blocked: {task['blocker']}")
+            print(_terminal_safe(f"  Blocked: {task['blocker']}"))
         elif update := task["last_update"]:
-            print(f"  {update['kind']}: {update['note']}")
+            print(_terminal_safe(f"  {update['kind']}: {update['note']}"))
     if not page["tasks"]:
         print("No matching tasks.")
     if page["next_after_id"] is not None:
