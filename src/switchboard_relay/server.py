@@ -58,6 +58,9 @@ _WAIT_HEARTBEAT_SECONDS = 10.0
 # wait() poll: it runs for the whole session lifetime, and a second of latency
 # on a background nudge is fine. See Switchboard._watch_loop.
 _WATCH_POLL_SECONDS = 1.0
+# Slack on the keepalive deadline for a sleep that wakes a hair early. Timer
+# jitter only: any larger and a refresh due just past a poll fires a tick early.
+_KEEPALIVE_SLACK_SECONDS = 0.01
 
 # How often the background loop refreshes the liveness clock of the sessions
 # connected to this process. It only has to beat the TTL by a comfortable
@@ -102,6 +105,11 @@ _LOCAL_IDEMPOTENT_DESTRUCTIVE = ToolAnnotations(
 
 def _now() -> float:
     return time.time()
+
+
+def _monotonic() -> float:
+    """The watch loop's clock; a seam so tests can drive the loop deterministically."""
+    return time.monotonic()
 
 
 def _auto_name() -> str:
@@ -686,12 +694,16 @@ class Switchboard:
             _WATCH_POLL_SECONDS if self._push_enabled else _KEEPALIVE_SECONDS,
             self.protocol.lease / 3,
         )
-        last_keepalive = 0.0
+        # Refresh within a third of the lease in every mode: an idle session's
+        # lease must never lapse while its process still holds it. Timed on the
+        # monotonic clock anyio sleeps on, with jitter-sized slack, so a tick
+        # that wakes a hair early can't skip a refresh and double the gap.
+        refresh_every = min(_KEEPALIVE_SECONDS, self.protocol.lease / 3)
+        slack = min(_KEEPALIVE_SLACK_SECONDS, poll / 2)
+        last_keepalive = float("-inf")
         while True:
-            now = _now()
-            # Refresh within a third of the lease in every mode: an idle
-            # session's lease must never lapse while its process still holds it.
-            if now - last_keepalive >= min(_KEEPALIVE_SECONDS, self.protocol.lease / 3):
+            now = _monotonic()
+            if now - last_keepalive >= refresh_every - slack:
                 last_keepalive = now
                 self._keepalive_conns()
             if self._push_enabled:

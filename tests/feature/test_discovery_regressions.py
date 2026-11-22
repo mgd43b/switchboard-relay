@@ -124,7 +124,9 @@ def test_unregister_drops_the_token(tmp_path):
 
 
 def test_manual_keepalive_refreshes_within_the_lease(tmp_path):
-    b = Switchboard(Store(tmp_path / "b.db"), ttl=0.3)  # lease 0.3s, keepalive 60s
+    # Lease 0.6s, so the loop refreshes every 0.2s: outlasting the lease twice
+    # over proves the keepalive, with headroom for a slow CI runner.
+    b = Switchboard(Store(tmp_path / "b.db"), ttl=0.6)
     a = FakeCtx(FakeSession())
     b.register(a, "lead")
     c = FakeCtx(FakeSession())
@@ -132,9 +134,54 @@ def test_manual_keepalive_refreshes_within_the_lease(tmp_path):
     async def drive():
         async with anyio.create_task_group() as tg:
             tg.start_soon(b._watch_loop)
-            await anyio.sleep(0.8)
+            await anyio.sleep(1.5)
             with pytest.raises(ToolError, match="name_in_use"):
                 b.register(c, "lead")
             tg.cancel_scope.cancel()
 
     anyio.run(drive)
+
+
+class _StopLoop(Exception):
+    pass
+
+
+def _drive_watch_loop(b, monkeypatch, *, tick, ticks):
+    """Run ``b._watch_loop`` for ``ticks`` sleeps on a fake clock that advances
+    ``tick`` seconds per sleep, and return how many keepalive refreshes ran."""
+    import switchboard_relay.server as server_mod
+
+    clock = [1000.0]
+    calls = []
+
+    async def fake_sleep(_seconds):
+        if len(calls) and clock[0] >= 1000.0 + tick * ticks:
+            raise _StopLoop
+        clock[0] += tick
+
+    monkeypatch.setattr(server_mod, "_monotonic", lambda: clock[0])
+    monkeypatch.setattr(server_mod.anyio, "sleep", fake_sleep)
+    monkeypatch.setattr(b, "_keepalive_conns", lambda: calls.append(clock[0]) or 0)
+    with pytest.raises(_StopLoop):
+        anyio.run(b._watch_loop)
+    return len(calls)
+
+
+def test_watch_loop_refreshes_on_a_tick_that_wakes_slightly_early(tmp_path, monkeypatch):
+    # Lease 0.3s: refresh every 0.1s, poll every 0.1s. Each sleep wakes 1ms early;
+    # the loop must still refresh on every tick, never every other one.
+    b = Switchboard(Store(tmp_path / "b.db"), ttl=0.3)
+    assert _drive_watch_loop(b, monkeypatch, tick=0.099, ticks=10) == 11
+
+
+def test_watch_loop_slack_does_not_refresh_early_with_push_on(tmp_path, monkeypatch):
+    # Lease 4s with push: poll 1s, refresh due every 1.33s. Slack is jitter-sized,
+    # so the refresh waits for the second tick rather than firing on every tick.
+    b = Switchboard(Store(tmp_path / "b.db"), ttl=4.0)
+    b._push_enabled = True
+
+    async def no_tick():
+        return None
+
+    monkeypatch.setattr(b, "_watch_tick", no_tick)
+    assert _drive_watch_loop(b, monkeypatch, tick=1.0, ticks=10) == 6
