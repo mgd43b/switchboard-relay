@@ -132,6 +132,8 @@ async def test_tools_advertise_codex_approval_hints(tmp_path):
         assert tools["inbox"].annotations.destructive_hint is True
         assert tools["wait"].annotations.destructive_hint is True
         assert tools["ask"].annotations.destructive_hint is True
+        assert tools["ack"].annotations.idempotent_hint is True
+        assert tools["status"].annotations.destructive_hint is False
         assert tools["unregister"].annotations.idempotent_hint is True
 
 
@@ -153,7 +155,7 @@ async def test_codex_standby_tools_work_over_the_wire(tmp_path):
         assert data(await lead.call_tool("standby", {"enabled": False}))["standby"] is False
 
 
-async def test_inbox_drains_by_default_peek_does_not(tmp_path):
+async def test_inbox_claims_by_default_peek_does_not(tmp_path):
     mcp = make_board(tmp_path)
     async with sessions(mcp) as (a, b):
         data(await a.call_tool("register", {"name": "lead"}))
@@ -162,7 +164,7 @@ async def test_inbox_drains_by_default_peek_does_not(tmp_path):
 
         assert data(await a.call_tool("inbox", {"peek": True}))["count"] == 1
         assert data(await a.call_tool("inbox", {"peek": True}))["count"] == 1  # still there
-        assert data(await a.call_tool("inbox", {}))["count"] == 1  # drains
+        assert data(await a.call_tool("inbox", {}))["count"] == 1  # claims
         assert data(await a.call_tool("inbox", {}))["count"] == 0  # gone
 
 
@@ -264,6 +266,11 @@ async def test_ask_round_trip(tmp_path):
         assert result["timed_out"] is False
         assert result["reply"]["body"] == "42"
         assert result["reply"]["reply_to"] == result["question_id"]
+        reply = result["reply"]
+        assert data(await lead.call_tool("status", {"id": reply["id"]}))["status"] == "leased"
+        ack = data(await worker.call_tool("ack", {"id": reply["id"], "receipt": reply["receipt"]}))
+        assert ack["ok"]
+        assert data(await lead.call_tool("status", {"id": reply["id"]}))["status"] == "acknowledged"
 
 
 async def test_broadcast_over_the_wire(tmp_path):

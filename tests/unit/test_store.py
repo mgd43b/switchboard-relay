@@ -7,6 +7,7 @@ drain semantics, role addressing, `since`, and TTL expiry. Time is injected via
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import types
 
@@ -195,12 +196,12 @@ def test_prune_deletes_expired(store):
 # -- send / inbox ----------------------------------------------------------
 
 
-def test_send_and_drain_roundtrip(store):
+def test_send_and_claim_roundtrip(store):
     store.register("b", now=1.0)
     mid = store.send("b", "hello", sender="a", now=2.0)
     assert isinstance(mid, int) and mid > 0
 
-    msgs = store.inbox("b")
+    msgs = store.inbox("b", now=1000.0)
     assert len(msgs) == 1
     m = msgs[0].to_dict()
     assert m["id"] == mid
@@ -209,30 +210,30 @@ def test_send_and_drain_roundtrip(store):
     assert m["body"] == "hello"
     assert m["reply_to"] is None
 
-    # Drained: a second read returns nothing.
-    assert store.inbox("b") == []
+    # An active lease hides the message from a second read.
+    assert store.inbox("b", now=1000.0) == []
 
 
-def test_peek_does_not_drain(store):
+def test_peek_does_not_claim(store):
     store.send("b", "hi", sender="a", now=1.0)
-    assert len(store.inbox("b", peek=True)) == 1
-    assert len(store.inbox("b", peek=True)) == 1  # still there
-    assert len(store.inbox("b")) == 1  # now drained
-    assert store.inbox("b", peek=True) == []
+    assert len(store.inbox("b", peek=True, now=1000.0)) == 1
+    assert len(store.inbox("b", peek=True, now=1000.0)) == 1  # still there
+    assert len(store.inbox("b", now=1000.0)) == 1  # now claimed
+    assert store.inbox("b", peek=True, now=1000.0) == []
 
 
 def test_messages_ordered_oldest_first(store):
     store.send("b", "one", sender="a", now=1.0)
     store.send("b", "two", sender="a", now=2.0)
     store.send("b", "three", sender="a", now=3.0)
-    bodies = [m.body for m in store.inbox("b")]
+    bodies = [m.body for m in store.inbox("b", now=1000.0)]
     assert bodies == ["one", "two", "three"]
 
 
 def test_reply_to_roundtrip(store):
     mid = store.send("b", "question", sender="a", now=1.0)
     reply_id = store.send("a", "answer", sender="b", reply_to=mid, now=2.0)
-    replies = store.inbox("a")
+    replies = store.inbox("a", now=1000.0)
     assert len(replies) == 1
     assert replies[0].reply_to == mid
     assert reply_id == replies[0].id
@@ -244,11 +245,11 @@ def test_lead_worker_two_way(store):
     store.register("worker:x", "worker", now=1.0)
 
     q = store.send("lead", "what is 2+2?", sender="worker:x", now=2.0)
-    got = store.inbox("lead")
+    got = store.inbox("lead", now=1000.0)
     assert [m.body for m in got] == ["what is 2+2?"]
 
     store.send("worker:x", "4", sender="lead", reply_to=q, now=3.0)
-    reply = store.inbox("worker:x")
+    reply = store.inbox("worker:x", now=1000.0)
     assert [m.body for m in reply] == ["4"]
     assert reply[0].reply_to == q
 
@@ -256,26 +257,152 @@ def test_lead_worker_two_way(store):
 def test_isolation_between_recipients(store):
     store.send("b", "for-b", sender="a", now=1.0)
     store.send("c", "for-c", sender="a", now=1.0)
-    assert [m.body for m in store.inbox("b")] == ["for-b"]
-    assert [m.body for m in store.inbox("c")] == ["for-c"]
+    assert [m.body for m in store.inbox("b", now=1000.0)] == ["for-b"]
+    assert [m.body for m in store.inbox("c", now=1000.0)] == ["for-c"]
 
 
 def test_since_filters_older_messages(store):
     m1 = store.send("b", "old", sender="a", now=1.0)
     m2 = store.send("b", "new", sender="a", now=2.0)
-    peeked = store.inbox("b", peek=True, since=m1)
+    peeked = store.inbox("b", peek=True, since=m1, now=1000.0)
     assert [m.id for m in peeked] == [m2]
 
 
 def test_send_to_durable_mailbox_before_register(store):
     # Sending to a name that has never registered is fine; it waits.
     store.send("future", "waiting for you", sender="a", now=1.0)
-    assert [m.body for m in store.inbox("future")] == ["waiting for you"]
+    assert [m.body for m in store.inbox("future", now=1000.0)] == ["waiting for you"]
 
 
 def test_send_rejects_empty_recipient(store):
     with pytest.raises(ValueError):
         store.send("", "body", sender="a", now=1.0)
+
+
+def test_delivery_lease_status_and_acknowledgment(store):
+    from switchboard_relay.store import MESSAGE_STATUS_RETENTION_SECONDS
+
+    mid = store.send("worker", "work", sender="lead", now=1.0)
+    assert store.status(mid, sender="lead", now=2)["status"] == "queued"
+    assert store.status(mid, sender="worker", now=2) is None
+    [peeked] = store.inbox("one", "worker", now=2, peek=True)
+    assert "receipt" not in peeked.to_dict()
+
+    [first] = store.inbox("one", "worker", now=2, lease=3)
+    assert first.lease_expires_at == 5
+    assert store.status(mid, sender="lead", now=3) == {
+        "id": mid,
+        "to": "worker",
+        "status": "leased",
+        "created_at": 1.0,
+        "claimed_at": 2.0,
+        "lease_expires_at": 5.0,
+    }
+    assert not store.has_messages("two", "worker", now=3)
+    assert store.ack(mid, first.receipt, name="two", clock=lambda: 3) is None
+    assert store.ack(mid, first.receipt, name="one", clock=lambda: 5) is None
+    assert store.status(mid, sender="lead", now=5)["status"] == "queued"
+
+    [second] = store.inbox("one", "worker", now=5, lease=3)
+    assert second.id == first.id and second.receipt != first.receipt
+    assert store.ack(mid, first.receipt, name="one", clock=lambda: 6) is None
+    assert store.ack(mid, second.receipt, name="one", clock=lambda: 6) == 6
+    assert store.ack(mid, second.receipt, name="one", clock=lambda: 7) == 6
+    assert store.inbox("two", "worker", now=9) == []
+    assert store.status(mid, sender="lead", now=9) == {
+        "id": mid,
+        "to": "worker",
+        "status": "acknowledged",
+        "created_at": 1.0,
+        "acknowledged_at": 6.0,
+    }
+    with store._connect() as conn:
+        assert (
+            conn.execute("SELECT body FROM message_deliveries WHERE id=?", (mid,)).fetchone()[0]
+            is None
+        )
+    after_retention = 6 + MESSAGE_STATUS_RETENTION_SECONDS
+    assert store.status(mid, sender="lead", now=after_retention) is None
+    assert store.ack(mid, second.receipt, name="one", clock=lambda: after_retention) is None
+    assert store.prune_messages(now=after_retention, max_age=None) == 0
+    with store._connect() as conn:
+        assert not conn.execute("SELECT 1 FROM message_deliveries").fetchone()
+
+
+def test_ack_samples_clock_under_the_writer_lock(store):
+    mid = store.send("worker", "job", sender="lead", now=1)
+    [message] = store.inbox("worker", now=2, lease=3)
+
+    def clock():
+        with (
+            contextlib.closing(sqlite3.connect(store.db_path, timeout=0)) as other,
+            pytest.raises(sqlite3.OperationalError, match="locked"),
+        ):
+            other.execute("BEGIN IMMEDIATE")
+        return 5
+
+    assert store.ack(mid, message.receipt, name="worker", clock=clock) is None
+    assert store.status(mid, sender="lead", now=5)["status"] == "queued"
+
+
+def test_incremental_availability_catches_claims_committed_after_a_snapshot(store):
+    from switchboard_relay.store import AvailabilityCursor
+
+    mid = store.send("worker", "job", sender="lead", now=1)
+    rows, cursor = store.newly_available(AvailabilityCursor(), name="worker", now=10, max_age=None)
+    assert [row["id"] for row in rows] == [mid]
+    # A claim with a deadline before the cursor became visible after its snapshot.
+    store.inbox("worker", now=9, lease=0.5)
+    rows, cursor = store.newly_available(cursor, name="worker", now=11, max_age=None)
+    assert [(row["id"], row["retry"]) for row in rows] == [(mid, 1)]
+    rows, _ = store.newly_available(cursor, name="worker", now=12, max_age=None)
+    assert rows == []
+
+
+def test_age_out_covers_queued_messages_and_active_claims(store):
+    from switchboard_relay.store import MESSAGE_STATUS_RETENTION_SECONDS
+
+    leased = store.send("worker", "leased", sender="lead", now=1)
+    [claim] = store.inbox("worker", now=2, lease=100)
+    queued = store.send("worker", "queued", sender="lead", now=2)
+    assert store.status(leased, sender="lead", now=6, max_age=5)["expired_at"] == 6
+    assert store.status(queued, sender="lead", now=7, max_age=5)["expired_at"] == 7
+    assert store.ack(leased, claim.receipt, name="worker", clock=lambda: 7, max_age=5) is None
+    assert store.inbox("worker", now=7, max_age=5) == []
+    assert store.prune_messages(now=7, max_age=5) == 2
+    assert store.status(leased, sender="lead", now=7)["status"] == "expired"
+    assert store.status(queued, sender="lead", now=7)["expired_at"] == 7
+    assert store.ack(leased, claim.receipt, name="worker", clock=lambda: 7) is None
+    assert store.status(queued, sender="lead", now=7 + MESSAGE_STATUS_RETENTION_SECONDS) is None
+
+
+def test_legacy_queue_can_be_read_and_cannot_remove_new_claims(tmp_path):
+    path = tmp_path / "legacy.db"
+    with contextlib.closing(sqlite3.connect(path)) as legacy, legacy:
+        legacy.execute(
+            """CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, recipient TEXT NOT NULL,
+                sender TEXT NOT NULL, body TEXT NOT NULL, reply_to INTEGER, created_at REAL NOT NULL
+            )"""
+        )
+        mid = legacy.execute(
+            "INSERT INTO messages (recipient,sender,body,created_at) VALUES ('worker','lead','old',1)"
+        ).lastrowid
+
+    from switchboard_relay.store import AvailabilityCursor
+
+    legacy_store = Store(path, init_schema=False)
+    assert legacy_store.pending_messages(now=2)[0].id == mid
+    rows, _ = legacy_store.newly_available(AvailabilityCursor(), now=2, max_age=None)
+    assert [row["id"] for row in rows] == [mid]
+    store = Store(path)
+    [claim] = store.inbox("worker", now=2, lease=2)
+    with contextlib.closing(sqlite3.connect(path)) as legacy, legacy:
+        assert legacy.execute("DELETE FROM messages WHERE recipient='worker'").rowcount == 0
+    [redelivery] = store.inbox("worker", now=4)
+    assert redelivery.id == mid and redelivery.receipt != claim.receipt
+    assert store.ack(mid, redelivery.receipt, name="worker", clock=lambda: 5) == 5
+    assert store.send("worker", "new", sender="lead", now=5) > mid
 
 
 # -- unregister ------------------------------------------------------------
@@ -297,43 +424,53 @@ def test_unregister_preserves_mailbox(store):
     store.send("lead", "still here", sender="worker", now=2.0)
     store.unregister("lead")
     # Leaving does not discard undelivered messages.
-    assert [m.body for m in store.inbox("lead")] == ["still here"]
+    assert [m.body for m in store.inbox("lead", now=1000.0)] == ["still here"]
 
 
 # -- take_reply (ask() primitive) ------------------------------------------
 
 
-def test_take_reply_drains_only_the_matching_reply(store):
+def test_take_reply_claims_only_the_matching_reply(store):
     q = store.send("worker", "question", sender="lead", now=1.0)
     # An unrelated message and the actual reply both land for worker.
     store.send("worker", "unrelated", sender="other", now=2.0)
     store.send("worker", "the answer", sender="lead", reply_to=q, now=3.0)
 
-    reply = store.take_reply("worker", reply_to=q)
+    reply = store.take_reply("worker", reply_to=q, now=1000.0)
     assert reply is not None
     assert reply.body == "the answer"
     assert reply.reply_to == q
     # The unrelated message is untouched.
-    assert [m.body for m in store.inbox("worker")] == ["question", "unrelated"]
+    assert [m.body for m in store.inbox("worker", now=1000.0)] == ["question", "unrelated"]
+
+
+def test_take_reply_recovers_the_same_reply_after_lease_expiry(store):
+    mid = store.send("worker", "answer", sender="lead", reply_to=42, now=1)
+    first = store.take_reply("worker", reply_to=42, now=2, lease=2)
+    assert first is not None
+    assert store.take_reply("worker", reply_to=42, now=3) is None
+    retry = store.take_reply("worker", reply_to=42, now=4)
+    assert retry is not None and retry.id == mid
+    assert retry.receipt != first.receipt
 
 
 def test_take_reply_returns_none_when_no_match(store):
     store.send("worker", "no reply here", sender="lead", now=1.0)
-    assert store.take_reply("worker", reply_to=999) is None
+    assert store.take_reply("worker", reply_to=999, now=1000.0) is None
 
 
 def test_take_reply_matches_role(store):
     q = 7
     store.send("worker", "answer", sender="lead", reply_to=q, now=1.0)
-    reply = store.take_reply("worker:1", role="worker", reply_to=q)
+    reply = store.take_reply("worker:1", role="worker", reply_to=q, now=1000.0)
     assert reply is not None and reply.body == "answer"
 
 
 def test_take_reply_oldest_first(store):
     store.send("w", "first", sender="a", reply_to=5, now=1.0)
     store.send("w", "second", sender="a", reply_to=5, now=2.0)
-    assert store.take_reply("w", reply_to=5).body == "first"
-    assert store.take_reply("w", reply_to=5).body == "second"
+    assert store.take_reply("w", reply_to=5, now=1000.0).body == "first"
+    assert store.take_reply("w", reply_to=5, now=1000.0).body == "second"
 
 
 # -- pending_messages (CLI inspection) -------------------------------------
@@ -342,31 +479,31 @@ def test_take_reply_oldest_first(store):
 def test_pending_messages_lists_all_queued(store):
     store.send("a", "one", sender="x", now=1.0)
     store.send("b", "two", sender="y", now=2.0)
-    pending = store.pending_messages()
+    pending = store.pending_messages(now=1000.0)
     assert [(m.to, m.body) for m in pending] == [("a", "one"), ("b", "two")]
 
 
 def test_pending_messages_respects_limit(store):
     for i in range(5):
         store.send("a", f"m{i}", sender="x", now=float(i))
-    assert len(store.pending_messages(limit=3)) == 3
+    assert len(store.pending_messages(limit=3, now=1000.0)) == 3
 
 
 def test_prune_messages_removes_old_keeps_new(store):
     store.send("a", "old", sender="x", now=100.0)
     store.send("a", "new", sender="x", now=200.0)
-    removed = store.prune_messages(older_than=150.0)
+    removed = store.prune_messages(now=250.0, max_age=100.0)
     assert removed == 1
-    assert [m.body for m in store.inbox("a", peek=True)] == ["new"]
+    assert [m.body for m in store.inbox("a", peek=True, now=1000.0)] == ["new"]
 
 
 def test_pending_messages_since_pages_through_backlog(store):
     ids = [store.send("a", f"m{i}", sender="x", now=float(i)) for i in range(5)]
     # Everything after the 2nd id.
-    rest = store.pending_messages(since=ids[1])
+    rest = store.pending_messages(since=ids[1], now=1000.0)
     assert [m.id for m in rest] == ids[2:]
     # since past the end -> empty.
-    assert store.pending_messages(since=ids[-1]) == []
+    assert store.pending_messages(since=ids[-1], now=1000.0) == []
 
 
 # -- role addressing -------------------------------------------------------
@@ -376,30 +513,30 @@ def test_inbox_matches_role_address(store):
     # A message addressed to the role "worker" is drained by a participant that
     # reads with that role.
     store.send("worker", "job for any worker", sender="lead", now=1.0)
-    msgs = store.inbox("worker:1", role="worker")
+    msgs = store.inbox("worker:1", role="worker", now=1000.0)
     assert [m.body for m in msgs] == ["job for any worker"]
 
 
 def test_inbox_matches_both_name_and_role(store):
     store.send("worker:1", "personal", sender="lead", now=1.0)
     store.send("worker", "broadcast", sender="lead", now=2.0)
-    msgs = store.inbox("worker:1", role="worker")
+    msgs = store.inbox("worker:1", role="worker", now=1000.0)
     assert sorted(m.body for m in msgs) == ["broadcast", "personal"]
 
 
 def test_role_message_not_seen_by_other_role(store):
     store.send("worker", "job", sender="lead", now=1.0)
     # A reviewer must not drain a worker-addressed message.
-    assert store.inbox("reviewer:1", role="reviewer") == []
+    assert store.inbox("reviewer:1", role="reviewer", now=1000.0) == []
     # And the worker still gets it.
-    assert [m.body for m in store.inbox("worker:1", role="worker")] == ["job"]
+    assert [m.body for m in store.inbox("worker:1", role="worker", now=1000.0)] == ["job"]
 
 
 def test_has_messages(store):
-    assert store.has_messages("b") is False
+    assert store.has_messages("b", now=1000.0) is False
     store.send("b", "x", sender="a", now=1.0)
-    assert store.has_messages("b") is True
-    assert store.has_messages("b", since=10_000) is False
+    assert store.has_messages("b", now=1000.0) is True
+    assert store.has_messages("b", since=10_000, now=1000.0) is False
 
 
 # -- durability across reconnects ------------------------------------------
@@ -414,7 +551,7 @@ def test_messages_survive_new_store_instance(tmp_path):
 
     # A brand new Store over the same file (simulating a restart) sees it.
     s2 = Store(path)
-    assert [m.body for m in s2.inbox("b", peek=True)] == ["durable"]
+    assert [m.body for m in s2.inbox("b", peek=True, now=1000.0)] == ["durable"]
     live = [p.name for p in s2.participants(now=2.0)]
     assert "b" in live
     s2.close()
@@ -443,8 +580,8 @@ def test_wal_mode_enabled(tmp_path):
     s.close()
 
 
-def test_concurrent_drain_delivers_each_message_once(tmp_path):
-    """Parallel drainers must never see the same message twice (atomic drain)."""
+def test_concurrent_claim_delivers_each_message_once_during_the_lease(tmp_path):
+    """Parallel readers cannot claim the same message within one lease."""
     import threading
 
     path = tmp_path / "sb.db"
@@ -457,15 +594,15 @@ def test_concurrent_drain_delivers_each_message_once(tmp_path):
     collected: list[str] = []
     lock = threading.Lock()
 
-    def drain_worker():
+    def claim_worker():
         s = Store(path)
         try:
             while True:
-                got = s.inbox("b")  # drains
+                got = s.inbox("b", now=1000.0)
                 if not got:
                     # One empty read isn't proof of "done" under contention, so
                     # check the shared store directly before giving up.
-                    if not s.has_messages("b"):
+                    if not s.has_messages("b", now=1000.0):
                         return
                     continue
                 with lock:
@@ -473,14 +610,14 @@ def test_concurrent_drain_delivers_each_message_once(tmp_path):
         finally:
             s.close()
 
-    threads = [threading.Thread(target=drain_worker) for _ in range(8)]
+    threads = [threading.Thread(target=claim_worker) for _ in range(8)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
 
     assert sorted(collected) == sorted(f"m{i}" for i in range(n))
-    assert len(collected) == n  # exactly once, no duplicates
+    assert len(collected) == n
 
 
 def test_concurrent_register_same_name_is_idempotent(tmp_path):
@@ -541,7 +678,7 @@ def test_memory_store_full_lifecycle():
     try:
         s.register("lead", "coordinator", now=1.0)
         s.send("lead", "hi", sender="worker", now=2.0)
-        assert [m.body for m in s.inbox("lead")] == ["hi"]
+        assert [m.body for m in s.inbox("lead", now=1000.0)] == ["hi"]
         assert [p.name for p in s.participants(now=2.0)] == ["lead"]
     finally:
         s.close()

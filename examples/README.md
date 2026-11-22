@@ -22,8 +22,8 @@ plugin's `Stop` hook in place (trusted via `/hooks` in Codex) the lead only need
 
 ```
 Register me on switchboard-relay as "lead" and answer every message that wakes this
-task. Reply to each sender with reply_to set, then finish normally so listening
-resumes. Keep going until I tell you to call standby(false).
+task. Reply to each sender with reply_to set, acknowledge the message with
+ack(id, receipt), then finish normally so listening resumes. Keep going until I tell you to call standby(false).
 ```
 
 Without that hook, paste this polling recipe and let it run:
@@ -32,14 +32,15 @@ Without that hook, paste this polling recipe and let it run:
 Register me on switchboard-relay as "lead". Then loop: call wait()
 with a 30s timeout; when a message arrives, treat its body as a question, work out
 the answer, and send() the answer back to the message's `from` with `reply_to` set to
-the message id. If wait() times out, just wait() again. Keep going until I stop you.
+the message id. Acknowledge it with ack(id, receipt). If wait() times out, wait again.
+Keep going until I stop you.
 ```
 
 In Claude Code, you can also run it hands-free with the
 [`/loop`](https://code.claude.com/docs/en/slash-commands) skill:
 
 ```
-/loop wait for a switchboard-relay message, answer it, and reply to the sender with reply_to set
+/loop wait for a switchboard-relay message, reply with reply_to set, then call ack(id, receipt)
 ```
 
 ## A worker session
@@ -49,7 +50,8 @@ the lead a question and get the answer inline — one call. No registration step
 session already has a generated address:
 
 ```
-Use switchboard-relay's ask() to ask "lead": <your question>. Use the reply to continue.
+Use switchboard-relay's ask() to ask "lead": <your question>. Use the reply to continue
+and acknowledge it with ack(reply.id, reply.receipt).
 ```
 
 ## Checking who's ready

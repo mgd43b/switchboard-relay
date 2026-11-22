@@ -276,13 +276,30 @@ def test_main_tail_lists_pending(monkeypatch, tmp_path, capsys):
     assert "reply_to #1" in out
 
 
+def test_tail_follow_prints_an_older_redelivery_once(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "mail.db"
+    store = Store(db)
+    old = store.send("lead", "older", sender="worker", now=1)
+    store.inbox("lead", now=2, lease=3)
+    new = store.send("lead", "newer", sender="worker", now=3)
+    times = iter([4, 5, 6])
+    monkeypatch.setattr(server, "_now", lambda: next(times))
+    monkeypatch.setattr(server.time, "sleep", lambda _: None)
+
+    with pytest.raises(StopIteration):
+        server._cli_tail(db, follow=True)
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines == [f"#{new} worker -> lead: newer", f"#{old} worker -> lead: older"]
+
+
 def test_main_tail_pages_past_the_limit(monkeypatch, tmp_path, capsys):
     # A backlog larger than pending_messages()'s per-query LIMIT (100) must still
     # be printed in full -- tail pages by id rather than windowing on the oldest.
     db = tmp_path / "big.db"
     s = Store(db)
     for i in range(150):
-        s.send("lead", f"m{i}", sender="worker", now=float(i))
+        s.send("lead", f"m{i}", sender="worker", now=time.time())
     monkeypatch.setenv("SWITCHBOARD_DB", str(db))
     assert main(["tail"]) == 0
     out = capsys.readouterr().out
@@ -304,7 +321,7 @@ def test_main_prune_removes_old_messages_and_stale_participants(monkeypatch, tmp
     assert main(["prune"]) == 0
     out = capsys.readouterr().out
     assert "Pruned 1 old message(s) and 1 expired participant(s)." in out
-    assert [m.body for m in Store(db).inbox("lead", peek=True)] == ["fresh"]
+    assert [m.body for m in Store(db).inbox("lead", peek=True, now=time.time())] == ["fresh"]
 
 
 def test_main_prune_no_database(monkeypatch, tmp_path, capsys):

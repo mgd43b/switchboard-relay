@@ -101,7 +101,7 @@ def test_recycled_connection_id_never_inherits_a_token(tmp_path):
     with pytest.raises(ToolError, match="name_in_use"):
         b.register(a, "lead")  # a fresh token, so the old session's mail stays put
     assert b._tokens[b._sid(a)][1] != old
-    assert b.store.has_messages("lead")
+    assert b.store.has_messages("lead", now=time.time())
 
 
 def test_prune_sweeps_tokens_of_closed_connections(tmp_path):
