@@ -140,10 +140,14 @@ def test_main_doctor_reports_resolution_env_and_hints(monkeypatch, tmp_path, cap
 
 
 def test_main_doctor_healthy_when_peers_and_no_dead_mail(monkeypatch, tmp_path, capsys):
+    from switchboard_relay.protocol import Protocol
+
     db = tmp_path / "h.db"
     s = Store(db)
     now = time.time()
-    s.register("lead", now=now)
+    protocol = Protocol(s)
+    protocol.claim("lead-token", "lead", "", now=now)
+    protocol.touch("lead-token", now, "armed")
     s.register("worker:1", "worker", now=now)
     s.send("lead", "queued but to a live reader", sender="worker:1", now=now)
     monkeypatch.setenv("SWITCHBOARD_DB", str(db))
@@ -433,3 +437,27 @@ def test_cli_tasks_escapes_board_authored_terminal_controls(tmp_path, capsys):
     assert main([*args, "--json"]) == 0
     [summary] = json.loads(capsys.readouterr().out)["tasks"]
     assert summary["last_update"]["note"] == progress
+
+
+def test_doctor_reports_listen_status_and_polling_only_pending_mail(tmp_path, capsys):
+    from switchboard_relay.protocol import Protocol
+
+    db = tmp_path / "board.db"
+    store = Store(db)
+    protocol = Protocol(store)
+    now = time.time()
+    protocol.claim("a", "poller", "worker", now=now)
+    protocol.claim("b", "listener", "worker", now=now)
+    protocol.touch("b", now, "armed")
+    for address in ("poller", "listener", "worker"):
+        store.send(address, "Pending", sender="lead", now=now)
+
+    assert main(["--db", str(db), "doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "listen_status=polling-only" in next(
+        line for line in out.splitlines() if "poller" in line
+    )
+    assert "listen_status=armed" in next(
+        line for line in out.splitlines() if "listener [worker]" in line
+    )
+    assert "1 message(s) are waiting on live recipients" in out

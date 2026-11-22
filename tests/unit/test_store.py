@@ -760,3 +760,65 @@ def test_db_path_expands_user(tmp_path, monkeypatch):
         assert (tmp_path / "nested").is_dir()  # parent created under real home
     finally:
         s.close()
+
+
+def test_reply_and_ack_roll_back_if_the_key_record_fails(store):
+    message_id = store.send("lead", "Question", sender="worker", now=1)
+    [question] = store.inbox("lead", now=2)
+    with store._connect() as conn:
+        conn.execute("""
+            CREATE TRIGGER reject_key BEFORE INSERT ON relay_submissions
+            BEGIN SELECT RAISE(ABORT, 'test failure'); END
+        """)
+    with pytest.raises(sqlite3.IntegrityError, match="test failure"):
+        store.send_reply(
+            "worker",
+            "Answer",
+            sender="lead",
+            reply_to=message_id,
+            receipt=question.receipt,
+            owner_token=None,
+            clock=lambda: 3,
+            max_age=None,
+            idempotency_key="reply",
+        )
+    assert store.inbox("worker", now=4, peek=True) == []
+    assert store.status(message_id, sender="worker", now=4)["status"] == "leased"
+
+
+def test_old_submission_key_survives_reply_ack_migration(tmp_path):
+    import hashlib
+    import json
+
+    path = tmp_path / "board.db"
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            ["lead", "A previous message", None],
+            separators=(",", ":"),
+        ).encode()
+    ).digest()
+    with contextlib.closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute("""
+            CREATE TABLE relay_submissions (
+                operation TEXT NOT NULL, sender TEXT NOT NULL, request_key TEXT NOT NULL,
+                fingerprint BLOB NOT NULL, result_id INTEGER NOT NULL, created_at REAL NOT NULL,
+                PRIMARY KEY (operation, sender, request_key)
+            )
+        """)
+        conn.execute(
+            "INSERT INTO relay_submissions VALUES ('send','worker','old-key',?,23,1)",
+            (fingerprint,),
+        )
+
+    store = Store(path)
+    assert (
+        store.send(
+            "lead",
+            "A previous message",
+            sender="worker",
+            now=2,
+            idempotency_key="old-key",
+        )
+        == 23
+    )
+    assert store.inbox("lead", now=3, peek=True) == []

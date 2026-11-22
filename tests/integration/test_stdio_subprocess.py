@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
@@ -93,9 +94,9 @@ async def test_two_real_processes_round_trip(tmp_path):
 
 
 @asynccontextmanager
-async def _participant(db: str, name: str, role: str = ""):
+async def _participant(db: str, name: str, role: str = "", *, lease: str = "1"):
     async with (
-        stdio_client(_params(db, SWITCHBOARD_DELIVERY_LEASE="1")) as (read, write),
+        stdio_client(_params(db, SWITCHBOARD_DELIVERY_LEASE=lease)) as (read, write),
         ClientSession(read, write) as session,
     ):
         await session.initialize()
@@ -284,3 +285,87 @@ async def test_stdio_inbox_subscription_is_scoped_and_notifies_on_redelivery(tmp
             [retry] = _data(await reconnected.call_tool("wait", {"timeout_s": 5}))["messages"]
             assert retry["id"] == claim["id"]
             assert retry["receipt"] != claim["receipt"]
+
+
+async def test_reply_ack_preserves_ownership_and_keyed_replay_over_stdio(tmp_path):
+    db = str(tmp_path / "switchboard.db")
+    async with _participant(db, "asker", lease="30") as asker:
+        async with _participant(db, "lead", lease="30") as lead:
+            sent = _data(await asker.call_tool("send", {"to": "lead", "body": "Question"}))
+            [claim] = _data(await lead.call_tool("inbox", {}))["messages"]
+            receipt_args = {"reply_to": sent["id"], "receipt": claim["receipt"]}
+            async with _participant(db, "other", lease="30") as other:
+                forwarded = _data(
+                    await other.call_tool(
+                        "send",
+                        {
+                            "to": "asker",
+                            "body": "Forwarded answer",
+                            **receipt_args,
+                        },
+                    )
+                )
+                assert not forwarded["acked"]
+                assert forwarded["ack_error"] == "invalid_or_expired_receipt"
+            status = _data(await asker.call_tool("status", {"id": sent["id"]}))
+            assert status["status"] == "leased"
+
+            invalid = await lead.call_tool(
+                "send",
+                {
+                    "to": "asker",
+                    "body": "Missing thread",
+                    "receipt": claim["receipt"],
+                },
+            )
+            assert invalid.is_error and "receipt requires reply_to" in invalid.content[0].text
+            answer_args = {
+                "to": "asker",
+                "body": "Answer",
+                "idempotency_key": "answer-once",
+                **receipt_args,
+            }
+            answered = _data(await lead.call_tool("send", answer_args))
+            assert answered["acked"]
+            status = _data(await asker.call_tool("status", {"id": sent["id"]}))
+            assert status["status"] == "acknowledged"
+            assert status["acknowledged_at"] == answered["acknowledged_at"]
+
+        async with _participant(db, "lead", lease="30") as reconnected:
+            replay = _data(await reconnected.call_tool("send", answer_args))
+            assert replay["id"] == answered["id"]
+            assert replay["acked"] and replay["acknowledged_at"] == answered["acknowledged_at"]
+
+        assert [
+            (reply["id"], reply["body"])
+            for reply in _data(await asker.call_tool("replies", {"question_id": sent["id"]}))[
+                "replies"
+            ]
+        ] == [(forwarded["id"], "Forwarded answer"), (answered["id"], "Answer")]
+
+
+async def test_expired_reply_receipt_still_delivers_over_stdio(tmp_path):
+    db = str(tmp_path / "switchboard.db")
+    async with (
+        _participant(db, "asker") as asker,
+        _participant(db, "lead") as lead,
+    ):
+        sent = _data(await asker.call_tool("send", {"to": "lead", "body": "Question"}))
+        [claim] = _data(await lead.call_tool("inbox", {}))["messages"]
+        await asyncio.sleep(max(0, claim["lease_expires_at"] - time.time()) + 0.02)
+        result = _data(
+            await lead.call_tool(
+                "send",
+                {
+                    "to": "asker",
+                    "body": "Late answer",
+                    "reply_to": sent["id"],
+                    "receipt": claim["receipt"],
+                },
+            )
+        )
+        assert not result["acked"]
+        assert result["ack_error"] == "invalid_or_expired_receipt"
+        [reply] = _data(await asker.call_tool("replies", {"question_id": sent["id"]}))["replies"]
+        assert reply["id"] == result["id"] and reply["body"] == "Late answer"
+        assert _data(await asker.call_tool("status", {"id": sent["id"]}))["status"] == "queued"

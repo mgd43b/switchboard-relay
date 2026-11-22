@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS relay_submissions (
     fingerprint  BLOB NOT NULL,
     result_id    INTEGER NOT NULL,
     created_at   REAL NOT NULL,
+    acknowledged_at REAL,
     PRIMARY KEY (operation, sender, request_key)
 );
 
@@ -193,6 +194,13 @@ class Message:
 
 
 @dataclass(frozen=True)
+class _Submission:
+    id: int
+    created_at: float
+    acknowledged_at: Optional[float] = None
+
+
+@dataclass(frozen=True)
 class AvailabilityCursor:
     message_id: int = 0
     claim_version: int = 0
@@ -279,7 +287,7 @@ class Store:
                 _enable_wal(conn)
             _with_lock_retry(lambda: conn.executescript(_SCHEMA))
             _with_lock_retry(lambda: _migrate_participants(conn))
-            _with_lock_retry(lambda: _migrate_claim_versions(conn))
+            _with_lock_retry(lambda: _migrate_delivery_schema(conn))
 
     def close(self) -> None:
         if self._memory_conn is not None:
@@ -437,32 +445,97 @@ class Store:
         idempotency_key: Optional[str] = None,
     ) -> int:
         """Append mail or return the original ID for an identical keyed submission."""
+        return self._submit_mail(
+            to,
+            body,
+            sender=sender,
+            reply_to=reply_to,
+            clock=lambda: now,
+            idempotency_key=idempotency_key,
+        ).id
+
+    def send_reply(
+        self,
+        to: str,
+        body: str,
+        *,
+        sender: str,
+        reply_to: int,
+        receipt: str,
+        owner_token: Optional[str],
+        clock: Callable[[], float],
+        max_age: Optional[float],
+        idempotency_key: Optional[str] = None,
+    ) -> tuple[int, Optional[float]]:
+        """Enqueue the reply and acknowledge the owned claim in one transaction."""
+        result = self._submit_mail(
+            to,
+            body,
+            sender=sender,
+            reply_to=reply_to,
+            clock=clock,
+            idempotency_key=idempotency_key,
+            receipt=receipt,
+            owner_token=owner_token,
+            max_age=max_age,
+        )
+        return result.id, result.acknowledged_at
+
+    def _submit_mail(
+        self,
+        to: str,
+        body: str,
+        *,
+        sender: str,
+        reply_to: Optional[int],
+        clock: Callable[[], float],
+        idempotency_key: Optional[str],
+        receipt: Optional[str] = None,
+        owner_token: Optional[str] = None,
+        max_age: Optional[float] = None,
+    ) -> _Submission:
         to = _require_name(to, field="to")
         if not isinstance(body, str):
             raise ValueError("body must be a string")
+        if receipt is not None and reply_to is None:
+            raise ValueError("receipt requires reply_to")
         with self._connect() as conn, conn:
-            if idempotency_key is not None:
+            if idempotency_key is not None or receipt is not None:
                 conn.execute("BEGIN IMMEDIATE")
+            now = clock()
 
-            def insert() -> int:
-                return int(
+            def insert() -> _Submission:
+                message_id = int(
                     conn.execute(
                         "INSERT INTO messages (recipient, sender, body, reply_to, created_at) "
                         "VALUES (?, ?, ?, ?, ?)",
                         (to, sender, body, reply_to, now),
                     ).lastrowid
                 )
+                ack_at = None
+                if receipt is not None and reply_to is not None:
+                    try:
+                        _check_owner(conn, sender, owner_token, now)
+                    except ValueError:
+                        # The reply is durable even if this call lost its claim.
+                        pass
+                    else:
+                        ack_at = _ack_claim(
+                            conn, reply_to, receipt, sender, owner_token, now, max_age
+                        )
+                return _Submission(message_id, now, ack_at)
 
-            message_id, _ = _submit_once(
+            payload = (to, body, reply_to)
+            if receipt is not None:
+                payload += (receipt,)
+            return _submit_once(
                 conn,
                 operation="send",
                 sender=sender,
                 key=idempotency_key,
-                payload=(to, body, reply_to),
-                now=now,
+                payload=payload,
                 insert=insert,
             )
-        return message_id
 
     def inbox(
         self,
@@ -609,32 +682,7 @@ class Store:
             conn.execute("BEGIN IMMEDIATE")
             now = clock()
             _check_owner(conn, name, owner_token, now)
-            row = conn.execute(
-                """SELECT acknowledged_at, expired_at, lease_expires_at, created_at
-                   FROM message_deliveries
-                   WHERE id=? AND receipt=? AND claimant=? AND owner_token IS ?""",
-                (id, receipt, name, owner_token),
-            ).fetchone()
-            if row is None:
-                return None
-            acknowledged_at = row["acknowledged_at"]
-            if acknowledged_at is not None:
-                return (
-                    acknowledged_at
-                    if acknowledged_at > now - MESSAGE_STATUS_RETENTION_SECONDS
-                    else None
-                )
-            if (
-                row["expired_at"] is not None
-                or row["lease_expires_at"] <= now
-                or row["created_at"] <= _age_cutoff(now, max_age)
-            ):
-                return None
-            conn.execute(
-                "UPDATE message_deliveries SET body=NULL, acknowledged_at=? WHERE id=?",
-                (now, id),
-            )
-        return now
+            return _ack_claim(conn, id, receipt, name, owner_token, now, max_age)
 
     def status(
         self, id: int, *, sender: str, now: float, max_age: Optional[float] = None
@@ -847,6 +895,38 @@ class Store:
 # -- helpers ----------------------------------------------------------------
 
 
+def _ack_claim(
+    conn: sqlite3.Connection,
+    message_id: int,
+    receipt: str,
+    name: str,
+    owner_token: Optional[str],
+    now: float,
+    max_age: Optional[float],
+) -> Optional[float]:
+    row = conn.execute(
+        """SELECT acknowledged_at, expired_at, lease_expires_at, created_at
+           FROM message_deliveries
+           WHERE id=? AND receipt=? AND claimant=? AND owner_token IS ?""",
+        (message_id, receipt, name, owner_token),
+    ).fetchone()
+    if row is None:
+        return None
+    acknowledged_at = row["acknowledged_at"]
+    if acknowledged_at is not None:
+        return acknowledged_at if acknowledged_at > now - MESSAGE_STATUS_RETENTION_SECONDS else None
+    if (
+        row["expired_at"] is not None
+        or row["lease_expires_at"] <= now
+        or row["created_at"] <= _age_cutoff(now, max_age)
+    ):
+        return None
+    conn.execute(
+        "UPDATE message_deliveries SET body=NULL, acknowledged_at=? WHERE id=?", (now, message_id)
+    )
+    return now
+
+
 def _submit_once(
     conn: sqlite3.Connection,
     *,
@@ -854,35 +934,34 @@ def _submit_once(
     sender: str,
     key: Optional[str],
     payload: tuple,
-    now: float,
-    insert: Callable[[], int],
-) -> tuple[int, float]:
+    insert: Callable[[], _Submission],
+) -> _Submission:
     """Run a keyed insert and record its result in the caller's write transaction."""
     if key is None:
-        return insert(), now
+        return insert()
     if not key.strip() or len(key.encode("utf-8")) > 128:
         raise ValueError("idempotency_key must be non-blank and at most 128 UTF-8 bytes.")
     encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     fingerprint = hashlib.sha256(encoded).digest()
     identity = (operation, sender, key)
     saved = conn.execute(
-        """SELECT fingerprint, result_id, created_at FROM relay_submissions
+        """SELECT fingerprint, result_id, created_at, acknowledged_at FROM relay_submissions
            WHERE operation=? AND sender=? AND request_key=?""",
         identity,
     ).fetchone()
     if saved is not None:
         if saved["fingerprint"] != fingerprint:
             raise ValueError("idempotency_key was already used with a different payload.")
-        return saved["result_id"], saved["created_at"]
+        return _Submission(saved["result_id"], saved["created_at"], saved["acknowledged_at"])
 
-    result_id = insert()
+    result = insert()
     conn.execute(
         """INSERT INTO relay_submissions
-           (operation, sender, request_key, fingerprint, result_id, created_at)
-           VALUES (?,?,?,?,?,?)""",
-        (*identity, fingerprint, result_id, now),
+           (operation, sender, request_key, fingerprint, result_id, created_at, acknowledged_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        (*identity, fingerprint, result.id, result.created_at, result.acknowledged_at),
     )
-    return result_id, now
+    return result
 
 
 def _is_locked_error(exc: sqlite3.OperationalError) -> bool:
@@ -929,9 +1008,12 @@ def _migrate_participants(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE participants SET last_active = last_seen")
 
 
-def _migrate_claim_versions(conn: sqlite3.Connection) -> None:
+def _migrate_delivery_schema(conn: sqlite3.Connection) -> None:
     with conn:
         conn.execute("BEGIN IMMEDIATE")
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(relay_submissions)")}
+        if "acknowledged_at" not in columns:
+            conn.execute("ALTER TABLE relay_submissions ADD COLUMN acknowledged_at REAL")
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(message_deliveries)")}
         if "claim_version" not in columns:
             conn.execute(
