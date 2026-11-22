@@ -166,6 +166,19 @@ class Protocol:
                 is not None
             )
 
+    def name_is_live(self, name: str, now: float) -> bool:
+        """Check the same name protection window used by claim()."""
+        with self.store._connect() as conn:
+            return bool(
+                conn.execute(
+                    """SELECT COALESCE(
+                    (SELECT expires>? FROM relay_sessions WHERE name=?),
+                    (SELECT last_seen>? FROM participants WHERE name=?), 0
+                )""",
+                    (now, name, now - self.lease, name),
+                ).fetchone()[0]
+            )
+
     def touch(self, token, now, status=None):
         with self.transaction() as c:
             c.execute(

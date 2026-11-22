@@ -53,7 +53,9 @@ switchboard just routes named messages, so any addressing scheme works.
 - [Connecting: identity, peers, and the charter](#connecting-identity-peers-and-the-charter)
 - [The lead / worker pattern](#the-lead--worker-pattern) — recipes + terminal inspection
 - [Configuration](#configuration) — environment variables
-- [How it works](#how-it-works) — and its one honest limitation
+- [How it works](#how-it-works)
+- [MCP inbox subscriptions](#mcp-inbox-subscriptions)
+- [Starting an offline worker](#starting-an-offline-worker)
 - [Turn injection (push)](#turn-injection-push) — make an open session *react* to a message, no daemon needed
 - [Troubleshooting](#troubleshooting) — the common "huh?" moments
 - [Development](#development)
@@ -649,7 +651,8 @@ All optional. Set as environment variables through `codex mcp add --env KEY=valu
 | `SWITCHBOARD_AUTO_LISTEN` | `1` | Start each session with listening between turns on. Set `0` to start with it off; `standby(true)` still turns it on. |
 | `SWITCHBOARD_NAME` | — | Auto‑register this session under this address instead of a generated one (also the fallback when `register()` is called without a name). It's protected like any explicit name: if another live session already holds it, this session doesn't join, and its tool calls report `name_in_use` until you `register()` a different name. |
 | `SWITCHBOARD_ROLE` | — | Role to pair with `SWITCHBOARD_NAME`. |
-| `SWITCHBOARD_PUSH` | `0` | Enable [turn‑injection push](#turn-injection-push) over Channels (CLI reactors) — has the background loop poll the board and nudge this session's own client. Off by default (a small background poll cost); set `1` to enable. The loop itself always runs: with push off it only does the once‑a‑minute liveness keepalive. |
+| `SWITCHBOARD_PUSH` | `0` | Set `1` to enable [turn injection](#turn-injection-push) over Claude Code Channels. |
+| `SWITCHBOARD_INBOX_SUBSCRIPTIONS` | `0` | Set `1` to expose the [inbox resource](#mcp-inbox-subscriptions) to the connected stdio client. |
 | `SWITCHBOARD_CCD_INJECT` | `0` | Enable [turn injection on Claude Desktop](#reacting-on-claude-desktop-ccd_session_mgmt): `send()` returns an `inject` hint so the sender's Claude can call `ccd_session_mgmt.send_message`. Off by default (leans on a Desktop tool + a per‑message approval). |
 | `SWITCHBOARD_CCD_SESSION_ID` | *(`local_<CLAUDE_CODE_SESSION_ID>`)* | Override this session's CCD id used for Desktop injection. Needed only when the default derivation is wrong (e.g. an agent/child session). Used verbatim. |
 
@@ -668,13 +671,12 @@ processes do not talk to each other directly — Codex and Claude Code processes
 the same SQLite database (one file per [board](#boards-one-switchboard-per-project)). `wait()`
 long-polls that database.
 
-**The one honest limitation:** switchboard **cannot wake a *closed* session or a client that is no
-longer running.** In the baseline poll model a recipient learns about a message by calling
-`inbox()` or `wait()` on its next turn or while parked in a polling loop. The Codex and Claude Code
-`Stop` hooks keep an open session parked between turns; an open Claude Code session can also be
-pushed into a turn with [turn injection](#turn-injection-push). Generic MCP clients are
-polling-only. Each session's `listen_status` reports which applies. Durable mail remains queued when
-no listener is active.
+A recipient can call `inbox()` or `wait()` whenever its host is running. The Codex and Claude Code
+Stop hooks keep an open session listening between turns. Claude Code can also react through
+[turn injection](#turn-injection-push), and generic clients can opt in to
+[MCP inbox subscriptions](#mcp-inbox-subscriptions). Durable mail stays queued while a recipient
+is offline. A separate [worker supervisor](#starting-an-offline-worker) can launch a configured
+foreground worker when its named address has mail.
 
 ### Delivery and acknowledgments
 
@@ -699,6 +701,53 @@ claims a message, that message is stored separately and remains recoverable by u
 
 Boards are SQLite files under your home directory, so "same machine" really means the same OS user
 on one machine. There is no network transport.
+
+---
+
+## MCP inbox subscriptions
+
+Set `SWITCHBOARD_INBOX_SUBSCRIPTIONS=1` on the stdio server to enable this opt-in prototype.
+A client that negotiates MCP 2026-07-28 can subscribe to `switchboard://inbox` through
+`subscriptions/listen`. The URI is scoped to that stdio connection's registered name and role.
+Reading it returns `{"available": true}` or `{"available": false}`.
+
+The watcher publishes a resource update when mail becomes available, including when a claim
+expires. The event contains the resource URI. Call `inbox()` to claim actual messages and
+`ack(id, receipt)` after handling them. Check the inbox when subscribing or reconnecting to
+recover any mail that arrived earlier. Clients without subscription support can use `inbox()`
+or `wait()`.
+
+The Python MCP SDK 2.3 stdio integration test uses `Client.listen(resource_subscriptions=[uri])`
+and receives a `ResourceUpdated` event for the application to handle. Starting a model turn
+requires host integration. The prototype ships opt-in based on that SDK test.
+[Python MCP SDK subscriptions](https://py.sdk.modelcontextprotocol.io/v2/client/subscriptions/)
+
+## Starting an offline worker
+
+On macOS or Linux, leave a local `worker-watch` supervisor running for a single named address.
+Supply the board and a foreground command you trust. The supervisor uses the executable and
+arguments below as the launch profile for that address.
+
+```bash
+switchboard-relay --board team worker-watch --name worker:docs -- ./run-docs-worker
+```
+
+Use `--db /path/to/board.db` for a file-backed board selected by path. The supervisor passes
+`SWITCHBOARD_DB`, `SWITCHBOARD_BOARD`, and `SWITCHBOARD_NAME` to the command. Have the worker
+pass those environment variables through to its MCP server, register the configured name, and
+claim and acknowledge its mail. The program should run in the foreground for the worker's
+lifetime. The integration test uses a Python MCP client as that worker.
+
+The supervisor observes available mail for the exact name and launches while the name is
+offline. A board-and-name lock limits it to one supervised foreground worker at a time. It
+reports attempts, launch errors, and exits to stderr. Mail remains available for normal
+delivery on launch failure, and attempts are spaced by a 30-second cooldown after an error or
+worker exit. Stop the supervisor with Ctrl+C to disable startup. An existing foreground worker
+can finish its work.
+
+Role-based tasks use a shared queue, while startup selects a specific configured worker. To
+wake a particular worker for queued work, submit the task to its role and send a direct message
+to that worker with the task ID.
 
 ---
 
@@ -730,7 +779,7 @@ falls back to the durable poll — nothing breaks, the message just waits in the
 1. **Push is enabled.** It's a background convenience with a small polling cost, so it's **off by
    default** — set `SWITCHBOARD_PUSH=1` to turn it on.
 2. **The recipient session is open.** Channels inject into a *running* session on its next turn.
-   Nothing can wake a fully idle or closed session — see [How it works](#how-it-works).
+   A local [worker supervisor](#starting-an-offline-worker) handles startup for configured workers.
 3. **The recipient subscribed to switchboard as a channel** — launched with the channel flag below.
    A session that connected normally still works; it just polls instead of reacting.
 
@@ -842,12 +891,13 @@ messages, and prints a hint for the two most common failures below — usually e
 in one shot.
 
 **"I sent a message but nothing happened."**
-switchboard cannot wake a closed session. Check the recipient's `listen_status` with `bootstrap()`.
+Check whether the recipient is open and inspect its `listen_status` with `bootstrap()`.
 With the Codex plugin installed, review its hook with `/hooks`; until then the session reports
 `configured`, not `armed`. A session that called `standby(false)` stays off until `standby(true)`. A
 direct MCP installation needs the `Stop` entry shown under [Install](#install), with `server` set to
-the name you installed the server under, or a requested `wait()` loop. Generic MCP clients are
-`polling-only`. (See [How it works](#how-it-works).)
+the name you installed the server under, or a requested `wait()` loop. Generic clients can
+poll or opt in to [inbox subscriptions](#mcp-inbox-subscriptions). Use a
+[worker supervisor](#starting-an-offline-worker) when a configured worker should start offline.
 
 **"My `wait()` failed with 'sent no response or progress for 1800s'."**
 Claude Code aborts an MCP call that stays silent for 30 minutes. Use a `timeout_s` under 1800, or

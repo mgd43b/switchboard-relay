@@ -41,8 +41,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 import anyio
+from mcp.server.caching import CacheHint
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.subscriptions import InMemorySubscriptionBus, ResourceUpdated
 from mcp.types import ToolAnnotations
 
 from switchboard_relay.board import boards_dir, describe_target, legacy_db_path
@@ -54,6 +56,7 @@ from switchboard_relay.store import (
     Store,
 )
 from switchboard_relay.tasks import TaskAction, TaskQueue
+from switchboard_relay.worker_watch import watch_worker
 
 # How often wait() checks the mailbox, and how often it heartbeats the caller's
 # liveness while parked. Poll is a balance between latency and DB churn.
@@ -65,6 +68,7 @@ _WAIT_HEARTBEAT_SECONDS = 10.0
 # wait() poll: it runs for the whole session lifetime, and a second of latency
 # on a background nudge is fine. See Switchboard._watch_loop.
 _WATCH_POLL_SECONDS = 1.0
+_INBOX_RESOURCE = "switchboard://inbox"
 # Slack on the keepalive deadline for a sleep that wakes a hair early. Timer
 # jitter only: any larger and a refresh due just past a poll fires a tick early.
 _KEEPALIVE_SLACK_SECONDS = 0.01
@@ -275,6 +279,7 @@ class Switchboard:
         max_body: int = DEFAULT_MAX_BODY_BYTES,
         stdio: bool = False,
         automatic: bool = False,
+        inbox_updates: Optional[InMemorySubscriptionBus] = None,
     ):
         if not math.isfinite(ttl) or ttl <= 0:
             raise ValueError("ttl must be finite and positive")
@@ -282,6 +287,8 @@ class Switchboard:
         self.protocol = Protocol(store, min(180.0, ttl), retention=ttl)
         self.tasks = TaskQueue(store)
         self._stdio = stdio
+        self._inbox_updates = inbox_updates
+        self._inbox_cursor = AvailabilityCursor()
         self._automatic = automatic
         self._disabled = False
         self._tokens = {}
@@ -392,6 +399,7 @@ class Switchboard:
             token=self._token(ctx),
         )
         if previous is None or (previous.name, previous.role) != (name, role):
+            self._inbox_cursor = AvailabilityCursor()
             self._watch_cursors.pop(sid, None)
             self._watch_failures.pop(sid, None)
         self._conns[sid] = conn
@@ -653,6 +661,32 @@ class Switchboard:
                 )
         return nudged
 
+    async def _publish_inbox_update(self, bus: InMemorySubscriptionBus) -> None:
+        # The bus and resource are local to one stdio connection. The same URI
+        # in another process refers to that process's own session.
+        conn = self._conns.get(0)
+        if conn is None or not self.protocol.owns(conn.token, conn.name):
+            return
+        rows, cursor = self.store.newly_available(
+            self._inbox_cursor, name=conn.name, role=conn.role, now=_now(), max_age=self.msg_ttl
+        )
+        if rows:
+            await bus.publish(ResourceUpdated(uri=_INBOX_RESOURCE))
+            if self._conns.get(0) is not conn:
+                return
+        self._inbox_cursor = cursor
+
+    def inbox_availability(self) -> str:
+        # Static resources have no request Context in the MCP SDK. This resource
+        # exists only on stdio, where the bound identity is the single connection.
+        conn = self._conns.get(0)
+        available = (
+            conn is not None
+            and self.protocol.owns(conn.token, conn.name)
+            and self.store.has_messages(conn.name, conn.role, now=_now(), max_age=self.msg_ttl)
+        )
+        return json.dumps({"available": available})
+
     def _keepalive_conns(self) -> int:
         """Refresh the liveness clock of every session connected to this process.
 
@@ -682,7 +716,7 @@ class Switchboard:
         return refreshed
 
     async def _watch_loop(self) -> None:
-        """Keep this process's sessions live; with push on, also inject turns.
+        """Keep sessions live and publish enabled mailbox notifications.
 
         Two jobs share one background task because both want the same shape --
         wake periodically for as long as the session lives.
@@ -705,7 +739,9 @@ class Switchboard:
         # Push wants a responsive poll; the keepalive on its own can idle for
         # the whole interval, which is why leaving push off stays cheap.
         poll = min(
-            _WATCH_POLL_SECONDS if self._push_enabled else _KEEPALIVE_SECONDS,
+            _WATCH_POLL_SECONDS
+            if self._push_enabled or self._inbox_updates is not None
+            else _KEEPALIVE_SECONDS,
             self.protocol.lease / 3,
         )
         # Refresh within a third of the lease in every mode: an idle session's
@@ -727,6 +763,9 @@ class Switchboard:
             if self._push_enabled:
                 with suppress(Exception):  # a bad pass must never kill the loop
                     await self._watch_tick()
+            if self._inbox_updates is not None:
+                with suppress(sqlite3.Error):  # retry an unreadable snapshot on the next poll
+                    await self._publish_inbox_update(self._inbox_updates)
             await anyio.sleep(poll)
 
     # -- turn injection on Desktop (ccd_session_mgmt broker) ----------------
@@ -1193,12 +1232,20 @@ def build_server(
     automatic: bool = False,
 ) -> MCPServer:
     store = store if store is not None else Store()
+    # A fixed "my inbox" URI is safe on stdio, where the server process serves
+    # one session. A multi-client server needs a different scoping mechanism.
+    inbox_updates = (
+        InMemorySubscriptionBus()
+        if stdio and os.getenv("SWITCHBOARD_INBOX_SUBSCRIPTIONS") == "1"
+        else None
+    )
     sb = Switchboard(
         store,
         ttl=ttl if ttl is not None else _resolve_ttl(),
         board=board,
         stdio=stdio,
         automatic=automatic,
+        inbox_updates=inbox_updates,
         # Match the ttl pattern: resolve from the environment when not supplied,
         # so programmatic callers behave like the CLI.
         msg_ttl=msg_ttl if msg_ttl is not None else _resolve_msg_ttl(),
@@ -1323,7 +1370,20 @@ def build_server(
         ),
         lifespan=_lifespan,
         middleware=[auto_context],
+        subscriptions=inbox_updates,
+        cache_hints={"resources/read": CacheHint()} if inbox_updates is not None else None,
     )
+    if inbox_updates is not None:
+
+        @mcp.resource(
+            _INBOX_RESOURCE,
+            name="switchboard_inbox",
+            description="Whether mail is available for this stdio session.",
+            mime_type="application/json",
+        )
+        def inbox_resource() -> str:
+            return sb.inbox_availability()
+
     # Expose the wiring for tests and introspection.
     mcp._switchboard_relay = sb  # type: ignore[attr-defined]
 
@@ -1656,6 +1716,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=7.0,
         help="Delete queued messages older than this many days (default 7).",
     )
+    wake = sub.add_parser(
+        "worker-watch",
+        help="Run an opt-in foreground supervisor for one offline worker.",
+    )
+    wake.add_argument("--name", required=True, help="Exact participant name to wake.")
+    wake.add_argument(
+        "command", nargs=argparse.REMAINDER, help="Fixed worker command and arguments."
+    )
     return parser
 
 
@@ -1716,6 +1784,7 @@ _DOCTOR_ENV_VARS = (
     "SWITCHBOARD_NAME",
     "SWITCHBOARD_ROLE",
     "SWITCHBOARD_PUSH",
+    "SWITCHBOARD_INBOX_SUBSCRIPTIONS",
     "SWITCHBOARD_CCD_INJECT",
     "SWITCHBOARD_CCD_SESSION_ID",
 )
@@ -1871,6 +1940,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     # $SWITCHBOARD_DB > $SWITCHBOARD_BOARD > the current project.
     target = describe_target(db_arg=args.db, board_arg=args.board)
     db_path = target.db_path
+
+    if args.cmd == "worker-watch":
+        if not args.board and not args.db:
+            parser.error("worker-watch requires an explicit --board or --db")
+        if os.name != "posix":
+            parser.error("worker-watch requires a POSIX system")
+        if str(db_path) == ":memory:":
+            parser.error("worker-watch requires a file-backed board")
+        name = args.name.strip()
+        command = args.command[1:] if args.command[:1] == ["--"] else args.command
+        if not name or not command or not command[0].strip():
+            parser.error("worker-watch requires a name and a command")
+        return watch_worker(target, name, command, ttl=ttl, max_age=_resolve_msg_ttl() or None)
 
     # Human-facing inspection commands read the DB directly -- no server, and no
     # side effect of creating the DB if it does not exist yet.
