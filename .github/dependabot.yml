@@ -33,7 +33,7 @@ updates:
         patterns: ["*"]
 
   # Hook revisions pinned in .pre-commit-config.yaml. Dev-only, so `chore` like
-  # the Actions group; keeps the local ruff hook in step with the locked ruff CI uses.
+  # the Actions group. Ruff itself is a local hook pinned by uv.lock (pip group).
   - package-ecosystem: "pre-commit"
     directory: "/"
     schedule:
