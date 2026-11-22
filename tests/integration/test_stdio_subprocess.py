@@ -130,3 +130,88 @@ async def test_unacknowledged_stdio_claim_survives_worker_disconnect(tmp_path):
         status = _data(await lead.call_tool("status", {"id": mid}))
         assert status["status"] == "acknowledged"
         assert status["acknowledged_at"] == ack["acknowledged_at"]
+
+
+async def test_nonblocking_threaded_replies_over_stdio(tmp_path):
+    db = str(tmp_path / "switchboard.db")
+    async with (
+        _participant(db, "lead") as lead,
+        _participant(db, "worker", "implementer") as worker,
+    ):
+        question = _data(await worker.call_tool("send", {"to": "lead", "body": "Which branch?"}))
+        ticket = {"question_id": question["id"]}
+        assert _data(await worker.call_tool("replies", ticket))["replies"] == []
+        _data(await lead.call_tool("send", {"to": "worker", "body": "Unrelated"}))
+        _data(
+            await lead.call_tool(
+                "send",
+                {
+                    "to": "implementer",
+                    "body": "Role message",
+                    "reply_to": question["id"],
+                },
+            )
+        )
+        answer = _data(
+            await lead.call_tool(
+                "send",
+                {
+                    "to": "worker",
+                    "body": "main",
+                    "reply_to": question["id"],
+                },
+            )
+        )
+
+        [reply] = _data(await worker.call_tool("replies", ticket))["replies"]
+        assert reply["id"] == answer["id"] and reply["body"] == "main"
+        assert _data(
+            await worker.call_tool(
+                "ack",
+                {
+                    "id": reply["id"],
+                    "receipt": reply["receipt"],
+                },
+            )
+        )["ok"]
+        mailbox = _data(await worker.call_tool("inbox", {"peek": True}))["messages"]
+        assert [message["body"] for message in mailbox] == ["Unrelated", "Role message"]
+
+
+async def test_role_task_tools_and_history_survive_lead_restart(tmp_path):
+    db = str(tmp_path / "switchboard.db")
+    async with _participant(db, "lead") as lead:
+        task = _data(
+            await lead.call_tool(
+                "task_submit",
+                {
+                    "role": "worker",
+                    "scope": "Review the docs",
+                    "owned_paths": ["README.md"],
+                    "acceptance_criteria": ["Verify the examples"],
+                    "expected_evidence": "Test output",
+                },
+            )
+        )
+        assert task["status"] == "queued"
+
+    async with _participant(db, "worker:one", "worker") as worker:
+        claim = _data(await worker.call_tool("task_claim", {}))["task"]
+        assert claim["id"] == task["id"] and claim["expected_evidence"] == "Test output"
+        change = {"id": task["id"], "receipt": claim["receipt"]}
+        assert _data(
+            await worker.call_tool(
+                "task_update",
+                {
+                    **change,
+                    "action": "completed",
+                    "note": "Examples passed",
+                },
+            )
+        )["ok"]
+        assert _data(await worker.call_tool("task_claim", {}))["task"] is None
+
+    async with _participant(db, "lead") as lead:
+        status = _data(await lead.call_tool("task_status", {"id": task["id"]}))
+        assert status["status"] == "completed"
+        assert status["attempts"][0]["updates"][0]["note"] == "Examples passed"

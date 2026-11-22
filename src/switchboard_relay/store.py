@@ -464,8 +464,33 @@ class Store:
         lease: float = DEFAULT_DELIVERY_LEASE_SECONDS,
     ) -> Optional[Message]:
         """Claim only the oldest available reply to the specified question."""
+        messages = self.claim_replies(
+            name,
+            role,
+            reply_to=reply_to,
+            now=now,
+            max_age=max_age,
+            owner_token=owner_token,
+            lease=lease,
+            limit=1,
+        )
+        return messages[0] if messages else None
+
+    def claim_replies(
+        self,
+        name: str,
+        role: str = "",
+        *,
+        reply_to: int,
+        now: float,
+        max_age: Optional[float] = None,
+        owner_token: Optional[str] = None,
+        lease: float = DEFAULT_DELIVERY_LEASE_SECONDS,
+        limit: int = -1,
+    ) -> list[Message]:
+        """Claim available matching replies, oldest first."""
         where, params = _mailbox_filter(name, role)
-        messages = self._claim(
+        return self._claim(
             name,
             owner_token,
             now,
@@ -473,9 +498,8 @@ class Store:
             lease,
             where + " AND reply_to = ?",
             [*params, reply_to],
-            limit=1,
+            limit=limit,
         )
-        return messages[0] if messages else None
 
     def _claim(
         self,

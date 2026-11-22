@@ -54,6 +54,19 @@ Use switchboard-relay's ask() to ask "lead": <your question>. Use the reply to c
 and acknowledge it with ack(reply.id, reply.receipt).
 ```
 
+## Working from the task queue
+
+1. Register the submitting session as `lead`. Call `task_submit()` with role `worker`, the
+   requested scope, owned paths, acceptance criteria, and the evidence the lead expects.
+   Save the task ID and use `task_status(id)` to see who claimed it and what changed.
+2. Register a separate session as `worker:docs` with role `worker`. Call `task_claim()`, then
+   use the task ID and receipt with `task_update()`. Record progress or blockers as you go.
+   Renew the lease before the deadline. When done, record `completed` or `failed` with evidence.
+3. If the worker exits, another session in role `worker` can claim the task after its lease
+   expires. Read the previous attempt's notes and check the owned paths, diff, and test output
+   before making further changes. Use the new claim's receipt for updates. The lead can still
+   inspect each attempt after reconnecting under the same name.
+
 ## Checking who's ready
 
 To see which peers are on the board and whether their agents have read the current charter:

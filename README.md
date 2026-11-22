@@ -441,6 +441,27 @@ The tools, grouped by what you reach for:
 |------|-----------|--------------|
 | `ask` | `ask(to, body, timeout_s?)` | Send `body` to `to`, then block until a reply threaded to it comes back (`reply_to` = the returned `question_id`). Claims just the matching reply. After handling it, call `ack(reply.id, reply.receipt)`. Returns `timed_out: true` if no reply in time — with `no_live_recipient: true` when nobody was registered as `to` at send time, so you can tell a wrong address from a slow reply. |
 
+For a non-blocking question, call `send(to, body)` and save the returned message ID as the
+question ticket. If `send()` returns a Desktop injection hint, you can use it before checking
+for a reply. Ask the recipient to respond to your unique name with `reply_to` set to the ticket.
+
+| Tool | Signature | What it does |
+|------|-----------|--------------|
+| `replies` | `replies(question_id)` | Immediately claim available replies addressed to your unique name and threaded to the question. An empty list means you can check again later. Call `ack(id, receipt)` after handling each reply. |
+
+**Task queue** — hand durable work to a worker role
+
+| Tool | What it does |
+|------|--------------|
+| `task_submit(role, scope, owned_paths, acceptance_criteria, expected_evidence)` | Queue work for a role and return a task ID. |
+| `task_claim()` | Claim the oldest available task for your registered role. Returns the task, lease deadline, attempt history, and receipt. An empty queue returns `task: null`. |
+| `task_update(id, receipt, action, note?)` | Use `renew` to extend the 15-minute lease, `progress` to record progress or resume blocked work, `blocked` to record what you need, and `completed` or `failed` to report an outcome with evidence. |
+| `task_status(id)` | Get the current owner, status, deadline, and attempt history. The submitting address and workers for the role can read it. |
+
+A task is available to another worker when its work lease expires. The new claim includes earlier
+notes and a fresh receipt. Keep the submitting name when reconnecting to watch your tasks.
+See [the lead and worker walkthrough](examples/README.md#working-from-the-task-queue).
+
 > **Readiness.** A peer's `ready` flag means its agent called `bootstrap()` (or `charter()`) at the
 > current charter revision. It does not mean the peer agrees to the charter or will follow it.
 > Peers running an older switchboard are listed as `legacy/manual` and are never `ready`.
