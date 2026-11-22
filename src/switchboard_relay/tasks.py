@@ -354,13 +354,14 @@ def _overview_rows(
         tables = {
             row[0]
             for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE name IN ('tasks', 'task_cancellations')"
+                "SELECT name FROM sqlite_master WHERE name IN "
+                "('tasks', 'task_attempts', 'task_updates', 'task_cancellations')"
             )
         }
-        if "tasks" not in tables:
+        if not {"tasks", "task_attempts"} <= tables:
             return []
     else:
-        tables = {"task_cancellations"}
+        tables = {"task_updates", "task_cancellations"}
 
     available_at = "task.available_at"
     cancellation_join = "LEFT JOIN task_cancellations AS cancel ON cancel.task_id=task.id"
@@ -388,6 +389,13 @@ def _overview_rows(
             ))"""
         )
     viewer_name, viewer_role, viewer_token = viewer or (None, None, None)
+    update_join = """LEFT JOIN task_updates AS last ON last.id=(
+        SELECT id FROM task_updates WHERE task_id=page.id ORDER BY id DESC LIMIT 1
+    )"""
+    if "task_updates" not in tables:
+        update_join = """LEFT JOIN (
+            SELECT NULL AS kind, NULL AS note, NULL AS at
+        ) AS last ON 0"""
     scope = "substr(page.scope, 1, 500)" if preview else "page.scope"
     note = "substr(last.note, 1, 500)" if preview else "last.note"
     extra = "" if preview else ", page.owned_paths, page.acceptance, page.expected_evidence"
@@ -419,9 +427,7 @@ def _overview_rows(
                {scope} AS display_scope, last.kind AS update_kind,
                {note} AS update_note, last.at AS update_at {extra}
         FROM page
-        LEFT JOIN task_updates AS last ON last.id=(
-            SELECT id FROM task_updates WHERE task_id=page.id ORDER BY id DESC LIMIT 1
-        )
+        {update_join}
         ORDER BY page.id""",
         {
             "now": now,
