@@ -111,6 +111,45 @@ def test_renaming_preserves_active_claims_and_redelivery(tmp_path):
     assert [m.id for m in store.inbox("new", owner_token="owner", now=4)] == [second]
 
 
+def test_startup_reservation_arbitrates_registration_and_expires(tmp_path):
+    path = tmp_path / "board.db"
+    protocol = Protocol(Store(path))
+    other = Protocol(Store(path))
+    name = "worker"
+
+    def reserved(token, now):
+        with protocol.startup_launch_window(name, token, lambda: now) as active:
+            return active
+
+    token = protocol.reserve_startup(name, 10)
+    assert token is not None
+    assert other.reserve_startup(name, 10) is None
+    assert reserved(token, 10)
+    with pytest.raises(ValueError, match="name_in_use"):
+        other.claim("manual", name, "", now=11)
+    with pytest.raises(ValueError, match="startup_reservation_lost"):
+        other.claim("wrong", name, "", now=11, startup_token="wrong")
+    assert other.claim("managed", name, "docs", now=11, startup_token=token) == name
+    assert not reserved(token, 11)
+    assert protocol.reserve_startup(name, 11) is None
+
+    protocol.leave("managed", 12)
+    expired = protocol.reserve_startup(name, 12)
+    assert expired is not None
+    assert not reserved(expired, 72)
+    assert other.claim("manual", name, "", now=72) == name
+    with pytest.raises(ValueError, match="startup_reservation_lost"):
+        other.claim("late", name, "", now=72, startup_token=expired)
+
+    protocol.leave("manual", 73)
+    active = protocol.reserve_startup(name, 73)
+    assert active is not None
+    protocol.release_startup(name, expired)
+    assert reserved(active, 74)
+    protocol.release_startup(name, active)
+    assert other.claim("manual", name, "", now=74) == name
+
+
 def test_simultaneous_schema_initialization(tmp_path):
     path = tmp_path / "fresh.db"
 

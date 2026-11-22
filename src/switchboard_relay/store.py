@@ -733,11 +733,50 @@ class Store:
         include_body: bool = False,
     ) -> tuple[list[sqlite3.Row], AvailabilityCursor]:
         """Read new mail and newly available retries from a single SQLite snapshot."""
-        where, params = _mailbox_filter(name, role) if name is not None else ("1", [])
         fields = "id, recipient, sender, reply_to" + (", body" if include_body else "")
+        with self._availability_query(
+            cursor, now=now, max_age=max_age, name=name, role=role, fields=fields
+        ) as (conn, sql, args, next_cursor):
+            rows = conn.execute(sql + " ORDER BY id", args).fetchall()
+        message_id = max((row["id"] for row in rows if not row["retry"]), default=cursor.message_id)
+        return rows, AvailabilityCursor(message_id, next_cursor.claim_version, now)
+
+    def availability_changed(
+        self,
+        cursor: AvailabilityCursor,
+        *,
+        now: float,
+        max_age: Optional[float],
+        name: str,
+        role: str = "",
+    ) -> tuple[bool, AvailabilityCursor]:
+        """Detect a new attempt and advance the cursor without loading message rows."""
+        with self._availability_query(
+            cursor, now=now, max_age=max_age, name=name, role=role, fields="1"
+        ) as (conn, sql, args, next_cursor):
+            return bool(conn.execute(f"SELECT EXISTS({sql})", args).fetchone()[0]), next_cursor
+
+    @contextmanager
+    def _availability_query(
+        self,
+        cursor: AvailabilityCursor,
+        *,
+        now: float,
+        max_age: Optional[float],
+        name: Optional[str],
+        role: str,
+        fields: str,
+    ) -> Iterator[tuple[sqlite3.Connection, str, list, AvailabilityCursor]]:
+        where, params = _mailbox_filter(name, role) if name is not None else ("1", [])
         cutoff = _age_cutoff(now, max_age)
         with self._connect() as conn, conn:
             conn.execute("BEGIN")
+            # Bound the cursor and the query to the same SQLite snapshot. New
+            # inserts always have higher IDs, including after an empty poll.
+            sequence = conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='messages'"
+            ).fetchone()
+            message_id = max(cursor.message_id, sequence[0]) if sequence else cursor.message_id
             # The CLI can follow a board that has not been upgraded yet.
             has_version = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE name='relay_claim_version'"
@@ -773,9 +812,7 @@ class Store:
                         min(cursor.observed_at, now),
                     ]
                 )
-            rows = conn.execute(sql + " ORDER BY id", args).fetchall()
-        message_id = max((row["id"] for row in rows if not row["retry"]), default=cursor.message_id)
-        return rows, AvailabilityCursor(message_id, version, now)
+            yield conn, sql, args, AvailabilityCursor(message_id, version, now)
 
 
 # -- helpers ----------------------------------------------------------------

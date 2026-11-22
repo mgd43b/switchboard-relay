@@ -11,6 +11,7 @@ inbox -> reply, TTL expiry, wait()).
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from contextlib import asynccontextmanager
 
@@ -397,6 +398,30 @@ async def test_stdio_lifespan_starts_self_watch(tmp_path, monkeypatch):
             await asyncio.sleep(0.02)
 
     assert ticks >= 1  # the lifespan actually started and ran the watcher
+
+
+async def test_inbox_resource_requires_opt_in_and_single_client_stdio(tmp_path, monkeypatch):
+    store = Store(tmp_path / "switchboard.db")
+    monkeypatch.setenv("SWITCHBOARD_INBOX_SUBSCRIPTIONS", "0")
+    async with connect(build_server(store, stdio=True)) as client:
+        assert (await client.list_resources()).resources == []
+
+    monkeypatch.setenv("SWITCHBOARD_INBOX_SUBSCRIPTIONS", "1")
+    async with connect(build_server(store)) as client:
+        assert (await client.list_resources()).resources == []
+
+    async with connect(build_server(store, stdio=True)) as client:
+        [resource] = (await client.list_resources()).resources
+        assert str(resource.uri) == "switchboard://inbox"
+        store.send("listener", "pending", sender="lead", now=time.time())
+        [contents] = (await client.read_resource(resource.uri)).contents
+        assert json.loads(contents.text) == {"available": False}
+        data(await client.call_tool("register", {"name": "listener"}))
+        [contents] = (await client.read_resource(resource.uri)).contents
+        assert json.loads(contents.text) == {"available": True}
+        data(await client.call_tool("unregister", {}))
+        [contents] = (await client.read_resource(resource.uri)).contents
+        assert json.loads(contents.text) == {"available": False}
 
 
 # -- durability across a "restart" ------------------------------------------

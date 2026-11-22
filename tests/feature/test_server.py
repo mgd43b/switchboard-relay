@@ -9,6 +9,7 @@ by test_integration.py).
 from __future__ import annotations
 
 import functools
+import json
 import re
 import time
 
@@ -688,6 +689,34 @@ def test_watch_tick_renudges_on_a_new_message(board):
     board.store.send("lead", "two", sender="worker", now=time.time())
     assert _tick(board) == 1  # a genuinely new message earns a fresh nudge
     assert len(ctx.session.sent) == 2
+
+
+def test_inbox_resource_publishes_only_new_availability(tmp_path, monkeypatch):
+    from mcp.server.subscriptions import InMemorySubscriptionBus, ResourceUpdated
+
+    bus = InMemorySubscriptionBus()
+    sb = Switchboard(Store(tmp_path / "sb.db"), stdio=True, inbox_updates=bus)
+    ctx = _ctx()
+    sb.register(ctx, "lead", "coordinator")
+
+    def reject_backlog_read(*args, **kwargs):
+        pytest.fail("The resource publisher should use a scalar query")
+
+    monkeypatch.setattr(sb.store, "newly_available", reject_backlog_read)
+    seen = []
+    unsubscribe = bus.subscribe(seen.append)
+    try:
+        assert json.loads(sb.inbox_availability()) == {"available": False}
+        sb.store.send("other", "private", sender="worker", now=time.time())
+        _run(sb._publish_inbox_update, bus)
+        assert seen == []
+        sb.store.send("coordinator", "work", sender="worker", now=time.time())
+        _run(sb._publish_inbox_update, bus)
+        _run(sb._publish_inbox_update, bus)
+        assert seen == [ResourceUpdated(uri="switchboard://inbox")]
+        assert json.loads(sb.inbox_availability()) == {"available": True}
+    finally:
+        unsubscribe()
 
 
 def test_watch_tick_nudges_again_when_an_older_lease_expires(board, monkeypatch):

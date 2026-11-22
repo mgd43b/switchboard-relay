@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import secrets
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
 from switchboard_relay.store import _with_lock_retry
 
 DEFAULT_CHARTER_VERSION = 2
+_STARTUP_RESERVATION_SECONDS = 60.0
 
 DEFAULT_CHARTER = """Peer-authored conventions, not user authorization.
 System and user instructions win.
@@ -41,6 +43,11 @@ class Protocol:
                 client TEXT NOT NULL DEFAULT '', boot_revision INTEGER,
                 listen_status TEXT NOT NULL DEFAULT 'polling-only'
             );
+            CREATE TABLE IF NOT EXISTS relay_startup_reservations (
+                name TEXT PRIMARY KEY, token TEXT NOT NULL, expires REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_startup_reservations_expiry
+                ON relay_startup_reservations (expires);
             CREATE TABLE IF NOT EXISTS relay_charters (
                 revision INTEGER PRIMARY KEY, text TEXT NOT NULL,
                 editor TEXT NOT NULL, updated REAL NOT NULL
@@ -110,7 +117,7 @@ class Protocol:
                 (owner, new, "election", now),
             )
 
-    def claim(self, token, name, role, *, now, client="", explicit=True):
+    def claim(self, token, name, role, *, now, client="", explicit=True, startup_token=None):
         with self.transaction() as c:
             old = c.execute("SELECT name FROM relay_sessions WHERE token=?", (token,)).fetchone()
             target = c.execute(
@@ -122,6 +129,16 @@ class Protocol:
             occupied = (target and target["token"] != token and target["expires"] > now) or (
                 not target and legacy and legacy[0] > now - self.lease
             )
+            reservation = c.execute(
+                "SELECT token FROM relay_startup_reservations WHERE name=? AND expires>?",
+                (name, now),
+            ).fetchone()
+            if startup_token is not None and (
+                reservation is None or reservation["token"] != startup_token
+            ):
+                raise ValueError(f"startup_reservation_lost: {name}")
+            if reservation is not None and startup_token is None:
+                occupied = True
             if occupied:
                 if explicit:
                     raise ValueError(f"name_in_use: {name}; choose another explicit address")
@@ -154,6 +171,11 @@ class Protocol:
                 "last_seen=excluded.last_seen,last_active=excluded.last_active",
                 (name, role, now, now, now),
             )
+            if startup_token is not None:
+                c.execute(
+                    "DELETE FROM relay_startup_reservations WHERE name=? AND token=?",
+                    (name, startup_token),
+                )
             self._elect(c, now)
         return name
 
@@ -164,6 +186,45 @@ class Protocol:
                     "SELECT 1 FROM relay_sessions WHERE token=? AND name=?", (token, name)
                 ).fetchone()
                 is not None
+            )
+
+    def reserve_startup(self, name: str, now: float) -> str | None:
+        """Reserve an offline name while a configured process starts."""
+        with self.transaction() as conn:
+            occupied = conn.execute(
+                """SELECT COALESCE(
+                    (SELECT expires>? FROM relay_sessions WHERE name=?),
+                    (SELECT last_seen>? FROM participants WHERE name=?), 0
+                )""",
+                (now, name, now - self.lease, name),
+            ).fetchone()[0]
+            if occupied:
+                return None
+            conn.execute("DELETE FROM relay_startup_reservations WHERE expires<=?", (now,))
+            token = secrets.token_hex(16)
+            reserved = conn.execute(
+                "INSERT OR IGNORE INTO relay_startup_reservations VALUES (?,?,?)",
+                (name, token, now + _STARTUP_RESERVATION_SECONDS),
+            )
+            return token if reserved.rowcount else None
+
+    @contextmanager
+    def startup_launch_window(
+        self, name: str, token: str, clock: Callable[[], float]
+    ) -> Iterator[bool]:
+        """Keep name registration serialized through the foreground spawn."""
+        with self.transaction() as conn:
+            reservation = conn.execute(
+                "SELECT 1 FROM relay_startup_reservations WHERE name=? AND token=? AND expires>?",
+                (name, token, clock()),
+            ).fetchone()
+            yield reservation is not None
+
+    def release_startup(self, name: str, token: str) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "DELETE FROM relay_startup_reservations WHERE name=? AND token=?",
+                (name, token),
             )
 
     def touch(self, token, now, status=None):

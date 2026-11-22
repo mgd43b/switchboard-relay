@@ -12,6 +12,8 @@ Skipped automatically if the ``switchboard-relay`` console script is not on PATH
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import shutil
 import sys
@@ -19,8 +21,9 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
 import pytest
-from mcp import ClientSession, StdioServerParameters
+from mcp import Client, ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.subscriptions import ResourceUpdated
 
 
 def _find_switchboard() -> str | None:
@@ -215,3 +218,47 @@ async def test_role_task_tools_and_history_survive_lead_restart(tmp_path):
         status = _data(await lead.call_tool("task_status", {"id": task["id"]}))
         assert status["status"] == "completed"
         assert status["attempts"][0]["updates"][0]["note"] == "Examples passed"
+
+
+async def test_stdio_inbox_subscription_is_scoped_and_notifies_on_redelivery(tmp_path):
+    board = str(tmp_path / "switchboard.db")
+    uri = "switchboard://inbox"
+    async with _participant(board, "sender") as sender:
+        async with Client(
+            _params(board, SWITCHBOARD_INBOX_SUBSCRIPTIONS="1", SWITCHBOARD_DELIVERY_LEASE="1")
+        ) as receiver:
+            _data(await receiver.call_tool("register", {"name": "listener"}))
+            async with receiver.listen(resource_subscriptions=[uri]) as events:
+                initial = await receiver.read_resource(uri)
+                assert json.loads(initial.contents[0].text) == {"available": False}
+                _data(await sender.call_tool("send", {"to": "somebody-else", "body": "private"}))
+                incoming = asyncio.create_task(anext(events))
+                try:
+                    done, _ = await asyncio.wait([incoming], timeout=1.25)
+                    assert not done
+                    sent = _data(
+                        await sender.call_tool(
+                            "send",
+                            {
+                                "to": "listener",
+                                "body": "claim me",
+                            },
+                        )
+                    )
+                    assert await asyncio.wait_for(incoming, 5) == ResourceUpdated(uri=uri)
+                finally:
+                    if not incoming.done():
+                        incoming.cancel()
+                        await asyncio.gather(incoming, return_exceptions=True)
+
+                visible = await receiver.read_resource(uri)
+                assert json.loads(visible.contents[0].text) == {"available": True}
+                [claim] = _data(await receiver.call_tool("inbox", {}))["messages"]
+                assert claim["id"] == sent["id"]
+                assert await asyncio.wait_for(anext(events), 5) == ResourceUpdated(uri=uri)
+
+        # A fresh connection can recover pending mail through a normal tool call.
+        async with _participant(board, "listener") as reconnected:
+            [retry] = _data(await reconnected.call_tool("wait", {"timeout_s": 5}))["messages"]
+            assert retry["id"] == claim["id"]
+            assert retry["receipt"] != claim["receipt"]
